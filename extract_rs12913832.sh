@@ -20,9 +20,14 @@ if [[ ! -f "$VCF" ]]; then
     exit 1
 fi
 
-# 1. Fast region query via tabix index, then filter by rsID
-#    (ID match guards against any nearby variants sharing the position).
-bcftools view -r "$REGION" -i "ID=\"$RSID\"" "$VCF" -Oz -o "${OUT_PREFIX}.vcf.gz"
+# 1. Fast region query via tabix index, then filter by REF/ALT.
+#    The 1000G Phase 3 VCFs were frozen against a 2013 dbSNP snapshot and
+#    may not carry the rs12913832 ID, so we identify the variant by its
+#    alleles (A>G) rather than by rsID.
+REF_ALLELE="A"
+ALT_ALLELE="G"
+bcftools view -r "$REGION" -i "REF=\"$REF_ALLELE\" & ALT=\"$ALT_ALLELE\"" \
+    "$VCF" -Oz -o "${OUT_PREFIX}.vcf.gz"
 bcftools index -t "${OUT_PREFIX}.vcf.gz"
 
 echo "--- Variant record ---"
