@@ -1,0 +1,102 @@
+# Genomic data files (large, should be downloaded/sourced separately)
+*.vcf
+*.vcf.gz
+*.vcf.bgz
+*.bcf
+*.bcf.gz
+
+# Index files
+*.tbi
+*.csi
+*.bai
+*.fai
+*.idx
+
+# Other large genomic formats
+*.bam
+*.sam
+*.cram
+*.bed
+*.bim
+*.fam
+*.ped
+*.map
+*.pgen
+*.pvar
+*.psam
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fasta
+*.fa
+*.fa.gz
+
+# PLINK output
+*.log
+*.nosex
+*.hh
+
+# Credentials and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+config.local.*
+*_secret*
+*_credentials*
+*_private*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Jupyter
+.jupyter/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+\#*\#
+
+# Temporary and output files
+tmp/
+temp/
+scratch/
+*.tmp
+*.out
+*.err
+logs/
+results/
+output/
