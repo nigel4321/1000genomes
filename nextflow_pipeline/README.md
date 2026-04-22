@@ -1,9 +1,11 @@
 # variant-scan — Nextflow pipeline
 
-Scan a directory of VCF files for a target variant, producing two markdown reports:
+Scan a directory of VCF files for a target variant, producing three markdown reports plus a carrier-level TSV:
 
 1. **`metadata_report.md`** — cohort-level and per-file overview for researchers orienting themselves to an unfamiliar dataset.
 2. **`variant_report.md`** — which files contain the target variant within an acceptable allele-frequency range, with per-population breakdowns.
+3. **`carriers_report.md`** — how many individuals carry the alt allele, split by heterozygous / homozygous, with integrity checks against cohort AC.
+4. **`carriers.tsv`** — one row per (file, sample) where the individual carries the alt allele. Suitable for downstream joins with a sample/population panel.
 
 Designed for a standalone VM (local executor). Scales to hundreds of VCFs via per-file parallelism.
 
@@ -59,9 +61,10 @@ nextflow_pipeline/
 │   └── reports.nf                   # markdown aggregation
 ├── bin/                             # scripts auto-added to PATH by Nextflow
 │   ├── inspect_vcf.py
-│   ├── scan_variant.py
+│   ├── scan_variant.py              # also emits per-file carriers.tsv
 │   ├── build_metadata_report.py
-│   └── build_variant_report.py
+│   ├── build_variant_report.py
+│   └── build_carrier_report.py
 └── variants/
     └── rs12913832.yaml              # example variant spec
 ```
@@ -71,12 +74,22 @@ nextflow_pipeline/
 Per input VCF, Nextflow runs two independent parallel tasks:
 
 - `INSPECT_VCF` — contigs, sample count, variant count, reference build heuristic, pipeline/date tags, sample-list hash (to detect cohort mismatches across files).
-- `SCAN_VARIANT` — tabix region query, strict REF/ALT match, AF extraction from INFO (or recomputed via `bcftools +fill-tags` if missing), classification into one of seven statuses.
+- `SCAN_VARIANT` — tabix region query, strict REF/ALT match, AF extraction from INFO (or recomputed via `bcftools +fill-tags` if missing), classification into one of seven statuses, **and per-sample genotype extraction** for any file where the variant is present.
 
-Aggregation runs once both per-file fan-outs finish:
+Each `SCAN_VARIANT` task emits two files:
+
+- `<name>.variant.json` — cohort-level scan result (status, AF, per-pop AFs, carrier counts)
+- `<name>.carriers.tsv` — one row per carrier sample (header-only when the variant is absent from this file, keeping the output channel stable)
+
+Aggregation runs once all per-file fan-outs finish:
 
 - `METADATA_REPORT` → `metadata_report.md`
 - `VARIANT_REPORT` → `variant_report.md` (highlights files where the variant is in range)
+- `CARRIER_REPORT` → `carriers.tsv` + `carriers_report.md` (concatenates per-file carrier TSVs, totals het/hom counts, verifies `het + 2·hom == cohort AC`)
+
+### Carrier extraction scope
+
+Carrier genotypes are extracted for **every file where the variant is present** — regardless of whether the cohort AF falls within `[min_af, max_af]`. The AF gate only affects *file* classification in `variant_report.md`; individual carriers are reported unfiltered so you can see raw genotype data even in cohorts where cohort-level AF is unusual. Filter downstream by joining `carriers.tsv` against `variant.json` status if needed.
 
 ## Variant statuses
 
@@ -104,8 +117,30 @@ Tune parallelism via `-profile`:
 
 ```
 results/
-├── metadata_report.md
-└── variant_report.md
+├── metadata_report.md       # cohort overview (one section per input file)
+├── variant_report.md        # file-level classification + AF per population
+├── carriers_report.md       # individual-level summary: het, hom, totals
+└── carriers.tsv             # full per-carrier table (file, sample, GT, dosage)
 ```
 
-Per-file intermediate JSONs stay in Nextflow's `work/` directory and can be inspected for debugging.
+Per-file intermediate JSONs and carrier TSVs stay in Nextflow's `work/` directory and can be inspected for debugging.
+
+## Joining carriers to populations
+
+`carriers.tsv` contains the sample IDs but no population labels. For 1000 Genomes data, join against the sample panel:
+
+```bash
+wget https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/integrated_call_samples_v3.20130502.ALL.panel
+
+awk 'NR==FNR {pop[$1]=$3; next}
+     FNR==1 {print $0"\tsuper_pop"; next}
+     {print $0"\t"pop[$2]}' \
+    integrated_call_samples_v3.20130502.ALL.panel \
+    results/carriers.tsv > results/carriers_with_pop.tsv
+```
+
+This adds a `super_pop` column (AFR, AMR, EAS, EUR, SAS) for downstream ancestry-stratified analysis.
+
+## Integrity check
+
+The `carriers_report.md` summary includes `het + 2·hom`; this should equal the cohort `AC` reported in `variant_report.md`. Mismatches indicate missing/partial genotypes or a bug — the reconciliation is a cheap end-to-end sanity check.

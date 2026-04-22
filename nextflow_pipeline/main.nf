@@ -4,7 +4,7 @@ nextflow.enable.dsl = 2
 
 include { INSPECT_VCF }                     from './modules/inspect_vcf.nf'
 include { SCAN_VARIANT }                    from './modules/scan_variant.nf'
-include { METADATA_REPORT; VARIANT_REPORT } from './modules/reports.nf'
+include { METADATA_REPORT; VARIANT_REPORT; CARRIER_REPORT } from './modules/reports.nf'
 
 def requiredParams = [
     'input',
@@ -32,7 +32,8 @@ workflow {
     SCAN_VARIANT(vcf_ch)
 
     METADATA_REPORT(INSPECT_VCF.out.collect())
-    VARIANT_REPORT(SCAN_VARIANT.out.collect())
+    VARIANT_REPORT(SCAN_VARIANT.out.json.collect())
+    CARRIER_REPORT(SCAN_VARIANT.out.carriers.collect())
 }
 
 workflow.onComplete {

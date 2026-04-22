@@ -15,6 +15,28 @@ process METADATA_REPORT {
     """
 }
 
+process CARRIER_REPORT {
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path carrier_tsvs
+
+    output:
+    path "carriers.tsv"
+    path "carriers_report.md"
+
+    script:
+    """
+    mkdir -p _carriers
+    for f in ${carrier_tsvs}; do cp "\$f" _carriers/; done
+    build_carrier_report.py \\
+        --input-dir    _carriers \\
+        --output-tsv   carriers.tsv \\
+        --output-md    carriers_report.md \\
+        --variant-name "${params.variant_name}"
+    """
+}
+
 process VARIANT_REPORT {
     publishDir params.outdir, mode: 'copy'
 
