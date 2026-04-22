@@ -100,3 +100,22 @@ scratch/
 logs/
 results/
 output/
+
+# Nextflow
+work/                   # task scratch directories (anywhere in tree)
+.nextflow/              # per-project cache / history
+.nextflow.log           # current run log
+.nextflow.log.*         # rotated run logs
+.nextflow.pid           # daemon pid file
+report.html             # -with-report output
+timeline.html           # -with-timeline output
+dag.html                # -with-dag output
+dag.svg
+dag.png
+trace.txt               # -with-trace output
+trace-*.txt
+pipeline_info/          # nf-core-style aggregated run metadata
+
+# Nextflow / nf-core secrets
+conf/*.secret.config
+*.local.config
