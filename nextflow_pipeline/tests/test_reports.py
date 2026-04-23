@@ -234,5 +234,101 @@ class CarrierReportTest(unittest.TestCase):
         self.assertIn("| `chr22.vcf.gz` | 1 | 0 | 1 |", md)
 
 
+class QcReportTest(unittest.TestCase):
+    """build_qc_report.py — aggregate qc.json files into qc_report.md."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="qc_report_test_")
+        self.input_dir = os.path.join(self.tmpdir, "_qc")
+        os.makedirs(self.input_dir)
+
+    def _write(self, name: str, *, pass_: bool = True,
+               errors=None, warnings=None, **check_overrides):
+        default_checks = {
+            "size_bytes": 2048,
+            "tabix_index_present": True,
+            "header_parseable": True,
+            "reference": "hs37d5",
+            "reference_build": "GRCh37",
+            "sample_count": 20,
+            "contigs": ["15"],
+            "human_contigs": ["15"],
+            "non_human_contigs": [],
+            "n_variants": 100,
+            "has_format_gt": True,
+            "info_fields": ["AC", "AF", "AN"],
+            "info_has_af": True,
+            "info_has_ac_an": True,
+        }
+        default_checks.update(check_overrides)
+        payload = {
+            "name": name,
+            "file": f"{name}.vcf.gz",
+            "pass": pass_,
+            "errors": errors or [],
+            "warnings": warnings or [],
+            "checks": default_checks,
+        }
+        path = os.path.join(self.input_dir, f"{name}.qc.json")
+        with open(path, "w") as fh:
+            json.dump(payload, fh)
+        return path
+
+    def _build(self) -> str:
+        out = os.path.join(self.tmpdir, "qc_report.md")
+        run_script(
+            bin_script("build_qc_report.py"),
+            "--input-dir", self.input_dir,
+            "--output", out,
+        )
+        with open(out) as fh:
+            return fh.read()
+
+    def test_all_pass_summary(self):
+        self._write("chr15")
+        self._write("chr22", contigs=["22"], human_contigs=["22"])
+        md = self._build()
+        self.assertIn("**Files scanned:** 2", md)
+        self.assertIn("**Passed:** 2", md)
+        self.assertIn("**Failed:** 0", md)
+        self.assertNotIn("## Hard failures", md)
+        self.assertNotIn("## Warnings", md)
+
+    def test_hard_failure_rendered(self):
+        self._write("chr15")
+        self._write(
+            "broken", pass_=False,
+            errors=["missing tabix index: expected broken.vcf.gz.tbi"],
+            tabix_index_present=False,
+        )
+        md = self._build()
+        self.assertIn("**Failed:** 1", md)
+        self.assertIn("## Hard failures", md)
+        self.assertIn("`broken.vcf.gz`", md)
+        self.assertIn("missing tabix index", md)
+
+    def test_warnings_rendered(self):
+        self._write(
+            "weird", pass_=True,
+            warnings=[
+                "reference 'mm10' does not match any recognised human build",
+                "no indexed contigs match human chromosome names",
+            ],
+            reference="mm10", reference_build=None,
+            contigs=["chr_mouse"], human_contigs=[],
+            non_human_contigs=["chr_mouse"],
+        )
+        md = self._build()
+        self.assertIn("## Warnings", md)
+        self.assertIn("`weird.vcf.gz`", md)
+        self.assertIn("mm10", md)
+
+    def test_per_file_detail_table(self):
+        self._write("chr15")
+        md = self._build()
+        self.assertIn("| File | Status | Samples | Variants | Reference", md)
+        self.assertIn("| `chr15.vcf.gz` | PASS | 20 | 100 ", md)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,9 +2,10 @@
 
 nextflow.enable.dsl = 2
 
+include { QC_VALIDATE }                     from './modules/qc_validate.nf'
 include { INSPECT_VCF }                     from './modules/inspect_vcf.nf'
 include { SCAN_VARIANT }                    from './modules/scan_variant.nf'
-include { METADATA_REPORT; VARIANT_REPORT; CARRIER_REPORT } from './modules/reports.nf'
+include { QC_REPORT; METADATA_REPORT; VARIANT_REPORT; CARRIER_REPORT } from './modules/reports.nf'
 
 def requiredParams = [
     'input',
@@ -28,9 +29,17 @@ workflow {
             tuple(name, vcf, tbi)
         }
 
-    INSPECT_VCF(vcf_ch)
-    SCAN_VARIANT(vcf_ch)
+    QC_VALIDATE(vcf_ch)
 
+    // Gate downstream stages on QC completion. In strict mode qc_validate.py
+    // exits non-zero on hard failure, so this tuple is never emitted for a
+    // broken file. In non-strict mode everything flows through regardless.
+    validated_ch = QC_VALIDATE.out.validated
+
+    INSPECT_VCF(validated_ch)
+    SCAN_VARIANT(validated_ch)
+
+    QC_REPORT(QC_VALIDATE.out.json.collect())
     METADATA_REPORT(INSPECT_VCF.out.collect())
     VARIANT_REPORT(SCAN_VARIANT.out.json.collect())
     CARRIER_REPORT(SCAN_VARIANT.out.carriers.collect())

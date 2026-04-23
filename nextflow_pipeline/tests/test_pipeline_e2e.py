@@ -81,13 +81,20 @@ class PipelineE2ETest(unittest.TestCase):
             f"nextflow failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
         )
 
-        # All three reports + carriers.tsv should be published.
-        for name in ("metadata_report.md", "variant_report.md",
+        # QC + three downstream reports + carriers.tsv should be published.
+        for name in ("qc_report.md", "metadata_report.md", "variant_report.md",
                      "carriers_report.md", "carriers.tsv"):
             self.assertTrue(
                 os.path.isfile(os.path.join(self.outdir, name)),
                 f"missing output: {name}",
             )
+
+        with open(os.path.join(self.outdir, "qc_report.md")) as fh:
+            qc_md = fh.read()
+        # Both synthetic files should pass QC cleanly.
+        self.assertIn("**Files scanned:** 2", qc_md)
+        self.assertIn("**Passed:** 2", qc_md)
+        self.assertIn("**Failed:** 0", qc_md)
 
         with open(os.path.join(self.outdir, "variant_report.md")) as fh:
             variant_md = fh.read()
@@ -117,6 +124,58 @@ class PipelineE2ETest(unittest.TestCase):
             meta_md = fh.read()
         self.assertIn("**Files scanned:** 2", meta_md)
         self.assertIn("phase3_shapeit2_mvncall_integrated_v5b", meta_md)
+
+
+class PipelineStrictQcAbortsTest(unittest.TestCase):
+    """Strict QC mode (default) aborts the workflow on bad input."""
+
+    @classmethod
+    def setUpClass(cls):
+        require_tools("nextflow", "bcftools", "tabix", "bgzip")
+        cls.tmpdir = tempfile.mkdtemp(prefix="pipeline_qc_abort_")
+        cls.input_dir = os.path.join(cls.tmpdir, "vcfs")
+        os.makedirs(cls.input_dir)
+
+        vcf = write_vcf(
+            standard_filename(cls.input_dir, "15"),
+            "15", in_range_variants(), default_cohort(),
+        )
+        # Sabotage the index so QC hard-fails.
+        os.remove(vcf + ".tbi")
+        # Re-create a zero-byte .tbi so the workflow's own pre-check in main.nf
+        # (`if (!tbi.exists()) error ...`) doesn't short-circuit ahead of us —
+        # we want QC_VALIDATE to be the thing that fails the pipeline.
+        open(vcf + ".tbi", "w").close()
+
+        cls.outdir = os.path.join(cls.tmpdir, "results")
+        cls.workdir = os.path.join(cls.tmpdir, "work")
+
+    @classmethod
+    def tearDownClass(cls):
+        if not os.environ.get("NF_KEEP"):
+            shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_strict_mode_aborts_on_hard_qc_failure(self):
+        glob = os.path.join(self.input_dir, "*.vcf.gz")
+        cmd = [
+            "nextflow", "run", "main.nf",
+            "--input", glob,
+            "--outdir", self.outdir,
+            "-work-dir", self.workdir,
+            "--variant_name", "rs12913832",
+            "--variant_chrom", "15", "--variant_pos", "28365618",
+            "--variant_ref", "A", "--variant_alt", "G",
+            "-ansi-log", "false",
+        ]
+        proc = subprocess.run(cmd, cwd=PIPELINE_DIR,
+                              capture_output=True, text=True)
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "expected pipeline to abort on strict QC failure, but it "
+            f"succeeded\nstdout:\n{proc.stdout}",
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertIn("QC_VALIDATE", combined)
 
 
 if __name__ == "__main__":

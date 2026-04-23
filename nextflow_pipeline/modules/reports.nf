@@ -1,3 +1,20 @@
+process QC_REPORT {
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path qc_jsons
+
+    output:
+    path "qc_report.md"
+
+    script:
+    """
+    mkdir -p _qc
+    for f in ${qc_jsons}; do cp "\$f" _qc/; done
+    build_qc_report.py --input-dir _qc --output qc_report.md
+    """
+}
+
 process METADATA_REPORT {
     publishDir params.outdir, mode: 'copy'
 

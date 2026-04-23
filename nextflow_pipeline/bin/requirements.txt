@@ -1,0 +1,7 @@
+# No pip dependencies — all bin/ scripts run on Python 3.8+ stdlib only
+# (argparse, glob, hashlib, json, os, re, subprocess, collections).
+#
+# System binaries required on PATH (invoked via subprocess, not installable
+# via pip):
+#   - bcftools   (htslib) — VCF querying, index inspection, fill-tags
+#   - tabix      (htslib) — fallback contig listing

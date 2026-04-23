@@ -154,43 +154,62 @@ def _format_info(ac: int, an: int, pop_af: dict[str, float],
     return ";".join(pieces)
 
 
-def _build_header(chrom: str, cohort: SyntheticCohort,
-                  file_date: str) -> list[str]:
+DEFAULT_REFERENCE = (
+    "ftp://ftp.1000genomes.ebi.ac.uk//vol1/ftp/technical/"
+    "reference/phase2_reference_assembly_sequence/hs37d5.fa.gz"
+)
+
+
+def _build_header(
+    chrom: str,
+    cohort: SyntheticCohort,
+    file_date: str,
+    reference: str = DEFAULT_REFERENCE,
+    contigs_override: dict[str, int] | None = None,
+    info_declarations: list[str] | None = None,
+    declare_format_gt: bool = True,
+) -> list[str]:
     lines = [
         "##fileformat=VCFv4.1",
         '##FILTER=<ID=PASS,Description="All filters passed">',
         f"##fileDate={file_date}",
-        "##reference=ftp://ftp.1000genomes.ebi.ac.uk//vol1/ftp/technical/"
-        "reference/phase2_reference_assembly_sequence/hs37d5.fa.gz",
+        f"##reference={reference}",
         "##source=1000GenomesPhase3Pipeline",
     ]
     # Full GRCh37 contig set keeps the header representative and means the
     # pipeline's chr-resolution logic (bare '15' vs 'chr15') is exercised.
-    for c, length in GRCH37_CONTIG_LENGTHS.items():
-        lines.append(f"##contig=<ID={c},assembly=b37,length={length}>")
-    lines += [
-        '##INFO=<ID=AC,Number=A,Type=Integer,Description="Total number of '
-        'alternate alleles in called genotypes">',
-        '##INFO=<ID=AF,Number=A,Type=Float,Description="Estimated allele '
-        'frequency in the range (0,1)">',
-        '##INFO=<ID=AN,Number=1,Type=Integer,Description="Total number of '
-        'alleles in called genotypes">',
-        '##INFO=<ID=NS,Number=1,Type=Integer,Description="Number of samples '
-        'with data">',
-        '##INFO=<ID=EAS_AF,Number=A,Type=Float,Description="Allele frequency '
-        'in the EAS populations calculated from AC and AN">',
-        '##INFO=<ID=EUR_AF,Number=A,Type=Float,Description="Allele frequency '
-        'in the EUR populations calculated from AC and AN">',
-        '##INFO=<ID=AFR_AF,Number=A,Type=Float,Description="Allele frequency '
-        'in the AFR populations calculated from AC and AN">',
-        '##INFO=<ID=AMR_AF,Number=A,Type=Float,Description="Allele frequency '
-        'in the AMR populations calculated from AC and AN">',
-        '##INFO=<ID=SAS_AF,Number=A,Type=Float,Description="Allele frequency '
-        'in the SAS populations calculated from AC and AN">',
-        '##INFO=<ID=VT,Number=.,Type=String,Description="indicates what type '
-        'of variant the line represents">',
-        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
-    ]
+    contig_map = contigs_override if contigs_override is not None else GRCH37_CONTIG_LENGTHS
+    for c, length in contig_map.items():
+        assembly = "b37" if contigs_override is None else "synthetic"
+        lines.append(f"##contig=<ID={c},assembly={assembly},length={length}>")
+    if info_declarations is None:
+        info_declarations = [
+            '##INFO=<ID=AC,Number=A,Type=Integer,Description="Total number '
+            'of alternate alleles in called genotypes">',
+            '##INFO=<ID=AF,Number=A,Type=Float,Description="Estimated '
+            'allele frequency in the range (0,1)">',
+            '##INFO=<ID=AN,Number=1,Type=Integer,Description="Total number '
+            'of alleles in called genotypes">',
+            '##INFO=<ID=NS,Number=1,Type=Integer,Description="Number of '
+            'samples with data">',
+            '##INFO=<ID=EAS_AF,Number=A,Type=Float,Description="Allele '
+            'frequency in the EAS populations calculated from AC and AN">',
+            '##INFO=<ID=EUR_AF,Number=A,Type=Float,Description="Allele '
+            'frequency in the EUR populations calculated from AC and AN">',
+            '##INFO=<ID=AFR_AF,Number=A,Type=Float,Description="Allele '
+            'frequency in the AFR populations calculated from AC and AN">',
+            '##INFO=<ID=AMR_AF,Number=A,Type=Float,Description="Allele '
+            'frequency in the AMR populations calculated from AC and AN">',
+            '##INFO=<ID=SAS_AF,Number=A,Type=Float,Description="Allele '
+            'frequency in the SAS populations calculated from AC and AN">',
+            '##INFO=<ID=VT,Number=.,Type=String,Description="indicates what '
+            'type of variant the line represents">',
+        ]
+    lines.extend(info_declarations)
+    if declare_format_gt:
+        lines.append(
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">'
+        )
     lines.append(
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
         + "\t".join(cohort.samples)
@@ -205,11 +224,27 @@ def write_vcf(
     cohort: SyntheticCohort | None = None,
     file_date: str = "20130502",
     seed: int = 1000,
+    reference: str = DEFAULT_REFERENCE,
+    contigs_override: dict[str, int] | None = None,
+    info_declarations: list[str] | None = None,
+    declare_format_gt: bool = True,
 ) -> str:
     """Write a bgzipped, tabix-indexed VCF. Returns the .vcf.gz path.
 
     `output_path` should end in `.vcf.gz`. A matching `.tbi` is generated
     alongside it.
+
+    Knobs relevant to QC-validation tests:
+      reference          — string written in `##reference=...`. Set to
+                           something non-human (e.g. "mm10") to trigger the
+                           unknown-build warning.
+      contigs_override   — replace the GRCh37 contig set with a custom dict
+                           (e.g. {"chr1_alt": 1000} to trigger the
+                           non-human-contig warning).
+      info_declarations  — replace the default INFO lines (drop AF/AC/AN to
+                           trigger the missing-allele-frequency warning).
+      declare_format_gt  — set False to omit the GT FORMAT declaration (to
+                           trigger the missing-GT warning).
     """
     if not output_path.endswith(".vcf.gz"):
         raise ValueError("output_path must end in .vcf.gz")
@@ -223,8 +258,15 @@ def write_vcf(
     vs = sorted(variants, key=lambda v: v.pos)
 
     plain_path = output_path[:-len(".gz")]  # .vcf
+    header_lines = _build_header(
+        chrom, cohort, file_date,
+        reference=reference,
+        contigs_override=contigs_override,
+        info_declarations=info_declarations,
+        declare_format_gt=declare_format_gt,
+    )
     with open(plain_path, "w") as fh:
-        for line in _build_header(chrom, cohort, file_date):
+        for line in header_lines:
             fh.write(line + "\n")
         for v in vs:
             gts = _realize_genotypes(v, cohort, rng)

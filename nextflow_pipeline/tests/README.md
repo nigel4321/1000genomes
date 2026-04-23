@@ -8,10 +8,11 @@ Tests are written against Python's stdlib `unittest` — no pip dependencies.
 |---|---|
 | `synthetic_vcf.py` | VCF 4.1-compliant synthetic data generator (1000G Phase 3 conventions: `##source=1000GenomesPhase3Pipeline`, `hs37d5` reference, per-super-pop AF INFO fields, phased diploid genotypes, `ALL.chrN.phase3_shapeit2_mvncall_integrated_v5b.<date>.genotypes.vcf.gz` filenames). |
 | `fixtures.py` | Shared cohort + variant fixtures. The default cohort is 20 real 1000G sample IDs (4 per super-pop: EUR/AFR/EAS/SAS/AMR). |
+| `test_qc_validate.py` | `qc_validate.py` — pass case, each soft-warning path (non-human reference, non-human contigs, missing `GT`, missing `AF`/`AC`+`AN`), and each hard-failure path (missing file, missing index, empty file) including strict vs non-strict exit behaviour. |
 | `test_inspect_vcf.py` | `inspect_vcf.py` metadata extraction — contigs, sample count, sample-hash stability, reference, pipeline/date tags. |
 | `test_scan_variant.py` | `scan_variant.py` — one test per pipeline status (`not_applicable`, `position_empty`, `absent`, `present_in_range`, `present_below_threshold`, `present_above_threshold`, `present_af_unknown`) plus carrier extraction and `chr`-prefix resolution. |
-| `test_reports.py` | The three markdown builders (`build_metadata_report.py`, `build_variant_report.py`, `build_carrier_report.py`) — aggregation, cohort-mismatch flagging, het+2·hom integrity check. |
-| `test_pipeline_e2e.py` | End-to-end `nextflow run main.nf` against two synthetic VCFs, asserts the four published outputs look right. |
+| `test_reports.py` | The four markdown builders (`build_qc_report.py`, `build_metadata_report.py`, `build_variant_report.py`, `build_carrier_report.py`) — aggregation, cohort-mismatch flagging, het+2·hom integrity check, QC pass/fail/warning rendering. |
+| `test_pipeline_e2e.py` | End-to-end `nextflow run main.nf` — a success path against two clean synthetic VCFs (asserts all five published outputs), plus a strict-QC abort path that sabotages a tabix index and verifies the pipeline halts at `QC_VALIDATE`. |
 
 ## Requirements
 
@@ -45,6 +46,17 @@ The generator produces bgzipped + tabix-indexed VCFs that share all the structur
 - Filename matches the real 1000G convention so `inspect_vcf.py`'s regex-based pipeline-tag and date-stamp extraction is exercised.
 
 See `synthetic_vcf.Variant` for ways to construct a record (direct genotype list, AF-per-super-pop draw, or edge cases like `strip_af_info=True` / `all_missing=True`).
+
+### QC-edge-case knobs
+
+`write_vcf()` also accepts parameters that let tests craft VCFs which should trip the QC soft-checks in `bin/qc_validate.py`:
+
+| Parameter | Effect |
+|---|---|
+| `reference="mm10.fa"` | Reference does not match a recognised human build → unknown-build warning. |
+| `contigs_override={"scaffold": 1000}` | Replaces the GRCh37 `##contig` set; combined with `chrom="scaffold"` the indexed contig is no longer a standard human chromosome. |
+| `info_declarations=[...]` | Replaces the default INFO header block. Omit `AF`, `AC`, and `AN` to trigger the missing-allele-frequency warning. |
+| `declare_format_gt=False` | Omits the `##FORMAT=<ID=GT...>` declaration → missing-GT warning. |
 
 ## Generating synthetic VCFs from the command line
 
