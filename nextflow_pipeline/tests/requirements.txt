@@ -1,0 +1,5 @@
+# No pip dependencies — tests run on Python stdlib only (unittest).
+#
+# System binaries required on PATH (not installable via pip):
+#   - bcftools, tabix, bgzip   (htslib, for all tests)
+#   - nextflow                 (only for test_pipeline_e2e.py)

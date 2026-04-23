@@ -1,0 +1,126 @@
+Apr-22 22:13:35.332 [main] DEBUG nextflow.cli.Launcher - $> nextflow run main.nf --input '/home/nigel/1000genomes/ALL.chr*.phase3*.vcf.gz' --outdir results -params-file variants/rs12913832.yaml
+Apr-22 22:13:35.594 [main] DEBUG nextflow.cli.CmdRun - N E X T F L O W  ~  version 25.10.4
+Apr-22 22:13:35.713 [main] DEBUG nextflow.plugin.PluginsFacade - Setting up plugin manager > mode=prod; embedded=false; plugins-dir=/home/nigel/.nextflow/plugins; core-plugins: nf-amazon@3.4.4,nf-azure@1.20.2,nf-cloudcache@0.5.0,nf-codecommit@0.5.0,nf-console@1.3.0,nf-google@1.23.5,nf-k8s@1.2.2,nf-tower@1.17.5,nf-wave@1.16.1
+Apr-22 22:13:35.798 [main] INFO  o.pf4j.DefaultPluginStatusProvider - Enabled plugins: []
+Apr-22 22:13:35.801 [main] INFO  o.pf4j.DefaultPluginStatusProvider - Disabled plugins: []
+Apr-22 22:13:35.811 [main] INFO  org.pf4j.DefaultPluginManager - PF4J version 3.12.0 in 'deployment' mode
+Apr-22 22:13:35.886 [main] DEBUG nextflow.util.RetryConfig - Missing nextflow session - using default retry config
+Apr-22 22:13:36.541 [main] INFO  org.pf4j.AbstractPluginManager - No plugins
+Apr-22 22:13:36.829 [main] DEBUG nextflow.config.ConfigBuilder - Found config local: /home/nigel/1000genomes/nextflow_pipeline/nextflow.config
+Apr-22 22:13:36.843 [main] DEBUG nextflow.config.ConfigBuilder - Parsing config file: /home/nigel/1000genomes/nextflow_pipeline/nextflow.config
+Apr-22 22:13:37.053 [main] DEBUG nextflow.config.ConfigBuilder - Applying config profile: `standard`
+Apr-22 22:13:39.490 [main] DEBUG nextflow.plugin.PluginsFacade - Plugins default=[]
+Apr-22 22:13:39.491 [main] DEBUG nextflow.plugin.PluginsFacade - Plugins resolved requirement=[]
+Apr-22 22:13:39.601 [main] DEBUG n.secret.LocalSecretsProvider - Secrets store: /home/nigel/.nextflow/secrets/store.json
+Apr-22 22:13:39.617 [main] DEBUG nextflow.secret.SecretsLoader - Discovered secrets providers: [nextflow.secret.LocalSecretsProvider@b67cc70] - activable => nextflow.secret.LocalSecretsProvider@b67cc70
+Apr-22 22:13:39.626 [main] DEBUG nextflow.cli.CmdRun - Applied DSL=2 from script declaration
+Apr-22 22:13:39.697 [main] DEBUG nextflow.cli.CmdRun - Launching `main.nf` [insane_stonebraker] DSL2 - revision: e688306e63
+Apr-22 22:13:39.926 [main] DEBUG nextflow.Session - Session UUID: 67428fe4-f8b6-4322-bd17-bb72f6ba8693
+Apr-22 22:13:39.940 [main] DEBUG nextflow.Session - Run name: insane_stonebraker
+Apr-22 22:13:39.941 [main] DEBUG nextflow.Session - Executor pool size: 3
+Apr-22 22:13:40.005 [main] DEBUG nextflow.file.FilePorter - File porter settings maxRetries=3; maxTransfers=50; pollTimeout=null
+Apr-22 22:13:40.039 [main] DEBUG nextflow.util.ThreadPoolBuilder - Creating thread pool 'FileTransfer' minSize=10; maxSize=10; workQueue=LinkedBlockingQueue[-1]; allowCoreThreadTimeout=false
+Apr-22 22:13:40.184 [main] DEBUG nextflow.cli.CmdRun - 
+  Version: 25.10.4 build 11173
+  Created: 10-02-2026 15:17 UTC 
+  System: Linux 6.8.0-110-generic
+  Runtime: Groovy 4.0.28 on OpenJDK 64-Bit Server VM 21.0.10+7-Ubuntu-124.04
+  Encoding: UTF-8 (UTF-8)
+  Process: 28925@scw-nifty-hofstadter [127.0.1.1]
+  CPUs: 3 - Mem: 3.8 GB (129 MB) - Swap: 0 (0)
+Apr-22 22:13:40.310 [main] DEBUG nextflow.Session - Work-dir: /home/nigel/1000genomes/nextflow_pipeline/work [ext2/ext3]
+Apr-22 22:13:40.472 [main] DEBUG nextflow.executor.ExecutorFactory - Extension executors providers=[]
+Apr-22 22:13:40.505 [main] DEBUG nextflow.Session - Observer factory (v2): LinObserverFactory
+Apr-22 22:13:40.520 [main] DEBUG nextflow.Session - Observer factory (v2): DefaultObserverFactory
+Apr-22 22:13:40.711 [main] DEBUG nextflow.cache.CacheFactory - Using Nextflow cache factory: nextflow.cache.DefaultCacheFactory
+Apr-22 22:13:40.755 [main] DEBUG nextflow.util.CustomThreadPool - Creating default thread pool > poolSize: 4; maxThreads: 1000
+Apr-22 22:13:41.153 [main] DEBUG nextflow.Session - Session start
+Apr-22 22:13:42.127 [main] DEBUG nextflow.script.ScriptRunner - > Launching execution
+Apr-22 22:13:43.835 [main] DEBUG n.script.dsl.ProcessConfigBuilder - Config settings `withName:INSPECT_VCF|SCAN_VARIANT` matches process INSPECT_VCF
+Apr-22 22:13:43.874 [main] DEBUG nextflow.executor.ExecutorFactory - << taskConfig executor: local
+Apr-22 22:13:43.875 [main] DEBUG nextflow.executor.ExecutorFactory - >> processorType: 'local'
+Apr-22 22:13:43.915 [main] DEBUG nextflow.executor.Executor - [warm up] executor > local
+Apr-22 22:13:43.954 [main] DEBUG n.processor.LocalPollingMonitor - Creating local task monitor for executor 'local' > cpus=3; memory=3.8 GB; capacity=16; pollInterval=100ms; dumpInterval=5m
+Apr-22 22:13:43.967 [main] DEBUG n.processor.TaskPollingMonitor - >>> barrier register (monitor: local)
+Apr-22 22:13:44.058 [main] DEBUG nextflow.processor.TaskProcessor - Creating process 'INSPECT_VCF': maxForks=0; fair=false; array=0
+Apr-22 22:13:44.250 [main] DEBUG n.script.dsl.ProcessConfigBuilder - Config settings `withName:INSPECT_VCF|SCAN_VARIANT` matches process SCAN_VARIANT
+Apr-22 22:13:44.256 [main] DEBUG nextflow.executor.ExecutorFactory - << taskConfig executor: local
+Apr-22 22:13:44.257 [main] DEBUG nextflow.executor.ExecutorFactory - >> processorType: 'local'
+Apr-22 22:13:44.261 [main] DEBUG nextflow.processor.TaskProcessor - Creating process 'SCAN_VARIANT': maxForks=0; fair=false; array=0
+Apr-22 22:13:44.335 [main] DEBUG n.script.dsl.ProcessConfigBuilder - Config settings `withName:METADATA_REPORT|VARIANT_REPORT` matches process METADATA_REPORT
+Apr-22 22:13:44.341 [main] DEBUG nextflow.executor.ExecutorFactory - << taskConfig executor: local
+Apr-22 22:13:44.342 [main] DEBUG nextflow.executor.ExecutorFactory - >> processorType: 'local'
+Apr-22 22:13:44.345 [main] DEBUG nextflow.processor.TaskProcessor - Creating process 'METADATA_REPORT': maxForks=0; fair=false; array=0
+Apr-22 22:13:44.369 [main] DEBUG n.script.dsl.ProcessConfigBuilder - Config settings `withName:METADATA_REPORT|VARIANT_REPORT` matches process VARIANT_REPORT
+Apr-22 22:13:44.374 [main] DEBUG nextflow.executor.ExecutorFactory - << taskConfig executor: local
+Apr-22 22:13:44.374 [main] DEBUG nextflow.executor.ExecutorFactory - >> processorType: 'local'
+Apr-22 22:13:44.377 [main] DEBUG nextflow.processor.TaskProcessor - Creating process 'VARIANT_REPORT': maxForks=0; fair=false; array=0
+Apr-22 22:13:44.412 [main] DEBUG nextflow.executor.ExecutorFactory - << taskConfig executor: local
+Apr-22 22:13:44.413 [main] DEBUG nextflow.executor.ExecutorFactory - >> processorType: 'local'
+Apr-22 22:13:44.417 [main] DEBUG nextflow.processor.TaskProcessor - Creating process 'CARRIER_REPORT': maxForks=0; fair=false; array=0
+Apr-22 22:13:44.427 [main] DEBUG nextflow.Session - Workflow process names [dsl2]: METADATA_REPORT, CARRIER_REPORT, SCAN_VARIANT, INSPECT_VCF, VARIANT_REPORT
+Apr-22 22:13:44.454 [main] DEBUG nextflow.Session - Igniting dataflow network (6)
+Apr-22 22:13:44.532 [main] DEBUG nextflow.processor.TaskProcessor - Starting process > INSPECT_VCF
+Apr-22 22:13:44.536 [main] DEBUG nextflow.processor.TaskProcessor - Starting process > SCAN_VARIANT
+Apr-22 22:13:44.541 [main] DEBUG nextflow.processor.TaskProcessor - Starting process > METADATA_REPORT
+Apr-22 22:13:44.542 [main] DEBUG nextflow.processor.TaskProcessor - Starting process > VARIANT_REPORT
+Apr-22 22:13:44.543 [main] DEBUG nextflow.processor.TaskProcessor - Starting process > CARRIER_REPORT
+Apr-22 22:13:44.558 [main] DEBUG nextflow.script.ScriptRunner - Parsed script files:
+  Script_6e1d137f80e90e41: /home/nigel/1000genomes/nextflow_pipeline/main.nf
+  Script_9a7475383924a49e: /home/nigel/1000genomes/nextflow_pipeline/modules/reports.nf
+  Script_124588af9fe69481: /home/nigel/1000genomes/nextflow_pipeline/modules/scan_variant.nf
+  Script_504dcb297d0e72e1: /home/nigel/1000genomes/nextflow_pipeline/modules/inspect_vcf.nf
+Apr-22 22:13:44.559 [main] DEBUG nextflow.script.ScriptRunner - > Awaiting termination 
+Apr-22 22:13:44.559 [main] DEBUG nextflow.Session - Session await
+Apr-22 22:13:44.563 [PathVisitor-1] DEBUG nextflow.file.PathVisitor - files for syntax: glob; folder: /home/nigel/1000genomes/; pattern: ALL.chr*.phase3*.vcf.gz; options: [checkIfExists:true]
+Apr-22 22:13:45.548 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:45.556 [Task submitter] INFO  nextflow.Session - [7b/68c570] Submitted process > INSPECT_VCF (ALL.chr20.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:45.604 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:45.607 [Task submitter] INFO  nextflow.Session - [65/9d6549] Submitted process > INSPECT_VCF (ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:45.643 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:45.647 [Task submitter] INFO  nextflow.Session - [2c/c416a8] Submitted process > INSPECT_VCF (ALL.chr19.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:45.923 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 5; name: INSPECT_VCF (ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/65/9d6549f25395a64f59294d46fef9b8]
+Apr-22 22:13:45.929 [Task monitor] DEBUG nextflow.util.ThreadPoolBuilder - Creating thread pool 'TaskFinalizer' minSize=10; maxSize=10; workQueue=LinkedBlockingQueue[-1]; allowCoreThreadTimeout=false
+Apr-22 22:13:45.955 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:45.957 [Task submitter] INFO  nextflow.Session - [55/e1af67] Submitted process > SCAN_VARIANT (ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:45.988 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 1; name: INSPECT_VCF (ALL.chr20.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/7b/68c5704fe30195d165bc60fa1ed1ca]
+Apr-22 22:13:46.019 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 3; name: INSPECT_VCF (ALL.chr19.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/2c/c416a8de80eef5df86c6a680fa71bf]
+Apr-22 22:13:46.029 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:46.033 [Task submitter] INFO  nextflow.Session - [df/883ffd] Submitted process > SCAN_VARIANT (ALL.chr19.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:46.061 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:46.065 [Task submitter] INFO  nextflow.Session - [b1/115ca3] Submitted process > SCAN_VARIANT (ALL.chr20.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:46.479 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 2; name: SCAN_VARIANT (ALL.chr20.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/b1/115ca380e8fdde1552de759b836e0a]
+Apr-22 22:13:46.544 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 6; name: SCAN_VARIANT (ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/55/e1af6765df48a651008bab7cf62a81]
+Apr-22 22:13:46.543 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:46.550 [Task submitter] INFO  nextflow.Session - [50/cb936b] Submitted process > INSPECT_VCF (ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:46.559 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 4; name: SCAN_VARIANT (ALL.chr19.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/df/883ffdb7360292e5749854d1e71597]
+Apr-22 22:13:46.614 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:46.619 [Task submitter] INFO  nextflow.Session - [bb/cfe6ab] Submitted process > INSPECT_VCF (ALL.chr21.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:46.648 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:46.651 [Task submitter] INFO  nextflow.Session - [ce/cc487e] Submitted process > SCAN_VARIANT (ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:46.909 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 8; name: INSPECT_VCF (ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/50/cb936bfb914372f1ff18e25990cc12]
+Apr-22 22:13:46.911 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 7; name: SCAN_VARIANT (ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/ce/cc487ee906b74914ab5a3ad042a9b1]
+Apr-22 22:13:46.953 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:46.955 [Task submitter] INFO  nextflow.Session - [d4/c3d167] Submitted process > SCAN_VARIANT (ALL.chr21.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes)
+Apr-22 22:13:46.985 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 9; name: INSPECT_VCF (ALL.chr21.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/bb/cfe6ab4487470e17f4436518f1a298]
+Apr-22 22:13:47.115 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:47.118 [Task submitter] INFO  nextflow.Session - [fe/2950e5] Submitted process > METADATA_REPORT
+Apr-22 22:13:47.229 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 10; name: SCAN_VARIANT (ALL.chr21.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes); status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/d4/c3d1670711d3861f3b40a31eb1247a]
+Apr-22 22:13:47.351 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:47.352 [Task submitter] INFO  nextflow.Session - [16/a4af97] Submitted process > CARRIER_REPORT
+Apr-22 22:13:47.445 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 11; name: METADATA_REPORT; status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/fe/2950e5bc6d3052caed04c4dcb8416e]
+Apr-22 22:13:47.492 [Task submitter] DEBUG n.executor.local.LocalTaskHandler - Launch cmd line: /bin/bash -ue .command.run
+Apr-22 22:13:47.493 [Task submitter] INFO  nextflow.Session - [3a/f83bb2] Submitted process > VARIANT_REPORT
+Apr-22 22:13:47.545 [TaskFinalizer-2] DEBUG nextflow.util.ThreadPoolBuilder - Creating thread pool 'PublishDir' minSize=10; maxSize=10; workQueue=LinkedBlockingQueue[-1]; allowCoreThreadTimeout=false
+Apr-22 22:13:47.644 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 13; name: CARRIER_REPORT; status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/16/a4af97a1f00d14cb3ed0eecf52664a]
+Apr-22 22:13:47.771 [Task monitor] DEBUG n.processor.TaskPollingMonitor - Task completed > TaskHandler[id: 12; name: VARIANT_REPORT; status: COMPLETED; exit: 0; error: -; workDir: /home/nigel/1000genomes/nextflow_pipeline/work/3a/f83bb27df01d3dc54b14b57eadcb9a]
+Apr-22 22:13:47.781 [main] DEBUG nextflow.Session - Session await > all processes finished
+Apr-22 22:13:47.872 [Task monitor] DEBUG n.processor.TaskPollingMonitor - <<< barrier arrives (monitor: local) - terminating tasks monitor poll loop
+Apr-22 22:13:47.873 [main] DEBUG nextflow.Session - Session await > all barriers passed
+Apr-22 22:13:47.883 [main] DEBUG nextflow.util.ThreadPoolManager - Thread pool 'TaskFinalizer' shutdown completed (hard=false)
+Apr-22 22:13:47.888 [main] DEBUG nextflow.util.ThreadPoolManager - Thread pool 'PublishDir' shutdown completed (hard=false)
+Apr-22 22:13:47.893 [main] INFO  nextflow.Nextflow - Pipeline complete — reports in results
+Apr-22 22:13:47.920 [main] DEBUG n.trace.WorkflowStatsObserver - Workflow completed > WorkflowStats[succeededCount=13; failedCount=0; ignoredCount=0; cachedCount=0; pendingCount=0; submittedCount=0; runningCount=0; retriesCount=0; abortedCount=0; succeedDuration=3.9s; failedDuration=0ms; cachedDuration=0ms;loadCpus=0; loadMemory=0; peakRunning=6; peakCpus=6; peakMemory=6 GB; ]
+Apr-22 22:13:48.126 [main] DEBUG nextflow.cache.CacheDB - Closing CacheDB done
+Apr-22 22:13:48.177 [main] DEBUG nextflow.util.ThreadPoolManager - Thread pool 'FileTransfer' shutdown completed (hard=false)
+Apr-22 22:13:48.180 [main] DEBUG nextflow.script.ScriptRunner - > Execution complete -- Goodbye
