@@ -252,3 +252,122 @@ def standard_filename(dir_path: str, chrom: str,
         f"{date_stamp}.genotypes.vcf.gz"
     )
     return os.path.join(dir_path, base)
+
+
+# -----------------------------------------------------------------------------
+# CLI — run `python3 synthetic_vcf.py --help` for usage.
+# -----------------------------------------------------------------------------
+
+_BASES = ("A", "C", "G", "T")
+
+
+def _random_variants(n: int, chrom: str, rng: random.Random,
+                     pos_start: int | None = None,
+                     pos_stop: int | None = None) -> list[Variant]:
+    chrom_len = GRCH37_CONTIG_LENGTHS.get(chrom)
+    lo = pos_start if pos_start is not None else 1_000_000
+    hi = pos_stop if pos_stop is not None else (chrom_len or 50_000_000)
+    if hi <= lo:
+        raise ValueError(f"pos-stop ({hi}) must be > pos-start ({lo})")
+    # Evenly spaced positions avoid accidental duplicates and sort order issues.
+    step = max(1, (hi - lo) // (n + 1))
+    variants = []
+    for i in range(n):
+        pos = lo + step * (i + 1)
+        ref = rng.choice(_BASES)
+        alt = rng.choice([b for b in _BASES if b != ref])
+        af = rng.betavariate(0.5, 5.0)  # skewed low, mimicking real MAF spectrum
+        variants.append(Variant(pos=pos, ref=ref, alt=alt,
+                                af_by_pop={"ALL": af}))
+    return variants
+
+
+def _cli() -> int:
+    import argparse
+    import sys
+
+    p = argparse.ArgumentParser(
+        description=(
+            "Generate a synthetic 1000G Phase 3-style VCF (bgzipped + "
+            "tabix-indexed)."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--chrom", required=True,
+                   help="Chromosome (e.g. 15, 22, X). No 'chr' prefix.")
+    p.add_argument("--output", "-o",
+                   help="Output .vcf.gz path. Default: standard 1000G "
+                        "filename in --outdir.")
+    p.add_argument("--outdir", default=".",
+                   help="Directory for the default filename (ignored if "
+                        "--output is set).")
+    p.add_argument("--n-variants", type=int, default=100,
+                   help="Number of random SNPs to emit.")
+    p.add_argument("--pos-start", type=int, default=None,
+                   help="Lower bound for random variant positions.")
+    p.add_argument("--pos-stop", type=int, default=None,
+                   help="Upper bound for random variant positions.")
+    p.add_argument("--seed", type=int, default=1000,
+                   help="RNG seed — genotypes AND random positions are "
+                        "derived from this.")
+    p.add_argument("--date-stamp", default="20130502",
+                   help="Date stamp used in the default filename.")
+    # Optional: splice in a specific known variant at a fixed position/allele.
+    p.add_argument("--target-name", default=None,
+                   help="Include a named variant at --target-pos with the "
+                        "given AFs. Pairs with --target-pos/--target-ref/"
+                        "--target-alt/--target-af-*.")
+    p.add_argument("--target-pos", type=int, default=None)
+    p.add_argument("--target-ref", default=None)
+    p.add_argument("--target-alt", default=None)
+    p.add_argument("--target-af-eur", type=float, default=0.0)
+    p.add_argument("--target-af-afr", type=float, default=0.0)
+    p.add_argument("--target-af-eas", type=float, default=0.0)
+    p.add_argument("--target-af-sas", type=float, default=0.0)
+    p.add_argument("--target-af-amr", type=float, default=0.0)
+    args = p.parse_args()
+
+    out_path = args.output or standard_filename(
+        args.outdir, args.chrom, args.date_stamp
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    rng = random.Random(args.seed)
+    variants = _random_variants(args.n_variants, args.chrom, rng,
+                                args.pos_start, args.pos_stop)
+
+    if args.target_name is not None:
+        missing = [k for k, v in {
+            "--target-pos": args.target_pos,
+            "--target-ref": args.target_ref,
+            "--target-alt": args.target_alt,
+        }.items() if v in (None, "")]
+        if missing:
+            p.error("--target-name requires: " + ", ".join(missing))
+        variants.append(Variant(
+            pos=args.target_pos,
+            ref=args.target_ref,
+            alt=args.target_alt,
+            variant_id=args.target_name,
+            af_by_pop={
+                "EUR": args.target_af_eur,
+                "AFR": args.target_af_afr,
+                "EAS": args.target_af_eas,
+                "SAS": args.target_af_sas,
+                "AMR": args.target_af_amr,
+            },
+        ))
+
+    path = write_vcf(
+        out_path, args.chrom, variants,
+        cohort=SyntheticCohort(), file_date=args.date_stamp, seed=args.seed,
+    )
+    n = len(variants)
+    print(f"wrote {path} ({n} variant{'s' if n != 1 else ''}, "
+          f"{len(DEFAULT_SAMPLES)} samples)", file=sys.stderr)
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
