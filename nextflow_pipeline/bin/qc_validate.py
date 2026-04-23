@@ -108,24 +108,47 @@ def _parse_index(idx_stdout: str) -> tuple[list[str], int | None]:
     return contigs, (total if have_counts else None)
 
 
-def _max_position_per_contig(vcf: str, contigs: list[str]) -> dict[str, int]:
-    """Return the largest POS per contig via tabix seek + tail."""
-    out: dict[str, int] = {}
+def _has_any_record(vcf: str, contig: str) -> bool:
+    """True if the VCF has at least one variant record on `contig`.
+
+    Implemented via Popen + readline() so the check is O(1) even on very
+    large contigs (chr20 in 1000G Phase 3 is 1.7M records × 2504 samples).
+    """
+    proc = subprocess.Popen(
+        ["bcftools", "view", "-H", "-r", contig, vcf],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    assert proc.stdout is not None
+    first = proc.stdout.readline()
+    proc.stdout.close()
+    proc.wait()
+    return bool(first.strip())
+
+
+def _contigs_with_overlong_positions(vcf: str, contigs: list[str],
+                                     threshold: int) -> list[str]:
+    """Return contigs that have any variant past `threshold` (via tabix seek).
+
+    Cheap: a single region query `contig:threshold+1-999999999`. tabix returns
+    zero rows if no such variant exists, so this is O(1) per contig even on
+    a 300 MB chromosome, vs. O(n_variants) for a full-scan max-position.
+    """
+    suspect: list[str] = []
     for c in contigs:
-        # Stream from the given contig, grab only POS, keep the max. bcftools
-        # streams in order so the last non-empty line holds the max.
-        r = _run(["bcftools", "query", "-f", "%POS\n", "-r", c, vcf])
-        last = ""
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if line:
-                last = line
-        if last:
-            try:
-                out[c] = int(last)
-            except ValueError:
-                pass
-    return out
+        region = f"{c}:{threshold + 1}-999999999"
+        # -H: headers off. Capture only the first line of output via Popen so
+        # we don't buffer the whole matching region into memory.
+        proc = subprocess.Popen(
+            ["bcftools", "view", "-H", "-r", region, vcf],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        assert proc.stdout is not None
+        first = proc.stdout.readline()
+        proc.stdout.close()
+        proc.wait()
+        if first.strip():
+            suspect.append(c)
+    return suspect
 
 
 def run_qc(vcf_path: str, name: str) -> dict:
@@ -172,17 +195,24 @@ def run_qc(vcf_path: str, name: str) -> dict:
     # --- Hard: indexed contigs + record count ---
     idx_proc = _run(["bcftools", "index", "-s", vcf_path])
     contigs, total_records = _parse_index(idx_proc.stdout)
+    # Older tabix indices (e.g. 1000G Phase 3) lack the count metadata that
+    # `bcftools index -s` needs — it then exits 1 with empty stdout. Fall back
+    # to `tabix -l`, which works for any tabix-format index.
+    if not contigs:
+        tbx = _run(["tabix", "-l", vcf_path])
+        contigs = [c.strip() for c in tbx.stdout.splitlines() if c.strip()]
     checks["contigs"] = contigs
     checks["n_variants"] = total_records
     if not contigs:
-        errors.append("index reports no contigs (file may have no data)")
+        errors.append("no contigs found in index "
+                      "(`bcftools index -s` and `tabix -l` both empty)")
     if total_records is not None and total_records == 0:
         errors.append("file contains zero variant records")
     elif total_records is None and contigs:
-        # Older indices lack counts — fall back to a streaming peek for the
-        # presence of at least one record.
-        r = _run(["bcftools", "view", "-H", "-r", contigs[0], vcf_path])
-        if not r.stdout.strip():
+        # No per-contig counts available — peek at the first record via Popen
+        # so we don't buffer the whole contig into memory (chr20 in the 1000G
+        # release is 1.7M records × 2.5k samples — several GB).
+        if not _has_any_record(vcf_path, contigs[0]):
             errors.append("file contains no variant records in first contig")
 
     # --- Soft: reference build ---
@@ -227,14 +257,14 @@ def run_qc(vcf_path: str, name: str) -> dict:
     # --- Soft: variant position sanity ---
     if contigs and not errors:
         # Only when the rest of the file checks out — otherwise don't spend
-        # the I/O. One-contig-per-file (1000G layout) keeps this cheap.
-        max_pos = _max_position_per_contig(vcf_path, contigs)
-        checks["max_position_per_contig"] = max_pos
-        overlong = {c: p for c, p in max_pos.items()
-                    if p > MAX_HUMAN_CHROM_LENGTH}
+        # the I/O.
+        overlong = _contigs_with_overlong_positions(
+            vcf_path, contigs, MAX_HUMAN_CHROM_LENGTH,
+        )
+        checks["contigs_with_overlong_positions"] = overlong
         if overlong:
             warnings.append(
-                f"variant positions exceed plausible human chromosome "
+                f"contigs have variants past plausible human chromosome "
                 f"length ({MAX_HUMAN_CHROM_LENGTH:,} bp): {overlong}"
             )
 

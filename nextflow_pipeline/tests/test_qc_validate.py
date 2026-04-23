@@ -141,6 +141,69 @@ class QcValidateWarningsTest(unittest.TestCase):
         )
 
 
+class QcValidateLegacyIndexTest(unittest.TestCase):
+    """Older tabix indices (e.g. 1000G Phase 3) lack count metadata so
+    `bcftools index -s` exits 1 with empty stdout. QC must fall back to
+    `tabix -l` — before the fix, real chr20 was flagged as "no contigs"."""
+
+    @classmethod
+    def setUpClass(cls):
+        require_tools("bcftools", "tabix", "bgzip")
+        cls.tmpdir = tempfile.mkdtemp(prefix="qc_legacy_idx_")
+        cls.vcf = write_vcf(
+            standard_filename(cls.tmpdir, "15"), "15",
+            in_range_variants(), default_cohort(),
+        )
+
+    def _shadowed_bcftools(self) -> str:
+        """Create a bcftools wrapper that simulates a legacy tabix index.
+
+        For `bcftools index -s`: exit 1, empty stdout (matches what htslib
+        emits for pre-counts indices). Everything else delegates to the real
+        binary.
+        """
+        real = os.environ.get("REAL_BCFTOOLS") or \
+            subprocess.run(["which", "bcftools"], capture_output=True,
+                           text=True).stdout.strip()
+        shadow_dir = os.path.join(self.tmpdir, "shadow_bin")
+        os.makedirs(shadow_dir, exist_ok=True)
+        wrapper = os.path.join(shadow_dir, "bcftools")
+        with open(wrapper, "w") as fh:
+            fh.write(
+                "#!/bin/bash\n"
+                f'real={real}\n'
+                'if [[ "$1" == "index" && "$2" == "-s" ]]; then\n'
+                '  exit 1\n'
+                'fi\n'
+                'exec "$real" "$@"\n'
+            )
+        os.chmod(wrapper, 0o755)
+        return shadow_dir
+
+    def test_falls_back_to_tabix_l(self):
+        shadow = self._shadowed_bcftools()
+        env = os.environ.copy()
+        env["PATH"] = shadow + os.pathsep + env["PATH"]
+        out = os.path.join(self.tmpdir, "legacy.qc.json")
+        proc = subprocess.run(
+            [sys.executable, bin_script("qc_validate.py"),
+             "--vcf", self.vcf, "--name", "legacy",
+             "--out", out, "--strict"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(
+            proc.returncode, 0,
+            msg=f"expected pass via tabix -l fallback\n"
+                f"stderr:\n{proc.stderr}",
+        )
+        with open(out) as fh:
+            result = json.load(fh)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["checks"]["contigs"], ["15"])
+        # Counts unavailable from the shadow → n_variants should be null.
+        self.assertIsNone(result["checks"]["n_variants"])
+
+
 class QcValidateHardFailuresTest(unittest.TestCase):
     """Hard checks abort in strict mode and are reported otherwise."""
 

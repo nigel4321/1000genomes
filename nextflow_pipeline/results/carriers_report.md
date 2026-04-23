@@ -2,18 +2,19 @@
 
 ## Summary
 
-- **Carrier records (rows in `carriers.tsv`):** 4
-- **Unique individuals carrying the alt allele:** 4
-- **Heterozygotes (dosage = 1):** 1
-- **Homozygous alt (dosage = 2):** 3
-- **Files containing the variant:** 1
-- **Allele-count integrity check:** het + 2·hom = 1 + 2·3 = **7**
+- **Carrier records (rows in `carriers.tsv`):** 1274
+- **Unique individuals carrying the alt allele:** 637
+- **Heterozygotes (dosage = 1):** 772
+- **Homozygous alt (dosage = 2):** 502
+- **Files containing the variant:** 2
+- **Allele-count integrity check:** het + 2·hom = 772 + 2·502 = **1776**
 
 ## Per-file breakdown
 
 | File | Heterozygotes | Homozygous alt | Total carriers |
 |---|---|---|---|
-| `ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz` | 1 | 3 | 4 |
+| `ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz` | 386 | 251 | 637 |
+| `rs12913832.vcf.gz` | 386 | 251 | 637 |
 
 ## Output files
 
@@ -26,6 +27,12 @@
 |---|---|---|
 | HG00096 | 1|1 | 2 |
 | HG00097 | 1|1 | 2 |
+| HG00099 | 1|1 | 2 |
 | HG00100 | 1|1 | 2 |
-| HG01112 | 0|1 | 1 |
+| HG00101 | 1|1 | 2 |
+| HG00102 | 1|1 | 2 |
+| HG00103 | 1|1 | 2 |
+| HG00105 | 1|1 | 2 |
+| HG00106 | 1|1 | 2 |
+| HG00107 | 0|1 | 1 |
 
