@@ -1,0 +1,13 @@
+# No pip dependencies — generate_people.py runs on Python 3.8+ stdlib only
+# (argparse, glob, os, random, shutil, subprocess, sys, urllib.request,
+#  pathlib).
+#
+# System binaries required on PATH (invoked via subprocess, not installable
+# via pip):
+#   - bcftools   (htslib) — ClinVar + 1000G query + filter
+#   - bgzip      (htslib) — compress output VCFs
+#   - tabix      (htslib) — index output VCFs
+#
+# Network access is required only on first run (to download the ClinVar VCF
+# from https://ftp.ncbi.nlm.nih.gov/pub/clinvar/). Subsequent runs read
+# ./cache/.
