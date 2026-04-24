@@ -15,6 +15,14 @@ from .clinvar import (
     fetch_clinvar,
     load_highlighted_candidates,
 )
+from .coalescent import (
+    DEFAULT_CHR_LENGTH_MB,
+    DEFAULT_DEMO_MODEL,
+    DEFAULT_MU,
+    DEFAULT_POPULATION,
+    DEFAULT_REC_RATE,
+    simulate_cohort,
+)
 from .cohort import draw_cohort_background, person_records_from_cohort
 from .sfs import (
     DEFAULT_SFS_ALPHA,
@@ -74,10 +82,11 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(
         description=(
-            "Generate a cohort of synthetic person VCFs. Background sites "
-            "are shared across the cohort with allele frequencies drawn "
-            "from a power-law SFS (singletons dominate); each person "
-            "receives a ClinVar-highlighted variant on top."
+            "Generate a cohort of synthetic person VCFs. The default path "
+            "simulates an LD-correct coalescent with stdpopsim demography; "
+            "pass --legacy-background for the M4 1000G-pool + power-law "
+            "SFS sampler. Each person receives a ClinVar-highlighted "
+            "variant on top of the shared cohort background."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -95,20 +104,48 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    help="RNG seed for deterministic output. Omit for "
                         "different people each run.")
     p.add_argument("--background-glob", action="append", default=None,
-                   help="Glob(s) for common-variant source VCFs. "
+                   help="[legacy] Glob(s) for common-variant source VCFs. "
                         "Pass multiple times to combine sources. "
                         f"Default: {default_bg}")
     p.add_argument("--n-background", type=int, default=500,
-                   help="Number of shared background sites the cohort is "
-                        "drawn over (hom-ref calls are dropped per person)")
+                   help="[legacy] Number of shared background sites the "
+                        "cohort is drawn over (hom-ref calls dropped "
+                        "per person)")
     p.add_argument("--af-min", type=float, default=0.05,
-                   help="Minimum AF filter when loading the coordinate pool "
-                        "from 1000G sources (source AFs are not used "
-                        "downstream — only coordinates and alleles are)")
+                   help="[legacy] Minimum AF filter when loading the "
+                        "coordinate pool from 1000G sources")
     p.add_argument("--sfs-alpha", type=float, default=DEFAULT_SFS_ALPHA,
-                   help="Power-law exponent for the cohort SFS: P(k) ∝ 1/k^α. "
-                        "α=1.0 is Watterson-neutral; α=2.0 (default) biases "
-                        "toward singletons, matching gnomAD-like spectra.")
+                   help="[legacy path] Power-law exponent for the cohort "
+                        "SFS: P(k) ∝ 1/k^α. α=1.0 is Watterson-neutral; "
+                        "α=2.0 (default) biases toward singletons, "
+                        "matching gnomAD-like spectra.")
+    p.add_argument("--legacy-background", action="store_true",
+                   help="Use the M4 1000G-pool + power-law SFS sampler "
+                        "instead of the coalescent. No LD, no realistic "
+                        "demography — retained for comparison and "
+                        "offline-only use.")
+    p.add_argument("--chromosomes", default="22",
+                   help="[coalescent] Comma-separated chromosomes to "
+                        "simulate (e.g. '19,20,21,22'). Shorter list = "
+                        "faster run.")
+    p.add_argument("--chr-length-mb", type=float,
+                   default=DEFAULT_CHR_LENGTH_MB,
+                   help="[coalescent] Simulated prefix length per "
+                        "chromosome in Mb. 0 = full length (slow on big "
+                        "chromosomes, fine for chr22).")
+    p.add_argument("--demo-model", default=DEFAULT_DEMO_MODEL,
+                   help="[coalescent] stdpopsim demographic model id. "
+                        "Pass 'none' for a constant-size Ne=10k "
+                        "single-pop msprime draw (no real demography).")
+    p.add_argument("--population", default=DEFAULT_POPULATION,
+                   help="[coalescent] Sampling population within the demo "
+                        "model (e.g. CEU / YRI / CHB for OutOfAfrica_3G09).")
+    p.add_argument("--rec-rate", type=float, default=DEFAULT_REC_RATE,
+                   help="[coalescent, --demo-model=none only] Uniform "
+                        "recombination rate per bp per generation.")
+    p.add_argument("--mu", type=float, default=DEFAULT_MU,
+                   help="[coalescent, --demo-model=none only] Mutation "
+                        "rate per bp per generation.")
     p.add_argument("--clinvar-sig",
                    default=",".join(sorted(DEFAULT_SIG_FILTER)),
                    help="Comma-separated CLNSIG values to include when "
@@ -150,25 +187,48 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("no ClinVar variants matched the CLNSIG filter — widen "
                  "--clinvar-sig")
 
-    bg_globs = args.background_glob or [args._default_bg]
-    print(f"Sampling background coordinates from: {bg_globs}", file=sys.stderr)
-    background_pool = load_background_pool(
-        bg_globs, args.af_min, per_source_limit=5000, rng=rng,
-    )
-    print(f"  coordinate pool: {len(background_pool)} variants",
-          file=sys.stderr)
-    if not background_pool:
-        print("  [warn] no background sources matched — output VCFs will "
-              "contain only the highlighted variant", file=sys.stderr)
+    if args.legacy_background:
+        bg_globs = args.background_glob or [args._default_bg]
+        print(f"[legacy] Sampling background coordinates from: {bg_globs}",
+              file=sys.stderr)
+        background_pool = load_background_pool(
+            bg_globs, args.af_min, per_source_limit=5000, rng=rng,
+        )
+        print(f"  coordinate pool: {len(background_pool)} variants",
+              file=sys.stderr)
+        if not background_pool:
+            print("  [warn] no background sources matched — output VCFs "
+                  "will contain only the highlighted variant",
+                  file=sys.stderr)
+        print(
+            f"[legacy] Drawing cohort background: {args.n_background} "
+            f"shared sites across {args.n} people (α={args.sfs_alpha})",
+            file=sys.stderr,
+        )
+        cohort_sites = draw_cohort_background(
+            background_pool, args.n, args.n_background, args.sfs_alpha,
+            rng,
+        )
+    else:
+        chromosomes = [c.strip() for c in args.chromosomes.split(",")
+                       if c.strip()]
+        demo_model = None if args.demo_model.lower() == "none" \
+            else args.demo_model
+        print(
+            f"Simulating coalescent cohort: {args.n} people across "
+            f"chroms {chromosomes} "
+            f"(model={demo_model or 'uniform-constant-Ne'}, "
+            f"pop={args.population}, length={args.chr_length_mb} Mb)",
+            file=sys.stderr,
+        )
+        cohort_sites = simulate_cohort(
+            chromosomes=chromosomes, build=args.build,
+            n_people=args.n, length_mb=args.chr_length_mb,
+            demo_model=demo_model, population=args.population,
+            rec_rate=args.rec_rate, mu=args.mu,
+            rng=rng, verbose=True,
+        )
 
-    print(
-        f"Drawing cohort background: {args.n_background} shared sites "
-        f"across {args.n} people (α={args.sfs_alpha})",
-        file=sys.stderr,
-    )
-    cohort_sites = draw_cohort_background(
-        background_pool, args.n, args.n_background, args.sfs_alpha, rng,
-    )
     hist = sfs_histogram(cohort_sites)
     total_alts = sum(hist.values())
     singletons = hist.get(1, 0)
