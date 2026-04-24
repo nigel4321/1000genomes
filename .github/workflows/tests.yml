@@ -1,0 +1,63 @@
+name: Tests
+
+"on":
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-people:
+    name: synthetic_people (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: synthetic_people/requirements.txt
+
+      - name: Install htslib binaries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bcftools tabix
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r synthetic_people/requirements.txt
+
+      - name: Run unit tests
+        working-directory: synthetic_people
+        run: python -m unittest discover -s tests -v
+
+  nextflow-pipeline:
+    name: nextflow_pipeline bin scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install htslib binaries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bcftools tabix
+
+      # bin/ scripts are stdlib-only; tests self-skip when optional tools
+      # (e.g. nextflow for the e2e test) are missing.
+      - name: Run unit tests
+        working-directory: nextflow_pipeline
+        run: python -m unittest discover -s tests -v
