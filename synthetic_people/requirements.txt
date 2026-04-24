@@ -1,13 +1,26 @@
-# No pip dependencies — generate_people.py runs on Python 3.8+ stdlib only
-# (argparse, glob, os, random, shutil, subprocess, sys, urllib.request,
-#  pathlib).
+# M1 runs on Python 3.8+ stdlib only. The deps below become required in
+# later milestones — install them now to be ready, or pip-install on demand.
+# `python3 generate_people.py --check-deps` reports what's missing.
 #
-# System binaries required on PATH (invoked via subprocess, not installable
-# via pip):
-#   - bcftools   (htslib) — ClinVar + 1000G query + filter
-#   - bgzip      (htslib) — compress output VCFs
-#   - tabix      (htslib) — index output VCFs
+# System binaries (NOT installable via pip) — required from M1 onwards:
+#   bcftools   (htslib) — ClinVar + 1000G query + filter
+#   bgzip      (htslib) — compress output VCFs
+#   tabix      (htslib) — index output VCFs
 #
-# Network access is required only on first run (to download the ClinVar VCF
-# from https://ftp.ncbi.nlm.nih.gov/pub/clinvar/). Subsequent runs read
+# Network access is needed on first run only, to download the ClinVar VCF
+# from https://ftp.ncbi.nlm.nih.gov/pub/clinvar/. Subsequent runs use
 # ./cache/.
+
+# M2 (quality metrics, sampling), M3 (Ti/Tv calibration), M4 (SFS)
+numpy>=1.24
+
+# M5 (coalescent simulation with realistic LD)
+msprime>=1.3
+tskit>=0.5
+
+# M6 (admixture modelling, human demographic models)
+stdpopsim>=0.2
+
+# M10 (validation suite: PCA, LD decay, Ti/Tv plots)
+matplotlib>=3.7
+scikit-allel>=1.3

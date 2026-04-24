@@ -6,10 +6,20 @@ All output is VCFv4.2, bgzipped, and tabix-indexed.
 
 ## Requirements
 
-- Python 3.8+ (stdlib only — no pip dependencies)
+- Python 3.8+ (stdlib only for the current milestone — M1)
 - `bcftools`, `tabix`, `bgzip` (htslib) on `PATH`
 - Network access on first run only (to download ClinVar into `cache/`)
 - Optional: local 1000 Genomes Phase 3 VCFs alongside this directory, for the common-variant background. Without them the output is highlighted-variant-only.
+
+### Coming milestones
+
+From **M2** onward the generator gains realistic sequencing quality metrics, linkage disequilibrium via coalescent simulation, UK admixture modelling, and a validation suite. Those features need `numpy`, `msprime`, `tskit`, `stdpopsim`, `matplotlib`, and `scikit-allel`:
+
+```bash
+pip install -r synthetic_people/requirements.txt
+```
+
+Run `python3 generate_people.py --check-deps` at any time to see what's installed and what's still missing. See `IMPLEMENTATION_PLAN.md` for the full milestone-by-milestone roadmap and `SYHTHETIC_PROJECT.md` for the spec.
 
 ## Quick start
 
@@ -95,7 +105,8 @@ Because each file has one sample, cohort-level AF and carrier counts in the vari
 |---|---|---|
 | `--n` | Number of person VCFs to generate | `10` |
 | `--seed` | RNG seed; omit for fresh randomness each run | `None` |
-| `--build` | `GRCh37` or `GRCh38` (must match background source) | `GRCh37` |
+| `--build` | `GRCh37` or `GRCh38` (must match background source) | `GRCh38` |
+| `--check-deps` | Print htslib + Python dependency status and exit | `False` |
 | `--output-dir` | Where to write `person_<N>.vcf.gz` | `./out` |
 | `--cache-dir` | Where ClinVar is downloaded | `./cache` |
 | `--background-glob` | Source glob(s) for common variants (repeatable) | 1000G files in parent dir |
