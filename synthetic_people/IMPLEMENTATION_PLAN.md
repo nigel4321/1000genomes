@@ -139,10 +139,13 @@ remains clean.
       keeps per-allele AFs; draw path samples two haplotypes from a
       categorical over {REF, alt_1, ..., alt_k}; writer emits
       `ALT=A,G` with comma-separated per-allele `AC` / `AF` / `AD`.
-- [x] Ti/Tv "calibrator" not needed: natural sampling from 1000G Phase 3
-      already lands at **2.11** on a 50-person batch, dead-centre of the
-      [1.9, 2.3] target. Skipped the calibrator per the working-agreement
-      to avoid premature abstraction.
+- [x] Ti/Tv calibrator in place (`syntheticgen/titv.py`): landed
+      defensively ahead of M5, where de-novo SNV generation drops the
+      natural ratio to ~0.5. `choose_alt(ref, rng, target=2.1)` draws a
+      non-REF base weighted so long-run Ti/Tv converges on the target;
+      14 tests verify convergence at several targets (0.5, 1.0, 2.1,
+      3.0) within ±5%. Not wired into the current 1000G-backed path
+      (which lands at 2.11 naturally without calibration).
 
 **Exit check:** ✅ 2026-04-24 on 50-person / 15,587-record batch:
 Ti/Tv = 2.11; 2,148 indels (13.8%), all left-aligned; 313 multi-allelic
