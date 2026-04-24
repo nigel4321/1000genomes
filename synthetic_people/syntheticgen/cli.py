@@ -8,12 +8,19 @@ import shutil
 import sys
 from pathlib import Path
 
-from .background import draw_person, load_background_pool
+from .background import load_background_pool, random_sample_id
 from .builds import BUILDS
 from .clinvar import (
     DEFAULT_SIG_FILTER,
     fetch_clinvar,
     load_highlighted_candidates,
+)
+from .cohort import draw_cohort_background, person_records_from_cohort
+from .sfs import (
+    DEFAULT_SFS_ALPHA,
+    sfs_histogram,
+    singleton_fraction,
+    write_sfs_tsv,
 )
 from .writer import write_person_vcf
 
@@ -67,13 +74,15 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(
         description=(
-            "Generate synthetic single-person VCFs with ClinVar-highlighted "
-            "variants and an HWE-sampled 1000 Genomes background."
+            "Generate a cohort of synthetic person VCFs. Background sites "
+            "are shared across the cohort with allele frequencies drawn "
+            "from a power-law SFS (singletons dominate); each person "
+            "receives a ClinVar-highlighted variant on top."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--n", type=int, default=10,
-                   help="Number of person VCFs to generate")
+                   help="Cohort size: number of person VCFs to generate")
     p.add_argument("--output-dir", type=Path,
                    default=script_dir / "out",
                    help="Where to write person_<N>.vcf.gz")
@@ -90,10 +99,16 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "Pass multiple times to combine sources. "
                         f"Default: {default_bg}")
     p.add_argument("--n-background", type=int, default=500,
-                   help="Max background variants sampled per person "
-                        "(hom-ref draws are dropped before writing)")
+                   help="Number of shared background sites the cohort is "
+                        "drawn over (hom-ref calls are dropped per person)")
     p.add_argument("--af-min", type=float, default=0.05,
-                   help="Minimum AF for background variants")
+                   help="Minimum AF filter when loading the coordinate pool "
+                        "from 1000G sources (source AFs are not used "
+                        "downstream — only coordinates and alleles are)")
+    p.add_argument("--sfs-alpha", type=float, default=DEFAULT_SFS_ALPHA,
+                   help="Power-law exponent for the cohort SFS: P(k) ∝ 1/k^α. "
+                        "α=1.0 is Watterson-neutral; α=2.0 (default) biases "
+                        "toward singletons, matching gnomAD-like spectra.")
     p.add_argument("--clinvar-sig",
                    default=",".join(sorted(DEFAULT_SIG_FILTER)),
                    help="Comma-separated CLNSIG values to include when "
@@ -136,29 +151,59 @@ def main(argv: list[str] | None = None) -> int:
                  "--clinvar-sig")
 
     bg_globs = args.background_glob or [args._default_bg]
-    print(f"Sampling background from: {bg_globs}", file=sys.stderr)
+    print(f"Sampling background coordinates from: {bg_globs}", file=sys.stderr)
     background_pool = load_background_pool(
         bg_globs, args.af_min, per_source_limit=5000, rng=rng,
     )
-    print(f"  background pool: {len(background_pool)} variants",
+    print(f"  coordinate pool: {len(background_pool)} variants",
           file=sys.stderr)
     if not background_pool:
         print("  [warn] no background sources matched — output VCFs will "
               "contain only the highlighted variant", file=sys.stderr)
 
-    print(f"Generating {args.n} person VCFs into {args.output_dir}",
+    print(
+        f"Drawing cohort background: {args.n_background} shared sites "
+        f"across {args.n} people (α={args.sfs_alpha})",
+        file=sys.stderr,
+    )
+    cohort_sites = draw_cohort_background(
+        background_pool, args.n, args.n_background, args.sfs_alpha, rng,
+    )
+    hist = sfs_histogram(cohort_sites)
+    total_alts = sum(hist.values())
+    singletons = hist.get(1, 0)
+    sfrac = singleton_fraction(hist)
+    print(
+        f"  cohort sites: {len(cohort_sites)}; alt observations: "
+        f"{total_alts}; singletons: {singletons} ({sfrac:.1%})",
+        file=sys.stderr,
+    )
+
+    summary_dir = args.output_dir / "summary"
+    sfs_path = summary_dir / "sfs.tsv"
+    write_sfs_tsv(sfs_path, hist)
+    print(f"  SFS histogram written to {sfs_path}", file=sys.stderr)
+
+    sample_ids = [random_sample_id(rng) for _ in range(args.n)]
+
+    print(f"Writing {args.n} person VCFs into {args.output_dir}",
           file=sys.stderr)
-    for i in range(args.n):
-        person = draw_person(candidates, background_pool,
-                             args.n_background, rng)
+    for i, sid in enumerate(sample_ids):
+        hi = dict(rng.choice(candidates))
+        hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
+        background = person_records_from_cohort(cohort_sites, i)
+        person = {
+            "sample_id": sid,
+            "highlighted": hi,
+            "background": background,
+        }
         out = args.output_dir / f"person_{i+1:04d}.vcf.gz"
         write_person_vcf(out, person, args.build, rng)
-        hi = person["highlighted"]
         print(
-            f"  [{i+1:>4}/{args.n}] {out.name} — {person['sample_id']} — "
+            f"  [{i+1:>4}/{args.n}] {out.name} — {sid} — "
             f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
             f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
-            f"{len(person['background'])} background records",
+            f"{len(background)} background records",
             file=sys.stderr,
         )
 

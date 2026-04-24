@@ -1,9 +1,14 @@
-"""1000G background variant sampling (independent HWE, multi-allelic aware).
+"""1000G background coordinate pool + genotype helpers.
 
-Reservoir-samples common variants from local 1000 Genomes VCFs, keeping
-per-allele AFs so multi-allelic sites can emit `0|2`, `1|2`, etc. on
-draw. Stays as the only background path until the M5 coalescent backbone
-lands (at which point this module is gated behind `--legacy-background`).
+Reservoir-samples common variants from local 1000 Genomes VCFs to build
+a coordinate pool (chrom/pos/ref/alts) the cohort generator can pick
+from. The source AFs are kept for back-compat but the M4+ cohort path
+redraws fresh SFS-based frequencies per site and ignores them — only
+coordinates and allele strings carry through.
+
+The `phased_gt_from_af*` helpers draw phased diploid genotypes under
+Hardy-Weinberg and are retained for the highlighted-variant path and
+unit tests.
 """
 
 from __future__ import annotations
@@ -144,35 +149,3 @@ def random_sample_id(rng: random.Random) -> str:
     """HG/NA-prefixed 5-digit ID, mirroring 1000G naming conventions."""
     prefix = rng.choice(("HG", "NA"))
     return f"{prefix}{rng.randint(10000, 99999)}"
-
-
-def draw_person(candidates: list[dict], background_pool: list[dict],
-                n_background: int, rng: random.Random) -> dict:
-    """Draw one person's variant set: 1 highlighted + N background.
-
-    Background variants whose drawn genotype turns out hom-ref (0|0) are
-    dropped, so the final record count is <= n_background. This mirrors
-    real per-sample VCFs which only emit non-reference sites.
-    """
-    hi = dict(rng.choice(candidates))
-    # Highlighted genotype: 70% het, 30% hom-alt, weighted toward the more
-    # common "carrier" scenario.
-    hi_gt = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
-
-    bg_records: list[dict] = []
-    if background_pool:
-        sample = rng.sample(
-            background_pool,
-            min(n_background, len(background_pool)),
-        )
-        for bg in sample:
-            gt = phased_gt_from_afs(bg["afs"], rng)
-            if alt_dosage(gt) == 0:
-                continue
-            bg_records.append({**bg, "gt": gt})
-
-    return {
-        "sample_id": random_sample_id(rng),
-        "highlighted": {**hi, "gt": hi_gt},
-        "background": bg_records,
-    }

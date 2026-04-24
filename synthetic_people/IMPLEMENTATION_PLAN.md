@@ -155,16 +155,33 @@ sites (2.0%); 23/23 unit tests pass; `qc_validate.py --strict` clean.
 
 ### M4 — Site Frequency Spectrum + cohort-level generation
 
-- [ ] Switch from per-person independent sampling to **cohort generation**:
-      simulate an N-sample cohort once, write one VCF per person with the
-      same variant coordinates, different genotypes.
-- [ ] Draw site frequencies from a power-law / neutral-coalescent SFS
-      (~1/f) rather than uniform, so singletons dominate.
-- [ ] Report SFS in the run log; persist a histogram to
-      `out/summary/sfs.tsv`.
+- [x] Switched from per-person independent sampling to **cohort generation**
+      (`syntheticgen/cohort.py`): a single pass picks N_sites from the
+      1000G coordinate pool and, for each site, assigns alt alleles into
+      the 2N haplotype slots without replacement. Each person's phased GT
+      at each site is then read off consecutive slot pairs, so the realised
+      cohort AC is exact (no HWE-resampling smoothing) and every person
+      sees the same (chrom, pos, ref, alts) at each site.
+- [x] Site frequencies now come from a power-law SFS (`syntheticgen/sfs.py`):
+      `P(k) ∝ 1/k^α` over k ∈ {1, …, 2N-1}, with α exposed via
+      `--sfs-alpha` (default 2.0). α=1.0 is Watterson-neutral; α=2.0 biases
+      toward singletons to match gnomAD-style empirical spectra.
+- [x] Run log prints cohort size, total alt observations, singleton count
+      and fraction. Histogram persists to `out/summary/sfs.tsv` (columns:
+      `ac`, `n_sites`). Multi-allelic sites contribute one observation
+      per alt.
+- [x] 24 new unit tests (12 in `test_sfs.py`, 12 in `test_cohort.py`)
+      covering SFS range/shape, singleton-fraction default, allele-count
+      rejection-sampling bound, slot-assignment exactness, cohort
+      reproducibility under seed, and hom-ref drop-out logic. 61 tests
+      total, all passing.
 
-**Exit check:** fraction of singletons > 50% of variable sites; AF spectrum
-plot shows the expected 1/f shape.
+**Exit check:** ✅ 2026-04-24 on `--n 50 --seed 42 --build GRCh37` chr22
+batch: 511 alt observations, **317 singletons = 62.0%** (well above the
+50% threshold), full 1/k^α shape visible in `sfs.tsv` (AC=1→317, AC=2→74,
+…, AC=76→1). Cross-check: cohort AC realised at a high-AC site sums to
+76 across the 50 per-person VCFs — exactly what the histogram records.
+`qc_validate.py --strict` exits 0 with 0 errors / 0 warnings.
 
 ---
 
