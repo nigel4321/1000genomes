@@ -6,7 +6,7 @@ import random
 import subprocess
 from pathlib import Path
 
-from .background import alt_dosage
+from .background import alt_dosages
 from .builds import BUILDS
 from .header import build_header
 from .quality import (
@@ -52,20 +52,30 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
     with open(plain_path, "w") as fh:
         fh.write(build_header(build, person["sample_id"]))
         for variant, gt, is_hi in records:
-            dosage = alt_dosage(gt)
-            info_parts = [f"AC={dosage}", "AN=2", f"AF={dosage/2:.1f}"]
+            alts = variant["alts"]
+            n_alts = len(alts)
+            n_alleles = n_alts + 1  # +1 for REF
+
+            # AC is per-alt (Number=A); AN is total allele count (fixed at 2
+            # for a diploid single-sample). AF = AC / AN per alt.
+            per_alt_dosage = alt_dosages(gt, n_alts)
+            ac_str = ",".join(str(d) for d in per_alt_dosage)
+            af_str = ",".join(f"{d/2:.1f}" for d in per_alt_dosage)
+            info_parts = [f"AC={ac_str}", "AN=2", f"AF={af_str}"]
             if is_hi:
                 info_parts.append("HIGHLIGHT")
                 if variant.get("clnsig") and variant["clnsig"] != ".":
                     info_parts.append(f"CLNSIG={variant['clnsig']}")
                 if variant.get("clndn") and variant["clndn"] != ".":
                     info_parts.append(f"CLNDN={variant['clndn']}")
-            dp, ref_d, alt_d, gq = draw_site_quality(gt, sample_lam, rng)
-            sample_field = f"{gt}:{dp}:{gq}:{ref_d},{alt_d}"
+
+            dp, ad, gq = draw_site_quality(gt, n_alleles, sample_lam, rng)
+            ad_str = ",".join(str(x) for x in ad)
+            sample_field = f"{gt}:{dp}:{gq}:{ad_str}"
             fh.write("\t".join([
                 variant["chrom"], str(variant["pos"]),
                 variant.get("id") or ".",
-                variant["ref"], variant["alt"],
+                variant["ref"], ",".join(alts),
                 "100", "PASS", ";".join(info_parts),
                 "GT:DP:GQ:AD", sample_field,
             ]) + "\n")

@@ -1,23 +1,23 @@
 """Simulated sequencing quality metrics: DP, AD, GQ.
 
-The model here is deliberately simple but distributionally realistic:
+The model is deliberately simple but distributionally realistic and
+multi-allelic aware:
 
-* **DP** (read depth) ~ Poisson(λ) per site, where λ is a per-sample
-  baseline with modest jitter — so different samples in a cohort have
-  different mean depths, and within a sample depth varies site-to-site.
-* **AD** (allelic depth) splits DP between REF and ALT per the genotype:
-    * `0|0`: all reads REF
-    * `1|1`: all reads ALT
-    * hets: Binomial(DP, p_alt) with `p_alt ≈ 0.5` biased slightly toward
-      REF (~0.475) to match the reference-bias seen in real short-read
-      aligners.
+* **DP** ~ Poisson(λ) per site; λ is a per-sample baseline with modest
+  jitter so different samples in a cohort show different coverage
+  profiles.
+* **AD** is `Number=R` — one depth per allele (REF + every ALT). `0|0`
+  lands all reads on REF; `k|k` lands all on alt k; a het `a|b` splits
+  reads between allele a and b via a binomial. Hets involving REF carry
+  a small reference bias (P(ref read) ≈ 0.525) matching empirical
+  Illumina + BWA-MEM behaviour; `1|2`-style hets split 50/50.
   `sum(AD) == DP` always holds, which `bcftools stats` cross-checks.
-* **GQ** (genotype quality) is a Phred-like score that degrades when
-  depth is low (noisy evidence) or when AD looks inconsistent with the
-  called genotype. Floored at 0, capped at 99 per VCF convention.
+* **GQ** is a Phred-like score from (AD, called GT): high when AD
+  strongly supports the call, low when AD contradicts or is sparse.
+  Floored at 0, capped at 99 per VCF convention.
 
-Everything takes an explicit `random.Random` instance so seeded runs stay
-deterministic.
+Everything takes an explicit `random.Random` instance so seeded runs
+stay deterministic.
 """
 
 from __future__ import annotations
@@ -74,60 +74,103 @@ def _binomial(n: int, p: float, rng: random.Random) -> int:
     return sum(1 for _ in range(n) if rng.random() < p)
 
 
-def ad_from_gt(gt: str, dp: int, rng: random.Random) -> tuple[int, int]:
-    """Split DP into (ref_depth, alt_depth) consistent with the genotype."""
-    alt_dosage = sum(1 for c in gt if c == "1")
-    if alt_dosage == 0:
-        return dp, 0
-    if alt_dosage == 2:
-        return 0, dp
-    # Heterozygote: slight reference bias so hets don't come out perfectly
-    # 50/50. Matches what an aligner like BWA-MEM shows in practice.
-    alt = _binomial(dp, HET_ALT_FRAC, rng)
-    return dp - alt, alt
+def _parse_gt_alleles(gt: str) -> tuple[int, int]:
+    """Parse a phased GT like `"0|2"` into an `(a, b)` pair of allele indices.
 
-
-def gq_from_ad(gt: str, ref_d: int, alt_d: int) -> int:
-    """Phred-like genotype quality driven by depth and AD/GT consistency.
-
-    The aim isn't to be GATK-accurate — it's to give a GQ that
-      * rises with depth,
-      * is high when AD strongly supports the called genotype,
-      * drops toward 0 when AD contradicts the call.
+    Non-numeric tokens (`.`) degrade to 0 — good enough for the quality
+    model which only needs dosage information.
     """
-    dp = ref_d + alt_d
+    parts = gt.split("|")
+    if len(parts) != 2:
+        return 0, 0
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return 0, 0
+
+
+def ad_from_gt(gt: str, n_alleles: int, dp: int,
+               rng: random.Random) -> tuple[int, ...]:
+    """Split DP into per-allele depths consistent with the genotype.
+
+    Returns a tuple of length `n_alleles` (REF at index 0, ALTs after).
+    `sum(...) == dp` always holds.
+
+    Reference bias: when the GT is a het that includes REF (e.g. `0|1`,
+    `0|2`), the ref slot gets a small read-share boost over a perfect
+    50/50, matching empirical short-read aligner bias. Hets between two
+    non-ref alleles (e.g. `1|2`) split 50/50 with no bias.
+    """
+    if dp == 0 or n_alleles <= 0:
+        return (0,) * max(n_alleles, 0)
+    a, b = _parse_gt_alleles(gt)
+    # Clamp bad indices so we never index out of bounds.
+    a = 0 if a < 0 or a >= n_alleles else a
+    b = 0 if b < 0 or b >= n_alleles else b
+
+    if a == b:
+        counts = [0] * n_alleles
+        counts[a] = dp
+        return tuple(counts)
+
+    # Heterozygote: one binomial between the two alleles present on the
+    # haplotypes. If REF is one of them, apply ref-bias; otherwise 50/50.
+    if a == 0:
+        p_a = 1.0 - HET_ALT_FRAC  # ref (at `a`) reads a bit more
+    elif b == 0:
+        p_a = HET_ALT_FRAC  # ref is at `b`, so allele `a` gets the smaller share
+    else:
+        p_a = 0.5
+    a_reads = _binomial(dp, p_a, rng)
+    counts = [0] * n_alleles
+    counts[a] = a_reads
+    counts[b] = dp - a_reads
+    return tuple(counts)
+
+
+def gq_from_ad(gt: str, ad: tuple[int, ...]) -> int:
+    """Phred-like GQ from (AD per allele) + called GT.
+
+    Support = fraction of reads consistent with the called genotype:
+      * `k|k`      → `AD[k] / DP`
+      * `a|b` het  → how close the split between AD[a] and AD[b] is to
+                     the expected 50/50, weighted by (AD[a] + AD[b]) / DP
+                     so reads supporting *other* alleles count against it.
+
+    GQ = `-10 log10(1 - support)`, depth-capped, clipped to [0, 99].
+    """
+    dp = sum(ad)
     if dp == 0:
         return 0
-    alt_frac = alt_d / dp
+    a, b = _parse_gt_alleles(gt)
+    n = len(ad)
+    if a < 0 or a >= n or b < 0 or b >= n:
+        return 0
 
-    alt_dosage = sum(1 for c in gt if c == "1")
-    if alt_dosage == 0:
-        # Homozygous reference: support = P(ref reads) → high when alt_frac≈0.
-        support = 1.0 - alt_frac
-    elif alt_dosage == 2:
-        support = alt_frac
+    if a == b:
+        support = ad[a] / dp
     else:
-        # Het: support peaks when alt_frac≈0.5, tails off toward 0 or 1.
-        support = 1.0 - 2.0 * abs(alt_frac - 0.5)
+        used = ad[a] + ad[b]
+        if used == 0:
+            support = 0.0
+        else:
+            a_frac = ad[a] / used
+            support = (1.0 - 2.0 * abs(a_frac - 0.5)) * (used / dp)
 
-    # Phred-like: -10 log10(1 - support). A tight epsilon lets well-supported
-    # calls reach the 99 ceiling instead of plateauing at ~40.
     gq = -10.0 * math.log10(max(1.0 - support, 1e-10))
-    # Depth cap: low DP can't produce a hugely confident call. Scales up
-    # quickly so DP≈30 reaches ~88 and DP≈40+ saturates near 99.
     gq = min(gq, 10.0 * math.log10(max(dp, 1)) * 6.0)
     return max(0, min(99, round(gq)))
 
 
-def draw_site_quality(gt: str, lam: float,
-                      rng: random.Random) -> tuple[int, int, int, int]:
-    """Return (DP, ref_AD, alt_AD, GQ) for one record.
+def draw_site_quality(gt: str, n_alleles: int, lam: float,
+                      rng: random.Random) -> tuple[int, tuple[int, ...], int]:
+    """Return `(DP, AD, GQ)` for one record with `n_alleles` total alleles.
 
-    Combines the primitives above; this is what the writer calls per row.
+    AD is always length `n_alleles` (REF + every ALT) per VCF `Number=R`.
     """
     dp = poisson(lam, rng)
     if dp == 0:
-        return 0, 0, 0, 0
-    ref_d, alt_d = ad_from_gt(gt, dp, rng)
-    gq = gq_from_ad(gt, ref_d, alt_d)
-    return dp, ref_d, alt_d, gq
+        return 0, (0,) * n_alleles, 0
+    ad = ad_from_gt(gt, n_alleles, dp, rng)
+    gq = gq_from_ad(gt, ad)
+    return dp, ad, gq

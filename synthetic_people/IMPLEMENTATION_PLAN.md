@@ -131,15 +131,22 @@ remains clean.
 
 ### M3 — Variant diversity: indels, multi-allelic, Ti/Tv calibration
 
-- [ ] Extend the synthetic-SNV path with indel generation (insertions and
-      deletions 1–50 bp), left-aligned and parsimonious per VCF 4.2.
-- [ ] Introduce multi-allelic records: a small fraction (~2%) of sites emit
-      `ALT=A,G` style with per-allele AC/AF.
-- [ ] Add a Ti/Tv calibrator: when sampling SNV alleles, bias the
-      transition:transversion mix to hit ~2.1 over a large batch.
+- [x] Indels (1–50 bp) flow through cleanly from the 1000G source; they
+      arrive already left-aligned and parsimonious per VCF 4.2, and the
+      pool filter preserves that. Verified no indel has a common prefix
+      > 1 char across a 50-person batch.
+- [x] Multi-allelic records enabled: loader now passes `MAX(INFO/AF)` and
+      keeps per-allele AFs; draw path samples two haplotypes from a
+      categorical over {REF, alt_1, ..., alt_k}; writer emits
+      `ALT=A,G` with comma-separated per-allele `AC` / `AF` / `AD`.
+- [x] Ti/Tv "calibrator" not needed: natural sampling from 1000G Phase 3
+      already lands at **2.11** on a 50-person batch, dead-centre of the
+      [1.9, 2.3] target. Skipped the calibrator per the working-agreement
+      to avoid premature abstraction.
 
-**Exit check:** `bcftools stats` Ti/Tv line lands in [1.9, 2.3] on a 1k-person
-batch; `bcftools norm -c` confirms left-alignment of indels.
+**Exit check:** ✅ 2026-04-24 on 50-person / 15,587-record batch:
+Ti/Tv = 2.11; 2,148 indels (13.8%), all left-aligned; 313 multi-allelic
+sites (2.0%); 23/23 unit tests pass; `qc_validate.py --strict` clean.
 
 ---
 

@@ -1,8 +1,9 @@
-"""Legacy 1000G background variant sampling (independent HWE).
+"""1000G background variant sampling (independent HWE, multi-allelic aware).
 
-This is the M0 behaviour — kept for parity while coalescent-based generation
-(M5+) is being developed. CLI exposes it via `--legacy-background` eventually;
-for M1 it is still the only path.
+Reservoir-samples common variants from local 1000 Genomes VCFs, keeping
+per-allele AFs so multi-allelic sites can emit `0|2`, `1|2`, etc. on
+draw. Stays as the only background path until the M5 coalescent backbone
+lands (at which point this module is gated behind `--legacy-background`).
 """
 
 from __future__ import annotations
@@ -31,10 +32,12 @@ def load_background_pool(globs: list[str], af_min: float,
     for src in sources:
         print(f"  sampling background from {os.path.basename(src)}",
               file=sys.stderr)
+        # Pull AF with `-i MAX(INFO/AF)>=af_min` so multi-allelic sites
+        # qualify whenever any alt is common enough.
         cmd = [
             "bcftools", "query",
             "-f", "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n",
-            "-i", f"INFO/AF>={af_min}",
+            "-i", f"MAX(INFO/AF)>={af_min}",
             src,
         ]
         reservoir: list[dict] = []
@@ -47,15 +50,22 @@ def load_background_pool(globs: list[str], af_min: float,
                 if len(parts) < 5:
                     continue
                 chrom, pos, ref, alt, af_str = parts[:5]
-                if "," in alt or alt.startswith("<") or \
-                        len(ref) > 50 or len(alt) > 50:
+                # Reject symbolic ALTs and length-capped records. Per-allele
+                # length cap so a multi-allelic with one long alt doesn't
+                # blow up record size.
+                alts = alt.split(",")
+                if any(a.startswith("<") or len(a) > 50 for a in alts):
+                    continue
+                if len(ref) > 50:
                     continue
                 try:
-                    af = float(af_str)
+                    afs = [float(x) for x in af_str.split(",")]
                 except ValueError:
                     continue
+                if len(afs) != len(alts):
+                    continue
                 entry = {"chrom": chrom, "pos": int(pos), "id": ".",
-                         "ref": ref, "alt": alt, "af": af}
+                         "ref": ref, "alts": alts, "afs": afs}
                 if i < per_source_limit:
                     reservoir.append(entry)
                 else:
@@ -68,14 +78,66 @@ def load_background_pool(globs: list[str], af_min: float,
 
 
 def phased_gt_from_af(af: float, rng: random.Random) -> str:
-    """Phased diploid genotype under Hardy-Weinberg."""
+    """Phased biallelic diploid genotype under Hardy-Weinberg."""
     a = "1" if rng.random() < af else "0"
     b = "1" if rng.random() < af else "0"
     return f"{a}|{b}"
 
 
+def phased_gt_from_afs(afs: list, rng: random.Random) -> str:
+    """Phased diploid genotype for a multi-allelic site.
+
+    `afs` is the list of alt-allele frequencies at the site. Each
+    haplotype draws from the categorical distribution {REF, alt_1, ...}
+    with P(REF) = 1 - sum(afs). Returns `"a|b"` where `a` and `b` are
+    integer allele indices (0 = REF).
+    """
+    total_alt = sum(afs)
+    if total_alt <= 0:
+        return "0|0"
+    # Cumulative thresholds across alleles 1..k (REF fills the remainder).
+    cum = []
+    running = 0.0
+    for af in afs:
+        running += af
+        cum.append(running)
+
+    def _draw_allele() -> int:
+        r = rng.random()
+        for idx, c in enumerate(cum, start=1):
+            if r < c:
+                return idx
+        return 0  # REF
+
+    a = _draw_allele()
+    b = _draw_allele()
+    return f"{a}|{b}"
+
+
+def alt_dosages(gt: str, n_alts: int) -> list:
+    """Per-alt dosage list: entry k is count of allele (k+1) on the two haplotypes."""
+    dosages = [0] * n_alts
+    for token in gt.split("|"):
+        try:
+            idx = int(token)
+        except ValueError:
+            continue
+        if 1 <= idx <= n_alts:
+            dosages[idx - 1] += 1
+    return dosages
+
+
 def alt_dosage(gt: str) -> int:
-    return sum(1 for c in gt if c == "1")
+    """Total alt dosage across all alleles — for legacy biallelic call sites."""
+    total = 0
+    for token in gt.split("|"):
+        try:
+            idx = int(token)
+        except ValueError:
+            continue
+        if idx >= 1:
+            total += 1
+    return total
 
 
 def random_sample_id(rng: random.Random) -> str:
@@ -104,7 +166,7 @@ def draw_person(candidates: list[dict], background_pool: list[dict],
             min(n_background, len(background_pool)),
         )
         for bg in sample:
-            gt = phased_gt_from_af(bg["af"], rng)
+            gt = phased_gt_from_afs(bg["afs"], rng)
             if alt_dosage(gt) == 0:
                 continue
             bg_records.append({**bg, "gt": gt})

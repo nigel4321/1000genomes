@@ -93,6 +93,8 @@ def load_highlighted_candidates(clinvar_vcf: Path,
             sigs = {s.strip() for s in clnsig.replace("|", ",").split(",")}
             if not sigs & sig_filter:
                 continue
+            # Highlighted variants stay single-alt: the "one clinically-
+            # highlighted variant per person" concept is inherently one alt.
             if "," in alt or alt.startswith("<") or \
                     len(ref) > 50 or len(alt) > 50:
                 continue
@@ -101,7 +103,8 @@ def load_highlighted_candidates(clinvar_vcf: Path,
                 "pos": int(pos),
                 "id": vid if vid else ".",
                 "ref": ref,
-                "alt": alt,
+                "alts": [alt],
+                "afs": [None],  # ClinVar doesn't supply AF; filled by writer.
                 "clnsig": _sanitize_info_value(clnsig),
                 "clndn": _sanitize_info_value(clndn),
             })

@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  [{i+1:>4}/{args.n}] {out.name} — {person['sample_id']} — "
             f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
-            f"{hi['ref']}>{hi['alt']} ({hi['gt']}), "
+            f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
             f"{len(person['background'])} background records",
             file=sys.stderr,
         )
