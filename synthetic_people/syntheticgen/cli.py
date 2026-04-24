@@ -152,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         person = draw_person(candidates, background_pool,
                              args.n_background, rng)
         out = args.output_dir / f"person_{i+1:04d}.vcf.gz"
-        write_person_vcf(out, person, args.build)
+        write_person_vcf(out, person, args.build, rng)
         hi = person["highlighted"]
         print(
             f"  [{i+1:>4}/{args.n}] {out.name} — {person['sample_id']} — "

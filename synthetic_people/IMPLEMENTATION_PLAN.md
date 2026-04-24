@@ -110,18 +110,22 @@ exits 0 with 0 errors / 0 warnings; reference build recognised as
 
 ### M2 — Realistic per-variant quality metrics (DP / GQ / AD)
 
-- [ ] Add `syntheticgen/quality.py` implementing:
+- [x] Add `syntheticgen/quality.py` implementing:
       * `DP` ~ Poisson(λ=30) with per-sample λ jitter.
       * `AD` from a Binomial(DP, p) where p reflects genotype
         (0.0 / 0.5 / 1.0) plus realistic sampling bias (~5% ref-bias
         for hets, so not 50/50 exactly).
       * `GQ` decreasing with DP variance; floor at 0, cap at 99.
-- [ ] Per-record FORMAT becomes `GT:DP:GQ:AD`.
-- [ ] Write a small unit-test file (`tests/test_quality.py`) that drives
-      distributions and checks means/variances.
+- [x] Per-record FORMAT becomes `GT:DP:GQ:AD`.
+- [x] Write a small unit-test file (`tests/test_quality.py`) that drives
+      distributions and checks means/variances. 12 tests, all passing.
 
 **Exit check:** `bcftools stats` on a fresh batch reports DP mean ≈ 30,
-GQ distribution non-degenerate, AD sum == DP on every row.
+GQ distribution non-degenerate, AD sum == DP on every row. ✅ Verified
+2026-04-24 on a 5-person / 1,289-record batch: DP mean 29.41 (13–51),
+GQ span 1–99 (184 high-confidence ≥90), AD mismatches 0/1,289, het
+alt-fraction 0.475 (confirming ref-bias). `qc_validate.py --strict`
+remains clean.
 
 ---
 
