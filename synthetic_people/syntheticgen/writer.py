@@ -76,6 +76,19 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                 info_parts.append(f"COSMIC_ID={variant['cosmic_id']}")
             if variant.get("cosmic_gene"):
                 info_parts.append(f"COSMIC_GENE={variant['cosmic_gene']}")
+            # Structural variants (M8) declare SVTYPE / SVLEN / END /
+            # CIPOS. The ALT is a symbolic <DEL>/<DUP>/<INV> already in
+            # variant["alts"], so the standard ",".join(alts) writes
+            # the right thing — only INFO needs extra fields.
+            if variant.get("svtype"):
+                info_parts.append(f"SVTYPE={variant['svtype']}")
+                if variant.get("svlen") is not None:
+                    info_parts.append(f"SVLEN={variant['svlen']}")
+                if variant.get("end") is not None:
+                    info_parts.append(f"END={variant['end']}")
+                if variant.get("cipos"):
+                    lo, hi = variant["cipos"]
+                    info_parts.append(f"CIPOS={lo},{hi}")
 
             dp, ad, gq = draw_site_quality(gt, n_alleles, sample_lam, rng)
             ad_str = ",".join(str(x) for x in ad)

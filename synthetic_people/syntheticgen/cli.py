@@ -53,6 +53,12 @@ from .sfs import (
     singleton_fraction,
     write_sfs_tsv,
 )
+from .sv import (
+    DEFAULT_SV_LENGTH_MAX_BP,
+    DEFAULT_SV_LENGTH_MIN_BP,
+    DEFAULT_SVS_PER_PERSON,
+    generate_person_svs,
+)
 from .writer import write_person_vcf
 
 
@@ -216,6 +222,18 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    default=DEFAULT_COSMIC_INJECT_DENSITY,
                    help="[M7] Fraction of cohort sites to overwrite "
                         "with COSMIC records when --somatic is set.")
+    p.add_argument("--svs-per-person", type=int,
+                   default=DEFAULT_SVS_PER_PERSON,
+                   help="[M8] Number of structural variants (DEL / "
+                        "DUP / INV) to emit per person, drawn at "
+                        "random positions inside the simulated "
+                        "region. Set to 0 to skip SV emission.")
+    p.add_argument("--sv-length-min", type=int,
+                   default=DEFAULT_SV_LENGTH_MIN_BP,
+                   help="[M8] Minimum SV length in bp (log-uniform).")
+    p.add_argument("--sv-length-max", type=int,
+                   default=DEFAULT_SV_LENGTH_MAX_BP,
+                   help="[M8] Maximum SV length in bp (log-uniform).")
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
@@ -424,6 +442,24 @@ def main(argv: list[str] | None = None) -> int:
 
     sample_ids = [random_sample_id(rng) for _ in range(args.n)]
 
+    # SV bounds: each SV occupies [pos, pos + svlen]; we draw POS up to
+    # `chrom_length_bp - sv_length_max` to keep the END inside the
+    # simulated region. For the legacy path we just use the full
+    # contig length (no sim window).
+    if args.legacy_background:
+        sv_chrom_span = max(
+            (BUILDS[args.build]["contigs"].get(c, 0)
+             for c in args.chromosomes.split(",") if c.strip()),
+            default=0,
+        )
+    else:
+        sv_chrom_span = int(args.chr_length_mb * 1_000_000) \
+            if args.chr_length_mb > 0 else max(
+                BUILDS[args.build]["contigs"].values())
+    sv_chromosomes = [c.strip() for c in args.chromosomes.split(",")
+                      if c.strip()]
+    sv_total = 0
+
     print(f"Writing {args.n} person VCFs into {args.output_dir}",
           file=sys.stderr)
     manifest_people: list = []
@@ -431,6 +467,16 @@ def main(argv: list[str] | None = None) -> int:
         hi = dict(rng.choice(candidates))
         hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
         background = person_records_from_cohort(cohort_sites, i)
+        person_svs: list = []
+        if args.svs_per_person > 0 and sv_chrom_span > args.sv_length_max:
+            person_svs = generate_person_svs(
+                rng, sv_chromosomes, sv_chrom_span,
+                n_svs=args.svs_per_person,
+                length_min_bp=args.sv_length_min,
+                length_max_bp=args.sv_length_max,
+            )
+            background.extend(person_svs)
+            sv_total += len(person_svs)
         person = {
             "sample_id": sid,
             "highlighted": hi,
@@ -452,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
                 "gt": hi["gt"],
             },
             "n_background_records": len(background),
+            "n_svs": len(person_svs),
         }
 
         if person_ancestry:
@@ -504,6 +551,12 @@ def main(argv: list[str] | None = None) -> int:
             "SAS": args.sas_frac,
             "AFR": args.afr_frac,
         }
+    manifest["svs"] = {
+        "per_person": args.svs_per_person,
+        "length_min_bp": args.sv_length_min,
+        "length_max_bp": args.sv_length_max,
+        "total": sv_total,
+    }
     if not args.legacy_background:
         manifest["overlays"] = {
             "clinvar_inject_density": args.clinvar_inject_density,

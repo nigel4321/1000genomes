@@ -339,14 +339,53 @@ documented opt-in for users with a registered download).
 
 ### M8 — Structural variants
 
-- [ ] Add `syntheticgen/sv.py`: generate a handful of SVs per individual
-      (deletions 50 bp – 10 kb, tandem duplications, simple inversions).
-      Emit with proper `SVTYPE`, `SVLEN`, `END`, `CIPOS`, and symbolic
-      ALTs (`<DEL>`, `<DUP>`, `<INV>`).
-- [ ] Update header with `ALT=<ID=DEL,Description=...>` lines etc.
+- [x] `syntheticgen/sv.py` exposes `generate_person_svs(rng,
+      chromosomes, chrom_length_bp, n_svs, length_min_bp,
+      length_max_bp)` returning a list of writer-shaped variant dicts
+      with `svtype` ∈ {DEL, DUP, INV}. Length is log-uniform on
+      [min, max] (default 50 bp – 10 kb). Type weights default
+      0.50 / 0.30 / 0.20 (DEL / DUP / INV). Phased GT defaults to
+      ~80% het / 20% hom-alt. Anchor REF base is a random standard
+      base (the real GRCh38 reference isn't on disk; this is the
+      pragmatic placeholder until M11 wires the FASTA in).
+- [x] Each record carries:
+      * Symbolic ALT `<DEL>`/`<DUP>`/`<INV>` (already declared in the
+        M1 header so no header change is required).
+      * `INFO/SVTYPE`, `INFO/SVLEN` (negative for DEL, positive for
+        DUP/INV), `INFO/END = POS + |SVLEN|`, `INFO/CIPOS = -50,50`
+        (every SV is "imprecise"; tighter CIs are an M9/M10 refinement).
+      * Per-record FORMAT continues to use the M2 quality model so
+        `GT:DP:GQ:AD` is populated — AD becomes ref-supporting vs
+        alt-supporting reads under the same Binomial(DP, p) model used
+        for SNVs.
+- [x] CLI: `--svs-per-person` (default 3), `--sv-length-min` (50),
+      `--sv-length-max` (10000). 0 = skip SV emission. Each SV's
+      `(POS, length)` is bounded so `END` stays inside the simulated
+      span.
+- [x] Manifest gains an `svs` block recording requested per-person
+      count, length bounds, and total SVs emitted across the cohort;
+      per-person `n_svs` lands on each `people[]` entry.
+- [x] Writer: when `variant["svtype"]` is set, emit
+      `SVTYPE=...;SVLEN=...;END=...;CIPOS=lo,hi` after the existing
+      AC/AN/AF/HIGHLIGHT/CLNSIG/COSMIC fields. The existing alt-list
+      `",".join(alts)` already puts the symbolic ALT in the right
+      column.
+- [x] 22 new tests in `tests/test_sv.py` — pure-Python; cover
+      log-uniform length distribution skew, length bounds, anchor base
+      validity, CIPOS default, SVTYPE/SVLEN sign-consistency, GT
+      validity, multi-chromosome distribution, default-weight
+      distribution within ±0.07 of (0.50, 0.30, 0.20), seed
+      reproducibility, parameter validation. **129/129 with deps;
+      106/106 stdlib-only.**
 
-**Exit check:** `bcftools view -i 'INFO/SVTYPE!="."'` returns structured SV
-records; `bcftools stats` counts them in its SV section.
+**Exit check:** ✅ 2026-04-25 on 3-person × 1 Mb chr22 sim
+(`--demo-model none`, seed 42, default `--svs-per-person 5`):
+each person carries exactly 5 SVs (`bcftools view -i 'INFO/SVTYPE!="."'`
+→ 5 records on every VCF; `bcftools stats` reports them under
+"number of others"). Spot check: `chr22:535206 A→<DEL>` with
+`SVTYPE=DEL;SVLEN=-586;END=535792;CIPOS=-50,50;GT=0|1`. All three
+VCFs pass `qc_validate.py --strict` with 0 errors / 0 warnings;
+`n_variants=690` includes the 5 SVs.
 
 ---
 

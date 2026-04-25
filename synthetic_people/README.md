@@ -9,14 +9,15 @@ GQ / AD).
 The spec is `SYHTHETIC_PROJECT.md`; incremental build plan and
 per-milestone status is in `IMPLEMENTATION_PLAN.md`.
 
-As of **M7** every coalescent / admixture cohort is grounded against
-public variant databases: a configurable fraction of cohort sites is
-overwritten with real ClinVar pathogenic records (CLNSIG / CLNDN
-attached) and dbSNP-known variants (`rs<digits>` IDs at real
-chromosome coordinates). **M6** added the `--admixture` mode (EUR +
-SAS + AFR → UK pulse with per-person local-ancestry BED truth);
-**M5** is the default single-population coalescent path; the M4
-1000G-pool + power-law SFS sampler is retained behind
+As of **M8** every output VCF carries a handful of structural variants
+per person — `<DEL>` / `<DUP>` / `<INV>` symbolic ALTs with
+`SVTYPE` / `SVLEN` / `END` / `CIPOS` INFO tags — alongside the
+SNV/indel cohort background. **M7** grounds cohort sites against
+public variant databases (ClinVar pathogenic records and dbSNP rsIDs
+at real chromosome coordinates). **M6** added the `--admixture` mode
+(EUR + SAS + AFR → UK pulse with per-person local-ancestry BED
+truth); **M5** is the default single-population coalescent path; the
+M4 1000G-pool + power-law SFS sampler is retained behind
 `--legacy-background`.
 
 ---
@@ -119,6 +120,34 @@ overlay. Cohort GT blocks (the LD signal) are preserved across
 injection; only `pos` / `ref` / `alt` / `id` and the new INFO tags
 change. Run summary and `out/manifest.json` record realised counts of
 each overlay.
+
+### Structural variants (M8)
+
+Every per-person VCF picks up a handful of SVs by default:
+
+```bash
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 5 --seed 42 \
+    --chromosomes 22 --chr-length-mb 5.0 \
+    --svs-per-person 5 --sv-length-min 50 --sv-length-max 10000
+```
+
+| Flag | Effect |
+|---|---|
+| `--svs-per-person 3` | Number of SVs emitted per person. `0` disables SV emission. |
+| `--sv-length-min 50` | Minimum SV length in bp (log-uniform). |
+| `--sv-length-max 10000` | Maximum SV length in bp; positions are drawn so `END = POS + length` stays inside the simulated span. |
+
+Type mix: ~50% `DEL`, ~30% `DUP`, ~20% `INV`. `INFO/SVLEN` is negative
+for `DEL` and positive for `DUP` / `INV`; `INFO/END = POS + |SVLEN|`;
+`INFO/CIPOS = -50,50` (every SV is currently flagged "imprecise").
+Anchor `REF` is a random standard base — the real GRCh38 reference
+isn't on disk in M8; M11 will wire the reference FASTA in for
+exact-anchor reporting.
+
+`out/manifest.json` gains an `svs` block recording per-person count,
+length range, and cohort-total SVs emitted; per-person entries record
+their `n_svs`.
 
 ### Legacy: 1000G-pool + power-law SFS (M4)
 
@@ -244,6 +273,7 @@ synthetic_people/
 │   ├── sfs.py                # M4 P(k) ∝ 1/k^α sampler + histogram
 │   ├── coalescent.py         # M5 msprime + stdpopsim driver
 │   ├── admixture.py          # M6 UK-cohort demes pulse + local ancestry
+│   ├── sv.py                 # M8 structural variant generator (DEL/DUP/INV)
 │   ├── titv.py               # M3+ Ti/Tv calibrator for de-novo SNVs
 │   ├── quality.py            # M2 DP / GQ / AD simulation
 │   ├── header.py             # VCF header assembly
@@ -257,7 +287,8 @@ synthetic_people/
 │   ├── test_cohort.py        # M4
 │   ├── test_coalescent.py    # M5 (skips cleanly without msprime/stdpopsim)
 │   ├── test_admixture.py     # M6 (skips cleanly without msprime/demes/tskit)
-│   └── test_overlays.py      # M7 (pure-Python; no bcftools / network)
+│   ├── test_overlays.py      # M7 (pure-Python; no bcftools / network)
+│   └── test_sv.py            # M8 (pure-Python; no bcftools / network)
 └── out/                      # generated VCFs + summary/ + ancestry/
 ```
 
@@ -441,20 +472,42 @@ chr22:15528207 `rs3924507 C>T`). Per-person VCFs carry **117–135
 rsIDs** and **5–7 CLNSIG-bearing records** each. All 5 VCFs pass
 `qc_validate.py --strict` with 0 errors / 0 warnings.
 
+### M8 — Structural variants
+
+`syntheticgen/sv.py` emits a handful of SVs per person — DEL / DUP /
+INV — with proper VCF 4.2 symbolic ALTs and the full SV INFO tag set.
+`generate_person_svs(rng, chromosomes, chrom_length_bp, n_svs,
+length_min_bp, length_max_bp)` draws lengths log-uniformly on
+[min, max] (default 50 bp – 10 kb) with type weights 50/30/20%
+(DEL/DUP/INV). Anchor `REF` is a single standard base placeholder —
+the real GRCh38 FASTA isn't loaded in M8. SVs are emitted as part of
+each person's `background` record list and flow through the standard
+writer, which detects `variant["svtype"]` and emits
+`SVTYPE / SVLEN / END / CIPOS` after the AC/AN/AF/HIGHLIGHT/CLNSIG
+fields.
+
+3-person × 1 Mb chr22 exit check (seed 42,
+`--svs-per-person 5`): each VCF carries exactly 5 SVs;
+`bcftools view -i 'INFO/SVTYPE!="."'` returns the SV records;
+`bcftools stats` counts them under "number of others". Spot check:
+`chr22:535206 A→<DEL>` with `SVTYPE=DEL;SVLEN=-586;END=535792;
+CIPOS=-50,50;GT=0|1`. All three VCFs pass `qc_validate.py --strict`
+with 0 errors / 0 warnings.
+
 ---
 
 ## Test suite
 
-107 tests across eight files; all passing with deps installed.
+129 tests across nine files; all passing with deps installed.
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Without msprime/stdpopsim/demes/tskit installed, `test_coalescent.py`
-and `test_admixture.py` skip cleanly and **84/84** remaining still
-pass (`test_overlays.py` is pure-Python and runs in either
-environment).
+and `test_admixture.py` skip cleanly and **106/106** remaining still
+pass (`test_overlays.py` and `test_sv.py` are pure-Python and run in
+either environment).
 
 | File | Count | Coverage |
 |---|---|---|
@@ -466,6 +519,7 @@ environment).
 | `test_coalescent.py` | 10 | Output shape, monotone positions, realised AC = declared AC, no fixed sites, seed reproducibility, Ti/Tv ∈ [1.7, 2.6], multi-chromosome, error on unknown chromosome, stdpopsim end-to-end (`skipUnless` on msprime/stdpopsim import) |
 | `test_admixture.py` | 13 | Demography proportion validation, UK 3-ancestor topology, sites + per-person segments shape, full-chromosome coverage, realised AC = declared AC, BED round-trip, ancestry-fraction normalisation + empty input, multi-chromosome, seed reproducibility, aggregate ancestry tracks requested 60/25/15 within ±15% (`skipUnless` on msprime/demes/tskit import) |
 | `test_overlays.py` | 23 | ClinVar `annotate` (collision match, alt mismatch, no-match returns 0); ClinVar `inject` (density count, GT-block preservation, post-sort invariant, off-chromosome skip, zero-density no-op); rsID `_normalise_rsid` (ID-prefixed, bare-digit, INFO/RS fallback, semicolon and comma lists, missing-returns-empty); rsID `inject_rsids` (density, GT preservation, sort invariant, reserve_indices exclusion, zero-density no-op); COSMIC inject (ID + gene + REF/ALT swap, zero-density no-op); ClinVar + rsID overlay disjointness via reserve_indices |
+| `test_sv.py` | 22 | `_draw_length` log-uniform skew + bounds + collapsed-range + invalid-range; `_build_sv_record` SVLEN sign by type, anchor base validity, CIPOS default, unknown-SVTYPE rejection; `generate_person_svs` count, zero-returns-empty, well-formed records, length bounds honoured, END inside chrom span, multi-chromosome distribution, type distribution within ±0.07 of (0.50, 0.30, 0.20), seed reproducibility, different-seed divergence, too-small-chrom and empty-chromosome rejection |
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -477,7 +531,6 @@ hard failure).
 
 Tracked in `IMPLEMENTATION_PLAN.md`:
 
-- **M8** — structural variants (symbolic ALTs, SVTYPE / SVLEN / END).
 - **M9** — sequencer-noise / genotyping-error injection.
 - **M10** — validation suite (PCA vs 1000G, LD decay curves, stats).
 - **M11** — delivery packaging (manifest, truth sets, smoke script).
@@ -499,6 +552,9 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--somatic` | [M7] Enable COSMIC overlay (requires `--cosmic-vcf`) | `False` |
 | `--cosmic-vcf` | [M7] Path to COSMIC-format VCF (registration required) | `None` |
 | `--cosmic-inject-density` | [M7] Fraction of cohort sites overwritten with COSMIC records when `--somatic` | `0.005` |
+| `--svs-per-person` | [M8] Number of SVs (DEL/DUP/INV) per person | `3` |
+| `--sv-length-min` | [M8] Minimum SV length in bp (log-uniform draw) | `50` |
+| `--sv-length-max` | [M8] Maximum SV length in bp | `10000` |
 | `--chromosomes` | [coalescent] Comma-separated chroms | `22` |
 | `--chr-length-mb` | [coalescent] Simulated prefix per chrom | `5.0` |
 | `--demo-model` | [coalescent] stdpopsim model id; `none` for uniform | `OutOfAfrica_3G09` |
