@@ -9,10 +9,15 @@ GQ / AD).
 The spec is `SYHTHETIC_PROJECT.md`; incremental build plan and
 per-milestone status is in `IMPLEMENTATION_PLAN.md`.
 
-As of **M8** every output VCF carries a handful of structural variants
-per person — `<DEL>` / `<DUP>` / `<INV>` symbolic ALTs with
-`SVTYPE` / `SVLEN` / `END` / `CIPOS` INFO tags — alongside the
-SNV/indel cohort background. **M7** grounds cohort sites against
+As of **M9** every batch carries a configurable lightweight
+sequencing-error model: per-call genotype flips and coverage dropouts
+applied at a target FDR (~0.1% by default). Flipped calls land
+low-GQ because GQ is recomputed from AD, which still reflects the
+truth; dropouts emit `./.` with DP / GQ / AD all zero. **M8** added a
+handful of structural variants per person — `<DEL>` / `<DUP>` /
+`<INV>` symbolic ALTs with `SVTYPE` / `SVLEN` / `END` / `CIPOS` INFO
+tags — alongside the SNV/indel cohort background. **M7** grounds
+cohort sites against
 public variant databases (ClinVar pathogenic records and dbSNP rsIDs
 at real chromosome coordinates). **M6** added the `--admixture` mode
 (EUR + SAS + AFR → UK pulse with per-person local-ancestry BED
@@ -149,6 +154,33 @@ exact-anchor reporting.
 length range, and cohort-total SVs emitted; per-person entries record
 their `n_svs`.
 
+### Sequencing errors (M9)
+
+Every batch passes through a lightweight per-call noise model after
+the truth-state DP/AD have been drawn:
+
+```bash
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 5 --seed 42 \
+    --chromosomes 22 --chr-length-mb 5.0 \
+    --error-rate 0.001 --dropout-rate 0.0005
+```
+
+| Flag | Effect |
+|---|---|
+| `--error-rate 0.001` | Probability of a per-call genotype flip (false positive / negative). 0 disables. |
+| `--dropout-rate 0.0005` | Probability of a coverage dropout. Emits `./.:0:0:0,0`. 0 disables. |
+| `--art` | Heavy path: ART read simulation + `bcftools call`. Currently rejected with a clear message; needs the M11 GRCh38 reference FASTA. |
+
+Mechanics: GT is perturbed *after* the AD draw, so the recomputed GQ
+reflects the disagreement between reads and call. Hom→het is the
+dominant flip direction (0.7 weight), matching empirical caller
+behaviour; het splits 50/50 between hom-ref and hom-alt; multi-allelic
+hets collapse one allele to REF. `out/manifest.json` gains an `errors`
+block with requested rates, realised counts, and realised FDR; each
+per-person entry carries its own `errors` sub-dict so M11's truth-set
+BED can grade calls against the truth.
+
 ### Legacy: 1000G-pool + power-law SFS (M4)
 
 ```bash
@@ -274,6 +306,7 @@ synthetic_people/
 │   ├── coalescent.py         # M5 msprime + stdpopsim driver
 │   ├── admixture.py          # M6 UK-cohort demes pulse + local ancestry
 │   ├── sv.py                 # M8 structural variant generator (DEL/DUP/INV)
+│   ├── errors.py             # M9 lightweight per-call noise (GT flips + dropouts)
 │   ├── titv.py               # M3+ Ti/Tv calibrator for de-novo SNVs
 │   ├── quality.py            # M2 DP / GQ / AD simulation
 │   ├── header.py             # VCF header assembly
@@ -288,7 +321,8 @@ synthetic_people/
 │   ├── test_coalescent.py    # M5 (skips cleanly without msprime/stdpopsim)
 │   ├── test_admixture.py     # M6 (skips cleanly without msprime/demes/tskit)
 │   ├── test_overlays.py      # M7 (pure-Python; no bcftools / network)
-│   └── test_sv.py            # M8 (pure-Python; no bcftools / network)
+│   ├── test_sv.py            # M8 (pure-Python; no bcftools / network)
+│   └── test_errors.py        # M9 (pure-Python; no bcftools / network)
 └── out/                      # generated VCFs + summary/ + ancestry/
 ```
 
@@ -494,20 +528,44 @@ fields.
 CIPOS=-50,50;GT=0|1`. All three VCFs pass `qc_validate.py --strict`
 with 0 errors / 0 warnings.
 
+### M9 — Sequencing error modelling
+
+`syntheticgen/errors.py` injects per-call genotype flips and coverage
+dropouts at configurable rates. The perturbation is applied **after**
+the truth-state AD has been drawn, so a flipped GT lives with a low
+recomputed GQ — the realistic mis-call signal where the reads
+disagree with the call. `maybe_flip_gt` weights biallelic flips
+toward hom→het (0.7) over hom→opposite-hom (0.3); het splits 50/50
+between hom-ref and hom-alt; multi-allelic `1|2`-style hets collapse
+one allele to REF. `maybe_dropout` zeros DP/AD/GQ and emits `./.`.
+
+Writer threads `error_rate`, `dropout_rate`, and an optional `stats`
+dict; CLI accumulates per-person counters into a manifest `errors`
+block. Heavy-path `--art` is gated and rejected for now: it needs
+the M11 GRCh38 reference FASTA to feed read simulation.
+
+3-person × 1 Mb chr22 exit check (seed 42, `--error-rate 0.01
+--dropout-rate 0.005`): **realised FDR 1.55%** vs requested 1.50%;
+16 flips + 13 dropouts over 1,871 calls. Mis-call signal visible in
+the output — e.g. `chr22:758982 0|0:40:0:0,40` (called hom-ref but
+all 40 reads on the alt, GQ correctly drops to 0). Dropouts emit
+`./.:0:0:0,0`. All three VCFs pass `qc_validate.py --strict` with
+0 errors / 0 warnings.
+
 ---
 
 ## Test suite
 
-129 tests across nine files; all passing with deps installed.
+147 tests across ten files; all passing with deps installed.
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Without msprime/stdpopsim/demes/tskit installed, `test_coalescent.py`
-and `test_admixture.py` skip cleanly and **106/106** remaining still
-pass (`test_overlays.py` and `test_sv.py` are pure-Python and run in
-either environment).
+and `test_admixture.py` skip cleanly and **124/124** remaining still
+pass (`test_overlays.py`, `test_sv.py`, and `test_errors.py` are
+pure-Python and run in either environment).
 
 | File | Count | Coverage |
 |---|---|---|
@@ -520,6 +578,7 @@ either environment).
 | `test_admixture.py` | 13 | Demography proportion validation, UK 3-ancestor topology, sites + per-person segments shape, full-chromosome coverage, realised AC = declared AC, BED round-trip, ancestry-fraction normalisation + empty input, multi-chromosome, seed reproducibility, aggregate ancestry tracks requested 60/25/15 within ±15% (`skipUnless` on msprime/demes/tskit import) |
 | `test_overlays.py` | 23 | ClinVar `annotate` (collision match, alt mismatch, no-match returns 0); ClinVar `inject` (density count, GT-block preservation, post-sort invariant, off-chromosome skip, zero-density no-op); rsID `_normalise_rsid` (ID-prefixed, bare-digit, INFO/RS fallback, semicolon and comma lists, missing-returns-empty); rsID `inject_rsids` (density, GT preservation, sort invariant, reserve_indices exclusion, zero-density no-op); COSMIC inject (ID + gene + REF/ALT swap, zero-density no-op); ClinVar + rsID overlay disjointness via reserve_indices |
 | `test_sv.py` | 22 | `_draw_length` log-uniform skew + bounds + collapsed-range + invalid-range; `_build_sv_record` SVLEN sign by type, anchor base validity, CIPOS default, unknown-SVTYPE rejection; `generate_person_svs` count, zero-returns-empty, well-formed records, length bounds honoured, END inside chrom span, multi-chromosome distribution, type distribution within ±0.07 of (0.50, 0.30, 0.20), seed reproducibility, different-seed divergence, too-small-chrom and empty-chromosome rejection |
+| `test_errors.py` | 18 | `maybe_flip_gt` zero/negative-rate no-op, full-rate always-flips, realised flip rate ~1% on 10k draws, biallelic-only flip targets, hom→het 0.7-weight bias, het 0|1 50/50 split between hom-ref and hom-alt, `1\|2` multi-allelic collapse to REF, unparseable GT pass-through, seed reproducibility; `maybe_dropout` zero/full-rate, realised rate, seed reproducibility; `new_error_stats` shape, `merge_stats` in-place add + missing-key seeding; default-constants lock-in |
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -531,9 +590,9 @@ hard failure).
 
 Tracked in `IMPLEMENTATION_PLAN.md`:
 
-- **M9** — sequencer-noise / genotyping-error injection.
 - **M10** — validation suite (PCA vs 1000G, LD decay curves, stats).
-- **M11** — delivery packaging (manifest, truth sets, smoke script).
+- **M11** — delivery packaging (manifest, truth sets, smoke script,
+  ART read simulation gated by `--art`).
 
 ## CLI reference
 
@@ -555,6 +614,9 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--svs-per-person` | [M8] Number of SVs (DEL/DUP/INV) per person | `3` |
 | `--sv-length-min` | [M8] Minimum SV length in bp (log-uniform draw) | `50` |
 | `--sv-length-max` | [M8] Maximum SV length in bp | `10000` |
+| `--error-rate` | [M9] Per-call probability of a GT flip (lightweight noise model) | `0.001` |
+| `--dropout-rate` | [M9] Per-call probability of a coverage dropout (`./.:0:0:0,0`) | `0.0005` |
+| `--art` | [M9, heavy] ART read simulation + `bcftools call`. Currently rejected; needs M11 reference FASTA | `False` |
 | `--chromosomes` | [coalescent] Comma-separated chroms | `22` |
 | `--chr-length-mb` | [coalescent] Simulated prefix per chrom | `5.0` |
 | `--demo-model` | [coalescent] stdpopsim model id; `none` for uniform | `OutOfAfrica_3G09` |

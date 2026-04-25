@@ -391,16 +391,43 @@ VCFs pass `qc_validate.py --strict` with 0 errors / 0 warnings;
 
 ### M9 — Sequencing error modelling
 
-- [ ] Lightweight path (default): inject per-call genotyping noise
-      probabilistically — occasional GT flips, lowered GQ, depth dropouts
-      — parameterised by a target FDR (~0.1%).
-- [ ] Heavy path (optional, gated by `--art` flag): shell out to `ART` to
-      simulate reads from the simulated genome and call back with
-      `bcftools call`, closing the loop. Disabled by default because ART
-      isn't on the typical bioinformatics box.
+- [x] `syntheticgen/errors.py` (lightweight, default): per-call
+      `maybe_flip_gt(true_gt, rng, error_rate)` and
+      `maybe_dropout(rng, dropout_rate)` perturbations applied **after**
+      AD has been drawn from the truth. Because `gq_from_ad` recomputes
+      GQ from the (possibly-disagreeing) called GT, flipped calls
+      naturally land low-GQ — exactly the realistic mis-call signal.
+      Biallelic flip distribution: hom→het is the dominant failure
+      mode (0.7 weight); het→hom-ref vs hom-alt is 50/50.
+      Multi-allelic `1|2`-style hets collapse one allele to REF.
+- [x] Writer threads `error_rate`, `dropout_rate`, optional `stats` dict
+      through `write_person_vcf`. Dropouts emit
+      `./.:0:0:0,0,...`; flips replace GT and recompute GQ.
+- [x] CLI: `--error-rate` (default `0.001` = 0.1% FDR target),
+      `--dropout-rate` (default `0.0005`), and `--art` flag (heavy
+      path). Per-batch stats print to stderr; manifest gains an
+      `errors` block with mode / requested rates / realised counts /
+      realised FDR. Per-person manifest entries gain a `errors`
+      sub-dict.
+- [x] Heavy path (`--art`) is gated and currently exits with a clear
+      message that ART read simulation needs the M11 GRCh38 reference
+      FASTA. The lightweight path is the M9 deliverable.
+- [x] 18 new tests in `tests/test_errors.py` — pure-Python; cover
+      zero-rate / negative-rate no-ops, full-rate always flips,
+      realised flip rate near target on 10k draws, hom→het bias
+      (~70% on 0|0), het→hom split (~50/50 on 0|1), multi-allelic
+      collapse to REF, unparseable GT pass-through, dropout rate,
+      seed reproducibility, stats accumulator, default-constants
+      lock-in. **147/147 with deps; 124/124 stdlib-only (23 skipped).**
 
-**Exit check:** noisy batch shows expected FDR when cross-checked against
-the coalescent truth (M5 provides the "truth" comparator).
+**Exit check:** ✅ 2026-04-25 on 3-person × 1 Mb chr22 sim
+(`--demo-model none`, seed 42, `--error-rate 0.01 --dropout-rate
+0.005 --svs-per-person 0`): **realised FDR 1.55%** vs requested 1.50%
+(0.01 + 0.005); 16 flips + 13 dropouts over 1,871 calls. Truth-vs-call
+disagreement visible in the output: e.g. `chr22:758982 0|0:40:0:0,40`
+— called hom-ref but all 40 reads on the alt, GQ correctly drops to
+0. Dropouts emit `./.:0:0:0,0`. All three VCFs pass `qc_validate.py
+--strict` with 0 errors / 0 warnings.
 
 ---
 

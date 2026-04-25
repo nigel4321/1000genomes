@@ -38,6 +38,12 @@ from .dbsnp import (
     inject_rsids,
     load_rsid_pool,
 )
+from .errors import (
+    DEFAULT_DROPOUT_RATE,
+    DEFAULT_GT_ERROR_RATE,
+    merge_stats,
+    new_error_stats,
+)
 from .coalescent import (
     DEFAULT_CHR_LENGTH_MB,
     DEFAULT_DEMO_MODEL,
@@ -234,6 +240,22 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--sv-length-max", type=int,
                    default=DEFAULT_SV_LENGTH_MAX_BP,
                    help="[M8] Maximum SV length in bp (log-uniform).")
+    p.add_argument("--error-rate", type=float,
+                   default=DEFAULT_GT_ERROR_RATE,
+                   help="[M9] Per-call probability of a genotype flip "
+                        "(false positive / negative). Applied after AD "
+                        "is drawn from the truth, so flipped calls land "
+                        "low-GQ. 0 disables.")
+    p.add_argument("--dropout-rate", type=float,
+                   default=DEFAULT_DROPOUT_RATE,
+                   help="[M9] Per-call probability of a coverage "
+                        "dropout (DP=0, GT=./., GQ=0). 0 disables.")
+    p.add_argument("--art", action="store_true",
+                   help="[M9, heavy] Use ART read simulation + "
+                        "bcftools call instead of the lightweight "
+                        "noise model. Requires a reference FASTA on "
+                        "disk and the `art_illumina` binary on PATH; "
+                        "wired in M11 alongside the GRCh38 reference.")
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
@@ -252,6 +274,14 @@ def main(argv: list[str] | None = None) -> int:
     for tool in ("bcftools", "tabix", "bgzip"):
         if not shutil.which(tool):
             sys.exit(f"required tool not on PATH: {tool}")
+
+    if args.art:
+        sys.exit(
+            "--art (ART read simulation + bcftools call) requires the "
+            "GRCh38 reference FASTA, which is wired in M11. Use the "
+            "default lightweight noise model (--error-rate / "
+            "--dropout-rate) for now."
+        )
 
     rng = random.Random(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -462,6 +492,13 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Writing {args.n} person VCFs into {args.output_dir}",
           file=sys.stderr)
+    if args.error_rate > 0 or args.dropout_rate > 0:
+        print(
+            f"Sequencing-error model: error_rate={args.error_rate:.4f}, "
+            f"dropout_rate={args.dropout_rate:.4f}",
+            file=sys.stderr,
+        )
+    error_stats_total = new_error_stats()
     manifest_people: list = []
     for i, sid in enumerate(sample_ids):
         hi = dict(rng.choice(candidates))
@@ -483,7 +520,14 @@ def main(argv: list[str] | None = None) -> int:
             "background": background,
         }
         out = args.output_dir / f"person_{i+1:04d}.vcf.gz"
-        write_person_vcf(out, person, args.build, rng)
+        person_stats = new_error_stats()
+        write_person_vcf(
+            out, person, args.build, rng,
+            error_rate=args.error_rate,
+            dropout_rate=args.dropout_rate,
+            stats=person_stats,
+        )
+        merge_stats(error_stats_total, person_stats)
 
         person_entry = {
             "index": i + 1,
@@ -499,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "n_background_records": len(background),
             "n_svs": len(person_svs),
+            "errors": dict(person_stats),
         }
 
         if person_ancestry:
@@ -557,6 +602,26 @@ def main(argv: list[str] | None = None) -> int:
         "length_max_bp": args.sv_length_max,
         "total": sv_total,
     }
+    realised_fdr = (
+        (error_stats_total["flipped"] + error_stats_total["dropped"]) /
+        error_stats_total["total_calls"]
+    ) if error_stats_total["total_calls"] else 0.0
+    manifest["errors"] = {
+        "mode": "art" if args.art else "lightweight",
+        "error_rate": args.error_rate,
+        "dropout_rate": args.dropout_rate,
+        "stats": dict(error_stats_total),
+        "realised_fdr": round(realised_fdr, 6),
+    }
+    if args.error_rate > 0 or args.dropout_rate > 0:
+        print(
+            f"Sequencing-error stats: "
+            f"flipped={error_stats_total['flipped']}, "
+            f"dropped={error_stats_total['dropped']}, "
+            f"total_calls={error_stats_total['total_calls']}, "
+            f"realised_fdr={realised_fdr:.4%}",
+            file=sys.stderr,
+        )
     if not args.legacy_background:
         manifest["overlays"] = {
             "clinvar_inject_density": args.clinvar_inject_density,

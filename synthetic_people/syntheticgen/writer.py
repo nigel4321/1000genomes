@@ -8,11 +8,19 @@ from pathlib import Path
 
 from .background import alt_dosages
 from .builds import BUILDS
+from .errors import (
+    DEFAULT_DROPOUT_RATE,
+    DEFAULT_GT_ERROR_RATE,
+    maybe_dropout,
+    maybe_flip_gt,
+    new_error_stats,
+)
 from .header import build_header
 from .quality import (
     DEFAULT_DP_MEAN,
     DEFAULT_DP_SAMPLE_JITTER_SD,
     draw_site_quality,
+    gq_from_ad,
     sample_lambda,
 )
 
@@ -25,12 +33,25 @@ def _contig_sort_key(chrom: str, pos: int,
 
 def write_person_vcf(out_path: Path, person: dict, build: str,
                      rng: random.Random,
-                     dp_mean: float = DEFAULT_DP_MEAN) -> Path:
+                     dp_mean: float = DEFAULT_DP_MEAN,
+                     error_rate: float = 0.0,
+                     dropout_rate: float = 0.0,
+                     stats: dict | None = None) -> Path:
     """Write a single-sample bgzipped+indexed VCF.
 
     Each record carries simulated DP/GQ/AD alongside GT. The per-sample
     mean depth is drawn once (Gaussian around `dp_mean`) so different
     samples in a cohort show plausibly different coverage profiles.
+
+    M9 sequencing-error parameters:
+      * `error_rate` — per-call probability of a GT flip applied
+        *after* AD has been drawn from the truth, so the recomputed GQ
+        naturally drops where the call disagrees with the reads.
+      * `dropout_rate` — per-call probability of a coverage dropout
+        (DP=0, AD all-zero, GQ=0, GT=`./.`).
+      * `stats` — optional dict mutated in place with running counts of
+        `flipped`, `dropped`, `total_calls`. The caller seeds it with
+        `errors.new_error_stats()`.
     """
     contigs = BUILDS[build]["contigs"]
     contig_order = {c: i for i, c in enumerate(contigs)}
@@ -90,9 +111,30 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                     lo, hi = variant["cipos"]
                     info_parts.append(f"CIPOS={lo},{hi}")
 
+            # Truth-state DP/AD/GQ first; M9 noise is layered on top so
+            # AD reflects what the reads would have looked like under
+            # the *true* genotype and any GT flip has to live with low
+            # GQ (because gq_from_ad sees the inconsistency).
             dp, ad, gq = draw_site_quality(gt, n_alleles, sample_lam, rng)
+            called_gt = gt
+            if stats is not None:
+                stats["total_calls"] = stats.get("total_calls", 0) + 1
+            if dropout_rate > 0 and maybe_dropout(rng, dropout_rate):
+                called_gt = "./."
+                dp = 0
+                ad = (0,) * n_alleles
+                gq = 0
+                if stats is not None:
+                    stats["dropped"] = stats.get("dropped", 0) + 1
+            elif error_rate > 0:
+                new_gt, flipped = maybe_flip_gt(gt, rng, error_rate)
+                if flipped:
+                    called_gt = new_gt
+                    gq = gq_from_ad(called_gt, ad)
+                    if stats is not None:
+                        stats["flipped"] = stats.get("flipped", 0) + 1
             ad_str = ",".join(str(x) for x in ad)
-            sample_field = f"{gt}:{dp}:{gq}:{ad_str}"
+            sample_field = f"{called_gt}:{dp}:{gq}:{ad_str}"
             fh.write("\t".join([
                 variant["chrom"], str(variant["pos"]),
                 variant.get("id") or ".",
