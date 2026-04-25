@@ -9,11 +9,15 @@ GQ / AD).
 The spec is `SYHTHETIC_PROJECT.md`; incremental build plan and
 per-milestone status is in `IMPLEMENTATION_PLAN.md`.
 
-As of **M6** an `--admixture` mode simulates an EUR + SAS + AFR → UK
-admixture pulse and writes per-person local-ancestry BED truth tracks
-alongside each VCF; **M5** remains the default single-population
-coalescent path; the M4 1000G-pool + power-law SFS sampler is retained
-behind `--legacy-background`.
+As of **M7** every coalescent / admixture cohort is grounded against
+public variant databases: a configurable fraction of cohort sites is
+overwritten with real ClinVar pathogenic records (CLNSIG / CLNDN
+attached) and dbSNP-known variants (`rs<digits>` IDs at real
+chromosome coordinates). **M6** added the `--admixture` mode (EUR +
+SAS + AFR → UK pulse with per-person local-ancestry BED truth);
+**M5** is the default single-population coalescent path; the M4
+1000G-pool + power-law SFS sampler is retained behind
+`--legacy-background`.
 
 ---
 
@@ -93,6 +97,28 @@ In addition to the per-person VCFs, this mode emits one
 `out/ancestry/person_NNNN.bed` truth track per individual (columns:
 `chrom  start  end  hap1_pop  hap2_pop`) and an `out/manifest.json`
 including realised per-person ancestry fractions.
+
+### Database grounding: ClinVar + dbSNP + COSMIC (M7)
+
+Both the coalescent and admixture paths apply the same overlay
+sequence to the cohort sites before per-person emission. Defaults give
+~20% rsID density and a small ClinVar-injection fraction at realistic
+chromosome coordinates; tune with:
+
+| Flag | Effect |
+|---|---|
+| `--rsid-density 0.20` | Fraction of cohort sites rewritten to a known dbSNP variant (real `pos` / `ref` / `alt` / `rsID`). `0` disables. |
+| `--dbsnp-vcf PATH` | Optional override for the rsID source. Default is the cached ClinVar VCF whose `INFO/RS` tag carries dbSNP rs numbers — no extra download. Pass a real dbSNP VCF (rsIDs in the ID column) to use a richer pool. |
+| `--clinvar-inject-density 0.01` | Fraction of cohort sites overwritten with a random ClinVar pathogenic record. Lands `CLNSIG` / `CLNDN` on a handful of records per person. `0` disables (the per-person highlighted variant still lands). |
+| `--somatic --cosmic-vcf PATH` | Opt-in COSMIC overlay (`COSMIC_ID` / `COSMIC_GENE` INFO tags). COSMIC is registration-gated, so we never auto-fetch — supply a local file. |
+| `--cosmic-inject-density 0.005` | Fraction of cohort sites rewritten with COSMIC records when `--somatic` is on. |
+
+Overlays operate on disjoint sites — ClinVar-injected rows are
+reserved against rsID injection so each row carries at most one
+overlay. Cohort GT blocks (the LD signal) are preserved across
+injection; only `pos` / `ref` / `alt` / `id` and the new INFO tags
+change. Run summary and `out/manifest.json` record realised counts of
+each overlay.
 
 ### Legacy: 1000G-pool + power-law SFS (M4)
 
@@ -210,7 +236,9 @@ synthetic_people/
 ├── generate_people.py        # 15-line shim → syntheticgen.cli:main
 ├── syntheticgen/
 │   ├── builds.py             # GRCh37 + GRCh38 contig tables, ClinVar URLs
-│   ├── clinvar.py            # ClinVar fetch + pathogenic candidate load
+│   ├── clinvar.py            # M1 + M7 ClinVar fetch + candidate load + cohort overlay/injection
+│   ├── dbsnp.py              # M7 rsID injection (default source: ClinVar INFO/RS)
+│   ├── cosmic.py             # M7 COSMIC overlay (--somatic, registration-gated)
 │   ├── background.py         # 1000G coordinate pool loader (reservoir)
 │   ├── cohort.py             # M4 shared-site cohort + haplotype slotting
 │   ├── sfs.py                # M4 P(k) ∝ 1/k^α sampler + histogram
@@ -228,7 +256,8 @@ synthetic_people/
 │   ├── test_sfs.py           # M4
 │   ├── test_cohort.py        # M4
 │   ├── test_coalescent.py    # M5 (skips cleanly without msprime/stdpopsim)
-│   └── test_admixture.py     # M6 (skips cleanly without msprime/demes/tskit)
+│   ├── test_admixture.py     # M6 (skips cleanly without msprime/demes/tskit)
+│   └── test_overlays.py      # M7 (pure-Python; no bcftools / network)
 └── out/                      # generated VCFs + summary/ + ancestry/
 ```
 
@@ -373,19 +402,59 @@ A 30-person × 1 Mb stand-alone proportions check
 lands EUR ≈ 0.6, SAS ≈ 0.25, AFR ≈ 0.15 within ±15%. The literal PCA
 acceptance test in spec §6 lands in M10.
 
+### M7 — ClinVar / dbSNP / COSMIC grounding
+
+`syntheticgen/clinvar.py` gains `load_clinvar_index`,
+`annotate_clinvar` (collision-only) and `inject_clinvar`
+(coordinate-replacing). Coalescent positions live in `[1, sim_length]`
+while ClinVar sits at real chromosome coordinates (chr22 ClinVar
+spans 15.5 M – 50.8 M), so collision-only annotation almost never
+fires; `inject_clinvar` is the practical mechanism for landing
+CLNSIG / CLNDN at realistic positions. Cohort GT blocks survive
+injection — only `pos` / `ref` / `alt` / `id` and the INFO tags are
+overwritten.
+
+`syntheticgen/dbsnp.py` exposes `load_rsid_pool` and `inject_rsids`.
+The default rsID source is the cached ClinVar VCF whose `INFO/RS` tag
+already carries dbSNP rs numbers (thousands of records per chromosome,
+no extra download); `--dbsnp-vcf PATH` accepts any dbSNP-style file
+where rsIDs sit in the ID column. `_normalise_rsid` handles both
+shapes and bare-digit / prefixed / semicolon- or comma-listed values.
+
+`syntheticgen/cosmic.py` overlays a user-supplied COSMIC VCF behind
+`--somatic --cosmic-vcf PATH`; never auto-fetches because COSMIC is
+registration-gated. `inject_cosmic` lands COSMIC_ID / COSMIC_GENE INFO
+tags onto a configurable fraction of sites.
+
+The three overlays operate on disjoint cohort rows: each pass reserves
+already-claimed indices so no row carries conflicting annotations.
+Header gains COSMIC_ID / COSMIC_GENE INFO declarations alongside
+CLNSIG / CLNDN; writer carries every annotation field through the
+per-person record onto the emitted INFO field.
+
+5-person × 1 Mb chr22 exit check (`--demo-model none`, seed 42,
+default densities): 1,299 cohort sites; **13 ClinVar pathogenic
+injections** at real chr22 coordinates (e.g.
+chr22:29673446 `Pathogenic / Neurofibromatosis,_type_2`);
+**259 rsID injections** (~20% of records, e.g.
+chr22:15528207 `rs3924507 C>T`). Per-person VCFs carry **117–135
+rsIDs** and **5–7 CLNSIG-bearing records** each. All 5 VCFs pass
+`qc_validate.py --strict` with 0 errors / 0 warnings.
+
 ---
 
 ## Test suite
 
-84 tests across seven files; all passing with deps installed.
+107 tests across eight files; all passing with deps installed.
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Without msprime/stdpopsim/demes/tskit installed, `test_coalescent.py`
-and `test_admixture.py` skip cleanly and **61/61** remaining still
-pass.
+and `test_admixture.py` skip cleanly and **84/84** remaining still
+pass (`test_overlays.py` is pure-Python and runs in either
+environment).
 
 | File | Count | Coverage |
 |---|---|---|
@@ -396,6 +465,7 @@ pass.
 | `test_cohort.py` | 14 | `assign_haplotypes` exact-count preservation, random-slot placement, overflow rejection, cohort reproducibility under seed, every-site-variable invariant, coord-sharing across people, hom-ref drop-out |
 | `test_coalescent.py` | 10 | Output shape, monotone positions, realised AC = declared AC, no fixed sites, seed reproducibility, Ti/Tv ∈ [1.7, 2.6], multi-chromosome, error on unknown chromosome, stdpopsim end-to-end (`skipUnless` on msprime/stdpopsim import) |
 | `test_admixture.py` | 13 | Demography proportion validation, UK 3-ancestor topology, sites + per-person segments shape, full-chromosome coverage, realised AC = declared AC, BED round-trip, ancestry-fraction normalisation + empty input, multi-chromosome, seed reproducibility, aggregate ancestry tracks requested 60/25/15 within ±15% (`skipUnless` on msprime/demes/tskit import) |
+| `test_overlays.py` | 23 | ClinVar `annotate` (collision match, alt mismatch, no-match returns 0); ClinVar `inject` (density count, GT-block preservation, post-sort invariant, off-chromosome skip, zero-density no-op); rsID `_normalise_rsid` (ID-prefixed, bare-digit, INFO/RS fallback, semicolon and comma lists, missing-returns-empty); rsID `inject_rsids` (density, GT preservation, sort invariant, reserve_indices exclusion, zero-density no-op); COSMIC inject (ID + gene + REF/ALT swap, zero-density no-op); ClinVar + rsID overlay disjointness via reserve_indices |
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -407,7 +477,6 @@ hard failure).
 
 Tracked in `IMPLEMENTATION_PLAN.md`:
 
-- **M7** — ClinVar / dbSNP / COSMIC overlays on the coalescent output.
 - **M8** — structural variants (symbolic ALTs, SVTYPE / SVLEN / END).
 - **M9** — sequencer-noise / genotyping-error injection.
 - **M10** — validation suite (PCA vs 1000G, LD decay curves, stats).
@@ -424,6 +493,12 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--cache-dir` | ClinVar download cache | `./cache` |
 | `--check-deps` | Print dependency status and exit | `False` |
 | `--clinvar-sig` | Comma-separated CLNSIG values | `Pathogenic,Likely_pathogenic,Pathogenic/Likely_pathogenic` |
+| `--clinvar-inject-density` | [M7] Fraction of cohort sites overwritten with random ClinVar pathogenic records | `0.01` |
+| `--rsid-density` | [M7] Fraction of cohort sites overwritten with a known dbSNP variant + rsID | `0.20` |
+| `--dbsnp-vcf` | [M7] Override rsID source. Default = cached ClinVar VCF (INFO/RS) | `None` |
+| `--somatic` | [M7] Enable COSMIC overlay (requires `--cosmic-vcf`) | `False` |
+| `--cosmic-vcf` | [M7] Path to COSMIC-format VCF (registration required) | `None` |
+| `--cosmic-inject-density` | [M7] Fraction of cohort sites overwritten with COSMIC records when `--somatic` | `0.005` |
 | `--chromosomes` | [coalescent] Comma-separated chroms | `22` |
 | `--chr-length-mb` | [coalescent] Simulated prefix per chrom | `5.0` |
 | `--demo-model` | [coalescent] stdpopsim model id; `none` for uniform | `OutOfAfrica_3G09` |

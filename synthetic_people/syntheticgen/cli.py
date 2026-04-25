@@ -20,9 +20,23 @@ from .admixture import (
 from .background import load_background_pool, random_sample_id
 from .builds import BUILDS
 from .clinvar import (
+    DEFAULT_CLINVAR_INJECT_DENSITY,
     DEFAULT_SIG_FILTER,
+    annotate_clinvar,
     fetch_clinvar,
+    inject_clinvar,
+    load_clinvar_index,
     load_highlighted_candidates,
+)
+from .cosmic import (
+    DEFAULT_COSMIC_INJECT_DENSITY,
+    inject_cosmic,
+    load_cosmic_records,
+)
+from .dbsnp import (
+    DEFAULT_RSID_DENSITY,
+    inject_rsids,
+    load_rsid_pool,
 )
 from .coalescent import (
     DEFAULT_CHR_LENGTH_MB,
@@ -173,6 +187,35 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    default=",".join(sorted(DEFAULT_SIG_FILTER)),
                    help="Comma-separated CLNSIG values to include when "
                         "drawing highlighted variants")
+    p.add_argument("--clinvar-inject-density", type=float,
+                   default=DEFAULT_CLINVAR_INJECT_DENSITY,
+                   help="[M7] Fraction of cohort sites to overwrite "
+                        "with random ClinVar pathogenic records, so "
+                        "CLNSIG/CLNDN appear at realistic chromosome "
+                        "coordinates. Set to 0 to skip injection (the "
+                        "highlighted per-person variant still lands).")
+    p.add_argument("--rsid-density", type=float,
+                   default=DEFAULT_RSID_DENSITY,
+                   help="[M7] Fraction of cohort sites to overwrite "
+                        "with a dbSNP-known variant (real coordinates "
+                        "and rsID). Set to 0 to skip rsID injection — "
+                        "all background record IDs will then be '.'.")
+    p.add_argument("--dbsnp-vcf", type=Path, default=None,
+                   help="[M7] Path to a dbSNP-style VCF (rsIDs in the "
+                        "ID column) for rsID injection. If omitted, "
+                        "the cached ClinVar VCF is used (its INFO/RS "
+                        "field carries dbSNP rs numbers).")
+    p.add_argument("--somatic", action="store_true",
+                   help="[M7] Enable COSMIC overlay/injection. Requires "
+                        "--cosmic-vcf because COSMIC is registration-"
+                        "gated and we never auto-fetch.")
+    p.add_argument("--cosmic-vcf", type=Path, default=None,
+                   help="[M7] Path to a COSMIC-format VCF. Required "
+                        "when --somatic is set.")
+    p.add_argument("--cosmic-inject-density", type=float,
+                   default=DEFAULT_COSMIC_INJECT_DENSITY,
+                   help="[M7] Fraction of cohort sites to overwrite "
+                        "with COSMIC records when --somatic is set.")
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
@@ -271,6 +314,99 @@ def main(argv: list[str] | None = None) -> int:
             rng=rng, verbose=True,
         )
 
+    overlay_stats = {
+        "clinvar_annotated": 0,
+        "clinvar_injected": 0,
+        "rsid_injected": 0,
+        "cosmic_injected": 0,
+    }
+    if not args.legacy_background:
+        chromosomes = [c.strip() for c in args.chromosomes.split(",")
+                       if c.strip()]
+
+        # ClinVar annotation: catch any natural collision before injection
+        # rewrites coordinates. With msprime simulating positions
+        # 1..sim_length and ClinVar at real chromosome coordinates the
+        # natural collision rate is essentially zero, but we still run
+        # annotate_clinvar so a future demography that lands on real
+        # coordinates picks up CLNSIG for free.
+        print("Loading ClinVar overlay index for "
+              f"{chromosomes}...", file=sys.stderr)
+        clinvar_index = load_clinvar_index(
+            clinvar_vcf, chromosomes, sig_filter=sig_filter,
+            max_per_chrom=20_000,
+        )
+        print(f"  {len(clinvar_index)} ClinVar pathogenic records "
+              "available for overlay", file=sys.stderr)
+        overlay_stats["clinvar_annotated"] = annotate_clinvar(
+            cohort_sites, clinvar_index)
+        if overlay_stats["clinvar_annotated"]:
+            print(f"  annotated {overlay_stats['clinvar_annotated']} "
+                  "natural ClinVar collisions", file=sys.stderr)
+
+        if args.clinvar_inject_density > 0 and clinvar_index:
+            overlay_stats["clinvar_injected"] = inject_clinvar(
+                cohort_sites, clinvar_index,
+                args.clinvar_inject_density, rng,
+            )
+            print(f"  injected {overlay_stats['clinvar_injected']} "
+                  "ClinVar pathogenic records "
+                  f"(density={args.clinvar_inject_density:.3f})",
+                  file=sys.stderr)
+
+        # Reserve ClinVar-injected rows so subsequent overlays don't
+        # overwrite their (pos, ref, alt) and break the CLNSIG↔variant
+        # correspondence. inject_clinvar re-sorts sites on exit, so we
+        # rebuild the index set against the post-sort list.
+        clinvar_reserved = {i for i, s in enumerate(cohort_sites)
+                            if s.get("clnsig")}
+
+        # rsID injection: prefer a user-supplied dbSNP VCF, fall back to
+        # ClinVar's own INFO/RS field (no extra download required).
+        if args.rsid_density > 0:
+            rsid_source = args.dbsnp_vcf or clinvar_vcf
+            print(f"Loading rsID pool from {rsid_source}...",
+                  file=sys.stderr)
+            rsid_pool = load_rsid_pool(rsid_source, chromosomes,
+                                       max_per_chrom=20_000)
+            print(f"  {len(rsid_pool)} rsID-bearing records available",
+                  file=sys.stderr)
+            overlay_stats["rsid_injected"] = inject_rsids(
+                cohort_sites, rsid_pool, args.rsid_density, rng,
+                reserve_indices=clinvar_reserved,
+            )
+            print(f"  injected {overlay_stats['rsid_injected']} "
+                  f"rsIDs (density={args.rsid_density:.3f})",
+                  file=sys.stderr)
+
+        # Re-derive reservations to include rsID-injected rows for the
+        # COSMIC pass so all three overlays land on disjoint sites.
+        all_overlay_reserved = {i for i, s in enumerate(cohort_sites)
+                                if s.get("clnsig") or
+                                s["id"].startswith("rs")}
+
+        if args.somatic:
+            if args.cosmic_vcf is None:
+                sys.exit("--somatic requires --cosmic-vcf (COSMIC is "
+                         "registration-gated; supply a local VCF path)")
+            if not args.cosmic_vcf.exists():
+                sys.exit(f"--cosmic-vcf not found: {args.cosmic_vcf}")
+            print(f"Loading COSMIC pool from {args.cosmic_vcf}...",
+                  file=sys.stderr)
+            cosmic_pool = load_cosmic_records(
+                args.cosmic_vcf, chromosomes, max_per_chrom=20_000)
+            print(f"  {len(cosmic_pool)} COSMIC records available",
+                  file=sys.stderr)
+            overlay_stats["cosmic_injected"] = inject_cosmic(
+                cohort_sites, cosmic_pool,
+                args.cosmic_inject_density, rng,
+                reserve_indices=all_overlay_reserved,
+            )
+            print(f"  injected {overlay_stats['cosmic_injected']} "
+                  "COSMIC records "
+                  f"(density={args.cosmic_inject_density:.3f})",
+                  file=sys.stderr)
+
     hist = sfs_histogram(cohort_sites)
     total_alts = sum(hist.values())
     singletons = hist.get(1, 0)
@@ -367,6 +503,17 @@ def main(argv: list[str] | None = None) -> int:
             "EUR": args.eur_frac,
             "SAS": args.sas_frac,
             "AFR": args.afr_frac,
+        }
+    if not args.legacy_background:
+        manifest["overlays"] = {
+            "clinvar_inject_density": args.clinvar_inject_density,
+            "rsid_density": args.rsid_density,
+            "dbsnp_source": (str(args.dbsnp_vcf) if args.dbsnp_vcf
+                             else "clinvar:INFO/RS"),
+            "somatic": bool(args.somatic),
+            "cosmic_inject_density": (args.cosmic_inject_density
+                                      if args.somatic else 0.0),
+            "stats": overlay_stats,
         }
     manifest_path = args.output_dir / "manifest.json"
     with open(manifest_path, "w") as f:

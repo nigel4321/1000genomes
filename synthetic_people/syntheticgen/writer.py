@@ -64,10 +64,18 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
             info_parts = [f"AC={ac_str}", "AN=2", f"AF={af_str}"]
             if is_hi:
                 info_parts.append("HIGHLIGHT")
-                if variant.get("clnsig") and variant["clnsig"] != ".":
-                    info_parts.append(f"CLNSIG={variant['clnsig']}")
-                if variant.get("clndn") and variant["clndn"] != ".":
-                    info_parts.append(f"CLNDN={variant['clndn']}")
+            # Annotation overlays (M7) are picked up regardless of
+            # whether this is the highlighted record. Cohort-level
+            # ClinVar / COSMIC injection lands the same INFO tags on
+            # background records, so the writer carries them over here.
+            if variant.get("clnsig") and variant["clnsig"] != ".":
+                info_parts.append(f"CLNSIG={variant['clnsig']}")
+            if variant.get("clndn") and variant["clndn"] != ".":
+                info_parts.append(f"CLNDN={variant['clndn']}")
+            if variant.get("cosmic_id"):
+                info_parts.append(f"COSMIC_ID={variant['cosmic_id']}")
+            if variant.get("cosmic_gene"):
+                info_parts.append(f"COSMIC_GENE={variant['cosmic_gene']}")
 
             dp, ad, gq = draw_site_quality(gt, n_alleles, sample_lam, rng)
             ad_str = ",".join(str(x) for x in ad)

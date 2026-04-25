@@ -90,13 +90,18 @@ def draw_cohort_background(pool: list, n_people: int, n_sites: int,
 
 
 def person_records_from_cohort(sites: list, person_index: int) -> list:
-    """Project cohort sites down to one person's non-hom-ref records."""
+    """Project cohort sites down to one person's non-hom-ref records.
+
+    Carries the M7 annotation fields (clnsig, clndn, cosmic_id,
+    cosmic_gene) through to the per-person record dict so the writer can
+    emit the corresponding INFO tags for that sample.
+    """
     records = []
     for site in sites:
         gt = site["gts"][person_index]
         if all(tok == "0" for tok in gt.split("|")):
             continue
-        records.append({
+        rec = {
             "chrom": site["chrom"],
             "pos": site["pos"],
             "id": site["id"],
@@ -104,5 +109,9 @@ def person_records_from_cohort(sites: list, person_index: int) -> list:
             "alts": site["alts"],
             "afs": site["afs"],
             "gt": gt,
-        })
+        }
+        for key in ("clnsig", "clndn", "cosmic_id", "cosmic_gene"):
+            if site.get(key):
+                rec[key] = site[key]
+        records.append(rec)
     return records

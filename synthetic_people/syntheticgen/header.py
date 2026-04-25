@@ -19,6 +19,10 @@ _INFO_CORE = [
     'Description="Clinical significance from ClinVar">',
     '##INFO=<ID=CLNDN,Number=.,Type=String,'
     'Description="ClinVar disease name">',
+    '##INFO=<ID=COSMIC_ID,Number=1,Type=String,'
+    'Description="COSMIC mutation identifier">',
+    '##INFO=<ID=COSMIC_GENE,Number=1,Type=String,'
+    'Description="COSMIC affected gene symbol">',
 ]
 
 # Structural-variant INFO lines declared now; values populated in M8.

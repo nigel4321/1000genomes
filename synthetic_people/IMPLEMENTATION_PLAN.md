@@ -277,21 +277,63 @@ now in place to validate against. Stand-alone proportions check on a
 
 ### M7 — ClinVar / dbSNP / COSMIC grounding
 
-- [ ] Refactor existing ClinVar overlay into `syntheticgen/clinvar.py`. For
-      any coalescent-produced variant whose (chrom,pos,ref,alt) tuple
-      collides with a ClinVar record, copy `CLNSIG` / `CLNDN` onto the
-      output record (don't force the overlay — keep positions consistent
-      with the simulation).
-- [ ] Add `syntheticgen/dbsnp.py`: download the dbSNP GRCh38 VCF (cached
-      like ClinVar) and **inject** a small set of known variants into the
-      cohort (annotated with rsIDs) so `ID` columns are non-empty and
-      realistic rsID densities are hit.
-- [ ] Optional `syntheticgen/cosmic.py` (gated behind `--somatic` flag;
-      COSMIC registration is required, so it stays optional).
+- [x] `syntheticgen/clinvar.py` now exposes `load_clinvar_index`,
+      `annotate_clinvar` (collision-only, copies CLNSIG/CLNDN/id when a
+      cohort site happens to land on a ClinVar coordinate) and
+      `inject_clinvar` (replaces a `--clinvar-inject-density` fraction
+      of cohort sites with random ClinVar pathogenic records — moves
+      the site to a real chromosome coordinate while preserving the
+      cohort GT block, so LD remains intact). Coalescent positions
+      live in `[1, sim_length]` while ClinVar sits at real chromosome
+      coordinates (chr22 ClinVar spans 15.5M–50.8M), so collision-only
+      annotation almost never fires — `inject_clinvar` is the
+      practical mechanism that lands CLNSIG/CLNDN at realistic
+      positions. The highlighted per-person variant path is unchanged.
+- [x] `syntheticgen/dbsnp.py` provides `load_rsid_pool` and
+      `inject_rsids`. Default rsID source is the cached ClinVar VCF
+      whose `INFO/RS` tag carries dbSNP rs numbers — this delivers
+      thousands of rsID-bearing records per chromosome with no extra
+      download. Users can pass `--dbsnp-vcf PATH` to point at a real
+      dbSNP-style VCF (rsIDs in the ID column) instead. `--rsid-density`
+      (default 0.20) controls how many cohort sites get rewritten with
+      a known rsID + its real coordinate / REF / ALT. ClinVar-injected
+      rows are reserved so the two overlays don't fight for the same
+      sites.
+- [x] `syntheticgen/cosmic.py` (gated behind `--somatic --cosmic-vcf
+      PATH`) reads any COSMIC-format VCF (GENE/LEGACY_ID/CDS/AA), and
+      `inject_cosmic` replaces a `--cosmic-inject-density` fraction of
+      cohort sites with COSMIC mutations. COSMIC registration is still
+      required to obtain the source file; we never auto-fetch and
+      `--somatic` without `--cosmic-vcf` exits with a clear message.
+- [x] Header gains `INFO=COSMIC_ID` and `INFO=COSMIC_GENE` declarations
+      (M7); writer carries `clnsig`, `clndn`, `cosmic_id`, `cosmic_gene`
+      from the cohort site through the per-person record onto the
+      emitted INFO field. `cohort.person_records_from_cohort` now
+      forwards those fields to the writer.
+- [x] Manifest gains an `overlays` block with the requested densities,
+      the dbSNP source path, and realised counts of annotated /
+      injected records.
+- [x] 23 new tests in `tests/test_overlays.py` covering ClinVar
+      annotate / inject, rsID normalisation (ID column vs INFO/RS,
+      bare digits vs prefixed, multi-rsID lists), inject_rsids
+      reserve_indices, COSMIC inject, post-injection sort invariants,
+      GT-block preservation, and ClinVar+rsID overlay interaction.
+      Tests are pure-Python and run without bcftools/network. **107/107
+      tests with deps; 84/84 stdlib-only (23 skipped).**
 
-**Exit check:** a significant fraction of output records carry rsIDs from
-dbSNP; ClinVar-known positions are annotated; `bcftools view -i 'CLNSIG!="."'`
-returns the injected pathogenic variants.
+**Exit check:** ✅ 2026-04-25 on 5-person × 1 Mb chr22 sim
+(`--demo-model none`, seed 42, default densities): 1,299 cohort sites;
+**13 ClinVar pathogenic injections** (CLNSIG=Pathogenic /
+Likely_pathogenic landing at real chr22 coordinates 29–50M); **259
+rsID injections** (~20% of records). Per-person VCFs carry
+117–135 rsIDs and 5–7 CLNSIG-bearing records each. Spot check —
+chr22:15528207 emerges as `rs3924507 C>T`,
+chr22:29673446 as `Pathogenic / Neurofibromatosis,_type_2`. All five
+VCFs pass `qc_validate.py --strict` with 0 errors / 0 warnings;
+header now declares COSMIC_ID / COSMIC_GENE alongside CLNSIG / CLNDN.
+COSMIC injection exercised via `tests/test_overlays.py` (no public
+COSMIC VCF in the cache; `--somatic --cosmic-vcf PATH` is the
+documented opt-in for users with a registered download).
 
 ---
 
