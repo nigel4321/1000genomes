@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import shutil
 import sys
 from pathlib import Path
 
+from .admixture import (
+    DEFAULT_AFR_FRAC,
+    DEFAULT_EUR_FRAC,
+    DEFAULT_SAS_FRAC,
+    ancestry_fractions,
+    simulate_cohort as simulate_admixed_cohort,
+    write_ancestry_bed,
+)
 from .background import load_background_pool, random_sample_id
 from .builds import BUILDS
 from .clinvar import (
@@ -146,6 +155,20 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--mu", type=float, default=DEFAULT_MU,
                    help="[coalescent, --demo-model=none only] Mutation "
                         "rate per bp per generation.")
+    p.add_argument("--admixture", action="store_true",
+                   help="UK-cohort admixture mode: simulate EUR + SAS + "
+                        "AFR sources mixed via a single pulse and write "
+                        "per-person local-ancestry BED truth tracks. "
+                        "Overrides --demo-model / --population.")
+    p.add_argument("--eur-frac", type=float, default=DEFAULT_EUR_FRAC,
+                   help="[admixture] EUR ancestry proportion in the "
+                        "admixture pulse.")
+    p.add_argument("--sas-frac", type=float, default=DEFAULT_SAS_FRAC,
+                   help="[admixture] SAS ancestry proportion in the "
+                        "admixture pulse.")
+    p.add_argument("--afr-frac", type=float, default=DEFAULT_AFR_FRAC,
+                   help="[admixture] AFR ancestry proportion in the "
+                        "admixture pulse. EUR+SAS+AFR must sum to 1.0.")
     p.add_argument("--clinvar-sig",
                    default=",".join(sorted(DEFAULT_SIG_FILTER)),
                    help="Comma-separated CLNSIG values to include when "
@@ -187,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("no ClinVar variants matched the CLNSIG filter — widen "
                  "--clinvar-sig")
 
+    person_ancestry: list = []  # admixture path fills per-person segments
     if args.legacy_background:
         bg_globs = args.background_glob or [args._default_bg]
         print(f"[legacy] Sampling background coordinates from: {bg_globs}",
@@ -208,6 +232,24 @@ def main(argv: list[str] | None = None) -> int:
         cohort_sites = draw_cohort_background(
             background_pool, args.n, args.n_background, args.sfs_alpha,
             rng,
+        )
+    elif args.admixture:
+        chromosomes = [c.strip() for c in args.chromosomes.split(",")
+                       if c.strip()]
+        proportions = (args.eur_frac, args.sas_frac, args.afr_frac)
+        print(
+            f"Simulating UK admixed cohort: {args.n} people across "
+            f"chroms {chromosomes} "
+            f"(EUR={args.eur_frac:.2f}, SAS={args.sas_frac:.2f}, "
+            f"AFR={args.afr_frac:.2f}, length={args.chr_length_mb} Mb)",
+            file=sys.stderr,
+        )
+        cohort_sites, person_ancestry = simulate_admixed_cohort(
+            chromosomes=chromosomes, build=args.build,
+            n_people=args.n, length_mb=args.chr_length_mb,
+            proportions=proportions,
+            rec_rate=args.rec_rate, mu=args.mu,
+            rng=rng, verbose=True,
         )
     else:
         chromosomes = [c.strip() for c in args.chromosomes.split(",")
@@ -248,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Writing {args.n} person VCFs into {args.output_dir}",
           file=sys.stderr)
+    manifest_people: list = []
     for i, sid in enumerate(sample_ids):
         hi = dict(rng.choice(candidates))
         hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
@@ -259,13 +302,76 @@ def main(argv: list[str] | None = None) -> int:
         }
         out = args.output_dir / f"person_{i+1:04d}.vcf.gz"
         write_person_vcf(out, person, args.build, rng)
-        print(
-            f"  [{i+1:>4}/{args.n}] {out.name} — {sid} — "
-            f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
-            f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
-            f"{len(background)} background records",
-            file=sys.stderr,
-        )
+
+        person_entry = {
+            "index": i + 1,
+            "sample_id": sid,
+            "vcf": out.name,
+            "highlighted": {
+                "id": hi["id"],
+                "chrom": hi["chrom"],
+                "pos": hi["pos"],
+                "ref": hi["ref"],
+                "alt": ",".join(hi["alts"]),
+                "gt": hi["gt"],
+            },
+            "n_background_records": len(background),
+        }
+
+        if person_ancestry:
+            bed_path = args.output_dir / "ancestry" / \
+                f"person_{i+1:04d}.bed"
+            write_ancestry_bed(bed_path, person_ancestry[i])
+            fracs = ancestry_fractions(person_ancestry[i])
+            person_entry["ancestry_bed"] = \
+                f"ancestry/{bed_path.name}"
+            person_entry["ancestry_fractions"] = {
+                p: round(v, 4) for p, v in fracs.items()
+            }
+            print(
+                f"  [{i+1:>4}/{args.n}] {out.name} — {sid} — "
+                f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
+                f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
+                f"{len(background)} background records, "
+                f"ancestry "
+                + ",".join(f"{p}={v:.2f}"
+                           for p, v in person_entry["ancestry_fractions"]
+                           .items()),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  [{i+1:>4}/{args.n}] {out.name} — {sid} — "
+                f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
+                f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
+                f"{len(background)} background records",
+                file=sys.stderr,
+            )
+
+        manifest_people.append(person_entry)
+
+    mode = ("legacy-background" if args.legacy_background
+            else "admixture-uk" if args.admixture
+            else "coalescent")
+    manifest = {
+        "build": args.build,
+        "n_people": args.n,
+        "mode": mode,
+        "chromosomes": [c.strip() for c in args.chromosomes.split(",")
+                        if c.strip()],
+        "seed": args.seed,
+        "people": manifest_people,
+    }
+    if args.admixture:
+        manifest["ancestry_proportions"] = {
+            "EUR": args.eur_frac,
+            "SAS": args.sas_frac,
+            "AFR": args.afr_frac,
+        }
+    manifest_path = args.output_dir / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Manifest written to {manifest_path}", file=sys.stderr)
 
     print("Done.", file=sys.stderr)
     return 0

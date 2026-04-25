@@ -9,9 +9,11 @@ GQ / AD).
 The spec is `SYHTHETIC_PROJECT.md`; incremental build plan and
 per-milestone status is in `IMPLEMENTATION_PLAN.md`.
 
-As of **M5** the default path is an msprime + stdpopsim coalescent; the
-M4 1000G-pool + power-law SFS sampler is retained behind
-`--legacy-background`.
+As of **M6** an `--admixture` mode simulates an EUR + SAS + AFR → UK
+admixture pulse and writes per-person local-ancestry BED truth tracks
+alongside each VCF; **M5** remains the default single-population
+coalescent path; the M4 1000G-pool + power-law SFS sampler is retained
+behind `--legacy-background`.
 
 ---
 
@@ -36,8 +38,9 @@ python3 -m venv .venv
 | Package | Used by | Purpose |
 |---|---|---|
 | `numpy>=1.24` | M4+ | sampling, histogram arithmetic |
-| `msprime>=1.3`, `tskit>=0.5` | M5 | coalescent simulation + tree sequences |
+| `msprime>=1.3`, `tskit>=0.5` | M5, M6 | coalescent simulation + tree sequences (M6 also uses `record_migrations` for local ancestry) |
 | `stdpopsim>=0.2` | M5 | human demographic catalogue (`OutOfAfrica_3G09`, etc.) |
+| `demes` (transitive via msprime) | M6 | UK-cohort admixture demography graph |
 | `matplotlib>=3.7`, `scikit-allel>=1.3` | M10 | validation plots (reserved) |
 
 Probe the environment:
@@ -70,6 +73,26 @@ First run only: ClinVar is downloaded (~50 MB) into
 - `--population` — sampling population for the demo model (CEU, YRI, CHB
   for `OutOfAfrica_3G09`).
 - `--rec-rate`, `--mu` — only consulted when `--demo-model=none`.
+
+### Admixture: EUR + SAS + AFR → UK pulse (M6)
+
+```bash
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 50 --seed 42 \
+    --chromosomes 22 --chr-length-mb 5.0 \
+    --admixture --eur-frac 0.60 --sas-frac 0.25 --afr-frac 0.15
+```
+
+- `--admixture` — overrides `--demo-model` / `--population`; runs the
+  three-source UK-cohort demography (M6).
+- `--eur-frac` / `--sas-frac` / `--afr-frac` — per-source ancestry
+  proportions. Must sum to 1.0 and be non-negative. Defaults
+  60/25/15.
+
+In addition to the per-person VCFs, this mode emits one
+`out/ancestry/person_NNNN.bed` truth track per individual (columns:
+`chrom  start  end  hap1_pop  hap2_pop`) and an `out/manifest.json`
+including realised per-person ancestry fractions.
 
 ### Legacy: 1000G-pool + power-law SFS (M4)
 
@@ -131,9 +154,28 @@ out/
 ├── person_0001.vcf.gz.tbi
 ├── person_0002.vcf.gz
 ├── ...
+├── manifest.json        # per-person VCF + ancestry summary (M6 onward)
+├── ancestry/            # M6 only: per-person local-ancestry BEDs
+│   ├── person_0001.bed
+│   └── ...
 └── summary/
     └── sfs.tsv          # cohort AC histogram (columns: ac, n_sites)
 ```
+
+Per-person BED columns (admixture mode only):
+
+```
+chrom    start    end    hap1_pop    hap2_pop
+22       0        1234567   EUR         AFR
+22       1234567  5000000   EUR         EUR
+...
+```
+
+`hap1_pop` / `hap2_pop` ∈ {EUR, SAS, AFR, OOA, ANC}. With the default
+~600-year-old admixture pulse, the vast majority of segments resolve to
+the three source demes; OOA / ANC appear only when an unusually deep
+lineage's tree-walk has not yet found an EUR/SAS/AFR ancestor by t=20
+gens — reported faithfully when it happens.
 
 Per-person VCF:
 
@@ -173,6 +215,7 @@ synthetic_people/
 │   ├── cohort.py             # M4 shared-site cohort + haplotype slotting
 │   ├── sfs.py                # M4 P(k) ∝ 1/k^α sampler + histogram
 │   ├── coalescent.py         # M5 msprime + stdpopsim driver
+│   ├── admixture.py          # M6 UK-cohort demes pulse + local ancestry
 │   ├── titv.py               # M3+ Ti/Tv calibrator for de-novo SNVs
 │   ├── quality.py            # M2 DP / GQ / AD simulation
 │   ├── header.py             # VCF header assembly
@@ -184,8 +227,9 @@ synthetic_people/
 │   ├── test_titv.py          # M3+
 │   ├── test_sfs.py           # M4
 │   ├── test_cohort.py        # M4
-│   └── test_coalescent.py    # M5 (skips cleanly without msprime/stdpopsim)
-└── out/                      # generated VCFs + summary/
+│   ├── test_coalescent.py    # M5 (skips cleanly without msprime/stdpopsim)
+│   └── test_admixture.py     # M6 (skips cleanly without msprime/demes/tskit)
+└── out/                      # generated VCFs + summary/ + ancestry/
 ```
 
 ---
@@ -288,18 +332,60 @@ because recombination is uniform; wiring in `HapMapII_GRCh38` hit a
 stdpopsim "missing data" error on sub-chromosome regions and is deferred
 to M6/M10.
 
+### M6 — UK-cohort admixture + local ancestry truth
+
+`syntheticgen/admixture.py` builds a `demes`-defined demography with
+three source demes (EUR, SAS, AFR) joining at a single admixture pulse
+into a UK deme **20 generations (~600 years) ago**. Source population
+sizes mirror the Gutenkunst OOA_3G09 parameterisation
+(ANC = 12.3 k, AFR = 12.3 k, OOA bottleneck = 2.1 k, EUR / SAS = 10 k);
+present-day UK Ne = 50 k. Mutations come from `BinaryMutationModel`
+with REF/ALT bases drawn through the M3+ Ti/Tv calibrator, so the
+output `sites` list has the exact shape M4 / M5 produce (writer is
+unchanged).
+
+Local ancestry: `msprime.sim_ancestry(..., record_migrations=True)`
+records every t = 20 migration. For each haplotype-sample we walk the
+tree at every breakpoint to find the lineage node spanning the pulse
+time, then look up which source deme it migrated into. Adjacent
+same-ancestry segments are merged; haplotype pairs are then
+intersected into per-person joint
+`(start, end, h1_pop, h2_pop)` rows, written one BED per person to
+`out/ancestry/person_NNNN.bed`.
+
+`out/manifest.json` lists each person with VCF path, BED path,
+highlighted ClinVar variant, background record count, and realised
+ancestry fractions. Top-level fields capture the requested
+`ancestry_proportions` and the run mode (`coalescent` / `admixture-uk`
+/ `legacy-background`).
+
+20-person × 5 Mb chr22 exit check (seed 42, default 60/25/15):
+13 549 variable sites; 43 ancestry segments across the cohort
+(mean 2.1 segments/person — biologically expected because 20
+generations × 5 Mb yields ≈ 1 recombination breakpoint per haplotype);
+cohort-mean realised ancestry **EUR = 0.456, SAS = 0.352, AFR = 0.192**
+— within finite-cohort sampling noise of the requested 0.60 / 0.25 /
+0.15 mix. Per-person VCFs pass `qc_validate.py --strict` with 0
+errors / 0 warnings.
+
+A 30-person × 1 Mb stand-alone proportions check
+(`tests/test_admixture.py::test_ancestry_fractions_track_requested_proportions`)
+lands EUR ≈ 0.6, SAS ≈ 0.25, AFR ≈ 0.15 within ±15%. The literal PCA
+acceptance test in spec §6 lands in M10.
+
 ---
 
 ## Test suite
 
-71 tests across six files; all passing with deps installed.
+84 tests across seven files; all passing with deps installed.
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Without msprime/stdpopsim installed, `test_coalescent.py` skips cleanly
-and **61/61** remaining still pass.
+Without msprime/stdpopsim/demes/tskit installed, `test_coalescent.py`
+and `test_admixture.py` skip cleanly and **61/61** remaining still
+pass.
 
 | File | Count | Coverage |
 |---|---|---|
@@ -309,6 +395,7 @@ and **61/61** remaining still pass.
 | `test_sfs.py` | 16 | `draw_minor_count` range + near-uniform at α→0, singleton fraction >55% at default α = 2.0, `draw_allele_counts` total bound, histogram aggregation, TSV round-trip, parameter validation |
 | `test_cohort.py` | 14 | `assign_haplotypes` exact-count preservation, random-slot placement, overflow rejection, cohort reproducibility under seed, every-site-variable invariant, coord-sharing across people, hom-ref drop-out |
 | `test_coalescent.py` | 10 | Output shape, monotone positions, realised AC = declared AC, no fixed sites, seed reproducibility, Ti/Tv ∈ [1.7, 2.6], multi-chromosome, error on unknown chromosome, stdpopsim end-to-end (`skipUnless` on msprime/stdpopsim import) |
+| `test_admixture.py` | 13 | Demography proportion validation, UK 3-ancestor topology, sites + per-person segments shape, full-chromosome coverage, realised AC = declared AC, BED round-trip, ancestry-fraction normalisation + empty input, multi-chromosome, seed reproducibility, aggregate ancestry tracks requested 60/25/15 within ±15% (`skipUnless` on msprime/demes/tskit import) |
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -320,8 +407,6 @@ hard failure).
 
 Tracked in `IMPLEMENTATION_PLAN.md`:
 
-- **M6** — UK-cohort admixture (EUR + SAS + AFR pulses, per-person local
-  ancestry BED).
 - **M7** — ClinVar / dbSNP / COSMIC overlays on the coalescent output.
 - **M8** — structural variants (symbolic ALTs, SVTYPE / SVLEN / END).
 - **M9** — sequencer-noise / genotyping-error injection.
@@ -345,6 +430,10 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--population` | [coalescent] Sampling population | `CEU` |
 | `--rec-rate` | [coalescent, `--demo-model=none`] Uniform recombination rate | `1e-8` |
 | `--mu` | [coalescent, `--demo-model=none`] Mutation rate | `1.29e-8` |
+| `--admixture` | Run M6 EUR + SAS + AFR → UK pulse, write per-person ancestry BED | `False` |
+| `--eur-frac` | [admixture] EUR proportion | `0.60` |
+| `--sas-frac` | [admixture] SAS proportion | `0.25` |
+| `--afr-frac` | [admixture] AFR proportion (sum must be 1.0) | `0.15` |
 | `--legacy-background` | Use M4 1000G-pool + power-law SFS sampler | `False` |
 | `--background-glob` | [legacy] Source glob(s) for common variants | 1000G files in parent dir |
 | `--n-background` | [legacy] Shared background site count | `500` |
