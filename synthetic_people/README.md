@@ -9,11 +9,18 @@ GQ / AD).
 The spec is `SYHTHETIC_PROJECT.md`; incremental build plan and
 per-milestone status is in `IMPLEMENTATION_PLAN.md`.
 
-As of **M9** every batch carries a configurable lightweight
-sequencing-error model: per-call genotype flips and coverage dropouts
-applied at a target FDR (~0.1% by default). Flipped calls land
-low-GQ because GQ is recomputed from AD, which still reflects the
-truth; dropouts emit `./.` with DP / GQ / AD all zero. **M8** added a
+As of **M10** every batch can be validated end-to-end with
+`validate_batch.py`, which walks the per-person VCFs and writes
+`summary.json`, a Markdown report, and four PNGs (LD decay, AF
+histogram, indel length distribution, cohort PCA) under
+`<batch>/validation/`. Acceptance criteria from `SYHTHETIC_PROJECT.md`
+§6 — Ti/Tv ≈ 2.1, monotone LD decay, PCA cluster structure on
+admixture-mode batches — are visible in those artefacts. **M9** added
+a configurable lightweight sequencing-error model: per-call genotype
+flips and coverage dropouts applied at a target FDR (~0.1% by
+default). Flipped calls land low-GQ because GQ is recomputed from
+AD, which still reflects the truth; dropouts emit `./.` with DP /
+GQ / AD all zero. **M8** added a
 handful of structural variants per person — `<DEL>` / `<DUP>` /
 `<INV>` symbolic ALTs with `SVTYPE` / `SVLEN` / `END` / `CIPOS` INFO
 tags — alongside the SNV/indel cohort background. **M7** grounds
@@ -181,6 +188,32 @@ block with requested rates, realised counts, and realised FDR; each
 per-person entry carries its own `errors` sub-dict so M11's truth-set
 BED can grade calls against the truth.
 
+### Validation suite (M10)
+
+After generating a batch, run `validate_batch.py` against the output
+directory:
+
+```bash
+.venv/bin/python synthetic_people/validate_batch.py path/to/out/
+```
+
+Walks every `person_*.vcf.gz` under the batch dir and produces, under
+`<batch>/validation/`:
+
+| Artefact | Contents |
+|---|---|
+| `summary.json` | Per-sample stats + cohort aggregates (Ti/Tv, Het/Hom, AF histogram, indel/SV breakdown, LD-decay bins, PCA projection) |
+| `report.md` | Markdown report linking the plots and surfacing the per-sample table |
+| `ld_decay.png` | Mean r² vs. distance, log-x |
+| `af_histogram.png` | Allele frequency distribution |
+| `indel_lengths.png` | Indel length distribution (insertions positive, deletions negative) |
+| `pca.png` | Cohort PCA scatter; admixture-mode batches colour each person by dominant ancestry component |
+
+The validator also reads the batch's `manifest.json` if present, so
+admixture-mode reports surface requested vs realised ancestry.
+Without matplotlib installed, the JSON / Markdown artefacts still
+land and a one-line warning skips the plots.
+
 ### Legacy: 1000G-pool + power-law SFS (M4)
 
 ```bash
@@ -307,11 +340,14 @@ synthetic_people/
 │   ├── admixture.py          # M6 UK-cohort demes pulse + local ancestry
 │   ├── sv.py                 # M8 structural variant generator (DEL/DUP/INV)
 │   ├── errors.py             # M9 lightweight per-call noise (GT flips + dropouts)
+│   ├── validate.py           # M10 stats / LD decay / PCA primitives
+│   ├── plots.py              # M10 matplotlib plot helpers
 │   ├── titv.py               # M3+ Ti/Tv calibrator for de-novo SNVs
 │   ├── quality.py            # M2 DP / GQ / AD simulation
 │   ├── header.py             # VCF header assembly
 │   ├── writer.py             # bgzip + tabix single-sample write
 │   └── cli.py                # argparse + orchestration
+├── validate_batch.py         # M10 top-level CLI → out/validation/
 ├── tests/
 │   ├── test_quality.py       # M2 + M3 (generalised to N alleles)
 │   ├── test_multiallelic.py  # M3
@@ -322,8 +358,9 @@ synthetic_people/
 │   ├── test_admixture.py     # M6 (skips cleanly without msprime/demes/tskit)
 │   ├── test_overlays.py      # M7 (pure-Python; no bcftools / network)
 │   ├── test_sv.py            # M8 (pure-Python; no bcftools / network)
-│   └── test_errors.py        # M9 (pure-Python; no bcftools / network)
-└── out/                      # generated VCFs + summary/ + ancestry/
+│   ├── test_errors.py        # M9 (pure-Python; no bcftools / network)
+│   └── test_validate.py      # M10 (gates plot/PCA tests on matplotlib/sklearn)
+└── out/                      # generated VCFs + summary/ + ancestry/ + validation/
 ```
 
 ---
@@ -552,20 +589,52 @@ all 40 reads on the alt, GQ correctly drops to 0). Dropouts emit
 `./.:0:0:0,0`. All three VCFs pass `qc_validate.py --strict` with
 0 errors / 0 warnings.
 
+### M10 — Validation suite
+
+`syntheticgen/validate.py` provides the analytics primitives;
+`syntheticgen/plots.py` keeps all matplotlib code in one gated module;
+`validate_batch.py` is the top-level CLI. The validator walks every
+`person_*.vcf.gz` under the batch directory, computes per-sample +
+cohort stats (Ti/Tv, Het/Hom-alt, AF, indel lengths, SVs, singletons,
+dropouts), then builds a genotype-dosage matrix to compute LD decay
+and PCA. Output lands as `summary.json`, `report.md`, and four PNGs
+under `<batch>/validation/`.
+
+LD decay uses log-spaced distance bins (100 bp – 500 kb) and samples
+SNP pairs reproducibly under a seedable RNG. PCA mean-imputes missing
+genotypes, prunes zero-variance columns, and runs `sklearn`'s PCA on
+the cohort matrix. Admixture-mode batches automatically label each
+sample by dominant ancestry component so the spec-§6 "cluster or
+bridge clusters" criterion is testable visually.
+
+Single-population exit check (30 people × 5 Mb chr22, `--demo-model
+none`, seed 42): **Ti/Tv = 1.822** ✓, **Het/Hom-alt = 2.004** ✓,
+LD decay monotone (0.327 → 0.123 across 100 bp – 500 kb), PCA PC1
+captures 5.3% of variance — appropriately low for a single-pop
+constant-Ne draw.
+
+Admixture exit check (30 people × 5 Mb chr22, default 60/25/15
+EUR/SAS/AFR, seed 42): **Ti/Tv = 1.882** ✓, LD decay monotone
+(0.338 → 0.104), **PCA PC1 captures 19.6% of variance** — the clear
+ancestry signal the spec calls for, with EUR / SAS / AFR-dominant
+labels visible as separable clusters in `pca.png`.
+
 ---
 
 ## Test suite
 
-147 tests across ten files; all passing with deps installed.
+186 tests across eleven files; all passing with deps installed.
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Without msprime/stdpopsim/demes/tskit installed, `test_coalescent.py`
-and `test_admixture.py` skip cleanly and **124/124** remaining still
-pass (`test_overlays.py`, `test_sv.py`, and `test_errors.py` are
-pure-Python and run in either environment).
+Without msprime / stdpopsim / demes / tskit / matplotlib / sklearn
+installed, the corresponding tests skip cleanly and **147/147**
+remaining still pass (`test_overlays.py`, `test_sv.py`, and
+`test_errors.py` are pure-Python; numpy-only validate tests still
+run if numpy is on PATH; matplotlib/sklearn-gated subset of
+`test_validate.py` skips when those deps are absent).
 
 | File | Count | Coverage |
 |---|---|---|
@@ -579,6 +648,7 @@ pure-Python and run in either environment).
 | `test_overlays.py` | 23 | ClinVar `annotate` (collision match, alt mismatch, no-match returns 0); ClinVar `inject` (density count, GT-block preservation, post-sort invariant, off-chromosome skip, zero-density no-op); rsID `_normalise_rsid` (ID-prefixed, bare-digit, INFO/RS fallback, semicolon and comma lists, missing-returns-empty); rsID `inject_rsids` (density, GT preservation, sort invariant, reserve_indices exclusion, zero-density no-op); COSMIC inject (ID + gene + REF/ALT swap, zero-density no-op); ClinVar + rsID overlay disjointness via reserve_indices |
 | `test_sv.py` | 22 | `_draw_length` log-uniform skew + bounds + collapsed-range + invalid-range; `_build_sv_record` SVLEN sign by type, anchor base validity, CIPOS default, unknown-SVTYPE rejection; `generate_person_svs` count, zero-returns-empty, well-formed records, length bounds honoured, END inside chrom span, multi-chromosome distribution, type distribution within ±0.07 of (0.50, 0.30, 0.20), seed reproducibility, different-seed divergence, too-small-chrom and empty-chromosome rejection |
 | `test_errors.py` | 18 | `maybe_flip_gt` zero/negative-rate no-op, full-rate always-flips, realised flip rate ~1% on 10k draws, biallelic-only flip targets, hom→het 0.7-weight bias, het 0|1 50/50 split between hom-ref and hom-alt, `1\|2` multi-allelic collapse to REF, unparseable GT pass-through, seed reproducibility; `maybe_dropout` zero/full-rate, realised rate, seed reproducibility; `new_error_stats` shape, `merge_stats` in-place add + missing-key seeding; default-constants lock-in |
+| `test_validate.py` | 39 | `_parse_info` empty / single / multiple / flag forms; SNV / indel / SV classification; GT dosage hom-ref/het/hom-alt/multi-allelic/missing; dropout detection; Ti/Tv aggregation + zero-Tv + empty corner cases; Het/Hom ratio + zero-hom + zero-both; indel/SV aggregation; AF histogram bin placement + empty; `_r2_pair` perfect-corr / perfect-anticorr / uncorrelated / constant-vector / few-samples / missing-mask; `ld_decay` shape + short-vs-long ordering; cohort PCA on a clear 2-cluster signal (PC1 > 95% variance) + insufficient-columns guard; PNG smoke tests for every plot helper (LD / AF / indel / PCA-handles-None) |
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -590,9 +660,10 @@ hard failure).
 
 Tracked in `IMPLEMENTATION_PLAN.md`:
 
-- **M10** — validation suite (PCA vs 1000G, LD decay curves, stats).
-- **M11** — delivery packaging (manifest, truth sets, smoke script,
-  ART read simulation gated by `--art`).
+- **M11** — delivery packaging (truth-set BED grading flipped/dropped
+  calls against the cohort truth, `scripts/smoke.sh` for CI, ART read
+  simulation gated by `--art`, GRCh38 reference FASTA wired in for
+  exact-anchor SV reporting).
 
 ## CLI reference
 

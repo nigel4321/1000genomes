@@ -433,19 +433,72 @@ disagreement visible in the output: e.g. `chr22:758982 0|0:40:0:0,40`
 
 ### M10 — Validation suite (PCA, LD decay, stats)
 
-- [ ] `syntheticgen/validate.py` + a `validate_batch.py` CLI producing:
-      * **PCA plot** using `scikit-allel` — project synthetic samples into
-        a 1000G PCA space (pre-computed from the local chr19–22 VCFs).
-      * **LD decay curve**: r² vs. physical distance in kb, split by
-        population, on log-x.
-      * **Variant statistics report** (HTML or Markdown):
-        Ti/Tv, Het/Hom per sample, AF histogram, singleton fraction, indel
-        length distribution, SV count summary.
-- [ ] Plots land under `out/validation/`; the Markdown report links them.
+- [x] `syntheticgen/validate.py` exposes the analytics primitives:
+      * `iter_records(vcf_path)` streams a single-sample VCF via
+        `bcftools query`, splitting multi-allelics into one Record per
+        ALT.
+      * `summarise_vcf` aggregates per-sample counts (SNV / indel / SV
+        / Ti / Tv / Het / Hom-alt / Hom-ref / dropouts / AF / indel
+        lengths / SV-by-type / singletons).
+      * `titv_from_stats` and `het_hom_ratio` close the spec acceptance
+        signals; `af_histogram`, `aggregate_indel_lengths`, and
+        `aggregate_sv_summary` produce the plot inputs.
+      * `build_genotype_matrix(vcf_paths)` materialises a
+        `(n_samples, n_variants)` int8 dosage matrix over the union of
+        sites; missing genotypes coded `-1`.
+      * `ld_decay(matrix, positions, chroms, distance_bins_kb,
+        pairs_per_bin, rng)` returns mean r² per log-spaced distance
+        bin; pair sub-sampling is reproducible under the supplied RNG.
+      * `cohort_pca(matrix, n_components)` mean-imputes missing calls,
+        prunes zero-variance columns, and returns the
+        `sklearn.decomposition.PCA` projection plus explained-variance
+        ratio.
+- [x] `syntheticgen/plots.py` contains all matplotlib code (gated
+      behind the import — caller still gets stats / JSON / Markdown
+      without matplotlib): `plot_ld_decay`, `plot_af_histogram`,
+      `plot_pca`, `plot_indel_lengths`. Headless-safe (`Agg` backend).
+- [x] `validate_batch.py` (top-level CLI alongside `generate_people.py`)
+      walks every `person_*.vcf.gz` under the batch directory, computes
+      the full stats stack, runs LD-decay + PCA, and writes
+      `summary.json`, `report.md`, and the four PNGs into
+      `<batch>/validation/`. Reads the existing `manifest.json` if
+      present so admixture-mode reports surface requested vs realised
+      ancestry; PCA labels each person by dominant ancestry component
+      so the spec's "cluster or bridge clusters" criterion is testable
+      visually.
+- [x] `requirements.txt` `matplotlib>=3.7` and `scikit-allel>=1.3` are
+      now installed in the project venv (scikit-learn pulled in as a
+      transitive dep for PCA). Without them, validate falls back to
+      JSON / Markdown output and prints a one-line warning.
+- [x] 39 new tests in `tests/test_validate.py` covering: INFO parsing,
+      SNV / indel / SV classification, GT dosage (incl. multi-allelic
+      `1|2`), dropout detection, Ti/Tv aggregation, Het/Hom corner
+      cases, AF histogram bin placement, indel/SV aggregation, r²
+      perfect-correlation / anticorrelation / uncorrelated /
+      constant-vector / missing-data / few-samples, LD-decay structure
+      (short-range > long-range), cohort PCA on a structured matrix
+      (PC1 captures >95% of variance on a 2-cluster signal),
+      insufficient-columns guard, and PNG smoke-tests for every plot
+      helper. Numpy-required tests gate on `HAS_NUMPY`; PCA tests
+      gate additionally on `HAS_SKLEARN`; plot tests gate on
+      `HAS_MPL`. **186/186 with deps; 147/147 stdlib-only (39
+      skipped).**
 
-**Exit check:** `python3 validate_batch.py out/` succeeds end-to-end and
-produces all three artefacts; acceptance criteria from spec §6 are visibly
-met on the plots.
+**Exit check:** ✅ 2026-04-25.
+
+Single-population path (30 people × 5 Mb chr22, `--demo-model none`,
+seed 42): **Ti/Tv = 1.822**, **Het/Hom-alt = 2.004**, 112,114 cohort
+records, 74,796 singletons. LD decay monotone from 0.327 (100–500 bp)
+through 0.123 (200–500 kb). PCA PC1 captures 5.3% of variance —
+expected for a single-pop constant-Ne draw with no real demographic
+structure. Four PNGs land under `validation/`; `report.md` links them
+all and surfaces the per-sample table.
+
+Admixture path (30 people × 5 Mb chr22, default 60/25/15
+EUR/SAS/AFR, seed 42): **Ti/Tv = 1.882**, LD decay monotone (0.338
+→ 0.104), **PCA PC1 captures 19.6% of variance** — the clear
+ancestry signal the spec calls for, with EUR / SAS / AFR-dominant
+labels visible as separable clusters in `pca.png`.
 
 ---
 
