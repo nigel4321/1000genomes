@@ -504,20 +504,49 @@ labels visible as separable clusters in `pca.png`.
 
 ### M11 — Delivery packaging
 
-- [ ] Per-batch manifest `out/manifest.json` listing each person with:
-      ancestry fractions, highlighted variants, file paths.
-- [ ] Truth set BED: per person, a BED listing "golden" variant positions
-      (injected ClinVar + simulated true variants) vs. noise-introduced
-      calls from M9.
-- [ ] `README.md` final rewrite describing the new pipeline end-to-end,
-      including how to regenerate the validation report.
-- [ ] Smoke-test script `scripts/smoke.sh` running `--n 20` end-to-end in
-      CI-friendly time (<5 min).
+- [x] Per-batch manifest `out/manifest.json` (already written from M6
+      onward) now also surfaces, per person, `golden_bed`, `noise_bed`,
+      `n_golden`, `n_noise` alongside the existing ancestry fractions,
+      highlighted variant, error stats, and file paths. The top-level
+      `errors` block continues to record cohort-wide realised FDR.
+- [x] Truth-set BED (`syntheticgen/truth.py`): two BED4 files per
+      person under `out/truth/`:
+      * `person_NNNN.golden.bed` — every record matching the spec's
+        "golden truth" set, tagged with priority HIGHLIGHTED > CLINVAR >
+        COSMIC > SV > RSID. Each row carries a semicolon-separated
+        `flag=…;id=…;ref=…;alt=…;gt=…;…` payload in the BED4 name
+        column so downstream tools (bedtools / IGV / UCSC) parse it
+        cleanly.
+      * `person_NNNN.noise.bed` — every M9 noise event (FLIP /
+        DROPOUT) recording the truth GT vs the called GT so a caller's
+        accuracy can be graded against the model.
+      `TruthBedWriter` buffers in memory and sorts by
+      `(contig_order, chrom, start)` on close so output is
+      `sort -k1,1 -k2,2n`-friendly. The writer is created per-person
+      in `cli.py` and threaded into `write_person_vcf` so the writer
+      sees both golden and noise events as the per-record loop runs.
+- [x] `README.md` final rewrite describing the new pipeline end-to-end,
+      including the M11 truth-set deliverables and the smoke script.
+- [x] Smoke-test script `scripts/smoke.sh` runs an end-to-end 5-person
+      cohort (chr22 × 0.5 Mb prefix) plus the validation suite and
+      asserts every advertised deliverable lands on disk. Defaults to
+      a deterministic seed; CI-friendly (<2 min on a laptop).
+- [x] 20 new tests in `tests/test_truth.py` covering category priority,
+      payload escaping, BED half-open coordinates for SNVs / deletions
+      / SVs, sort-on-close, context-manager protocol, and parent-dir
+      creation. **226/226 with deps; 165/165 stdlib-only (61 skipped).**
 
-**Exit check:** a fresh clone can `pip install -r requirements.txt`,
-run `python3 generate_people.py --n 20 --seed 42`, and have all spec
-deliverables (VCF.gz, tbi, truth BED, local ancestry BED, validation plots,
-stats report) land under `out/` without manual intervention.
+**Exit check:** ✅ 2026-04-26 on a fresh 5-person × 0.5 Mb chr22 sim
+(`scripts/smoke.sh`, seed 42, default error / dropout rates): every
+deliverable lands without manual intervention —
+`out/person_NNNN.vcf.gz` + `.tbi`, `out/truth/person_NNNN.golden.bed`,
+`out/truth/person_NNNN.noise.bed`, `out/manifest.json`,
+`out/summary/sfs.tsv`, `out/validation/report.md` +
+`summary.json` + four PNGs. Realised FDR 0.293% over 1,365 calls (4
+events spread across 5 people). Manifest entries surface the new
+`golden_bed` / `noise_bed` / `n_golden` / `n_noise` fields. Each
+golden BED row carries the priority-ordered tag so a downstream
+caller can split on `flag=` to grade against the model.
 
 ---
 

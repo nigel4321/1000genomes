@@ -24,3 +24,4 @@ stdpopsim>=0.2
 # M10 (validation suite: PCA, LD decay, Ti/Tv plots)
 matplotlib>=3.7
 scikit-allel>=1.3
+scikit-learn>=1.3

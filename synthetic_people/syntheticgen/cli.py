@@ -65,6 +65,7 @@ from .sv import (
     DEFAULT_SVS_PER_PERSON,
     generate_person_svs,
 )
+from .truth import TruthBedWriter
 from .writer import write_person_vcf
 
 
@@ -499,6 +500,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     error_stats_total = new_error_stats()
+    truth_dir = args.output_dir / "truth"
+    contig_order = {c: i for i, c
+                    in enumerate(BUILDS[args.build]["contigs"])}
     manifest_people: list = []
     for i, sid in enumerate(sample_ids):
         hi = dict(rng.choice(candidates))
@@ -521,12 +525,18 @@ def main(argv: list[str] | None = None) -> int:
         }
         out = args.output_dir / f"person_{i+1:04d}.vcf.gz"
         person_stats = new_error_stats()
+        golden_path = truth_dir / f"person_{i+1:04d}.golden.bed"
+        noise_path = truth_dir / f"person_{i+1:04d}.noise.bed"
+        tw = TruthBedWriter(golden_path, noise_path,
+                            contig_order=contig_order)
         write_person_vcf(
             out, person, args.build, rng,
             error_rate=args.error_rate,
             dropout_rate=args.dropout_rate,
             stats=person_stats,
+            truth_writer=tw,
         )
+        tw.close()
         merge_stats(error_stats_total, person_stats)
 
         person_entry = {
@@ -544,6 +554,10 @@ def main(argv: list[str] | None = None) -> int:
             "n_background_records": len(background),
             "n_svs": len(person_svs),
             "errors": dict(person_stats),
+            "golden_bed": f"truth/{golden_path.name}",
+            "noise_bed": f"truth/{noise_path.name}",
+            "n_golden": tw.golden_count,
+            "n_noise": tw.noise_count,
         }
 
         if person_ancestry:

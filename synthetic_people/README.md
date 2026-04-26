@@ -9,7 +9,15 @@ GQ / AD).
 The spec is `SYHTHETIC_PROJECT.md`; incremental build plan and
 per-milestone status is in `IMPLEMENTATION_PLAN.md`.
 
-As of **M10** every batch can be validated end-to-end with
+As of **M11** every batch ships a self-contained delivery: per-person
+`person_NNNN.vcf.gz` + `.tbi`, a pair of BED4 truth tracks
+(`out/truth/person_NNNN.golden.bed` for the curated golden set,
+`out/truth/person_NNNN.noise.bed` for every M9 flip / dropout), local
+ancestry BED (admixture mode), `manifest.json` cataloguing it all, and
+the `validation/` artefacts described next.
+A smoke test (`scripts/smoke.sh`) exercises the full pipeline in <2
+min on a laptop.
+**M10** validates every batch end-to-end with
 `validate_batch.py`, which walks the per-person VCFs and writes
 `summary.json`, a Markdown report, and four PNGs (LD decay, AF
 histogram, indel length distribution, cohort PCA) under
@@ -58,7 +66,8 @@ python3 -m venv .venv
 | `msprime>=1.3`, `tskit>=0.5` | M5, M6 | coalescent simulation + tree sequences (M6 also uses `record_migrations` for local ancestry) |
 | `stdpopsim>=0.2` | M5 | human demographic catalogue (`OutOfAfrica_3G09`, etc.) |
 | `demes` (transitive via msprime) | M6 | UK-cohort admixture demography graph |
-| `matplotlib>=3.7`, `scikit-allel>=1.3` | M10 | validation plots (reserved) |
+| `matplotlib>=3.7`, `scikit-allel>=1.3` | M10 | LD decay r² + cohort PCA + plot artefacts |
+| `scikit-learn>=1.3` (transitive) | M10 | PCA decomposition for the cohort matrix |
 
 Probe the environment:
 
@@ -214,6 +223,35 @@ admixture-mode reports surface requested vs realised ancestry.
 Without matplotlib installed, the JSON / Markdown artefacts still
 land and a one-line warning skips the plots.
 
+### Truth-set BED tracks (M11)
+
+Every run drops two BED4 files per person under `out/truth/`:
+
+| File | Contents |
+|---|---|
+| `person_NNNN.golden.bed` | Every record matching the spec's "golden truth" set, tagged with priority `HIGHLIGHTED` > `CLINVAR` > `COSMIC` > `SV` > `RSID`. The 4th column carries a semicolon-separated `flag=…;id=…;ref=…;alt=…;gt=…;…` payload so a downstream caller can split on `flag=` to grade against the model. |
+| `person_NNNN.noise.bed` | One row per M9 noise event: `flag=FLIP` or `flag=DROPOUT` plus `truth_gt=…;called_gt=…`. Lets a caller's per-call accuracy be graded against the known noise model. |
+
+Rows are sorted by `(contig_order, chrom, start)` so the BEDs are
+`sort -k1,1 -k2,2n`-friendly with no follow-up shell sort. BED
+coordinates are 0-based half-open. Manifest entries gain
+`golden_bed`, `noise_bed`, `n_golden`, `n_noise` per person; the
+top-level `errors` block continues to record the cohort-wide realised
+FDR.
+
+### Smoke test (M11)
+
+Quick end-to-end exercise of generation + validation, useful for CI:
+
+```bash
+bash synthetic_people/scripts/smoke.sh
+```
+
+Generates a 5-person × 0.5 Mb chr22 cohort with default error /
+dropout rates, runs the validation suite, and asserts every
+deliverable lands on disk. `OUT_DIR`, `N_PEOPLE`, `SEED`, and
+`PYTHON` can be overridden by env-var.
+
 ### Legacy: 1000G-pool + power-law SFS (M4)
 
 ```bash
@@ -274,12 +312,23 @@ out/
 ├── person_0001.vcf.gz.tbi
 ├── person_0002.vcf.gz
 ├── ...
-├── manifest.json        # per-person VCF + ancestry summary (M6 onward)
-├── ancestry/            # M6 only: per-person local-ancestry BEDs
+├── manifest.json        # per-person VCF + truth + ancestry summary
+├── ancestry/            # admixture mode only: per-person local-ancestry BEDs
 │   ├── person_0001.bed
 │   └── ...
-└── summary/
-    └── sfs.tsv          # cohort AC histogram (columns: ac, n_sites)
+├── truth/               # M11: golden + noise BED tracks per person
+│   ├── person_0001.golden.bed
+│   ├── person_0001.noise.bed
+│   └── ...
+├── summary/
+│   └── sfs.tsv          # cohort AC histogram (columns: ac, n_sites)
+└── validation/          # M10 (created by validate_batch.py)
+    ├── report.md
+    ├── summary.json
+    ├── ld_decay.png
+    ├── af_histogram.png
+    ├── indel_lengths.png
+    └── pca.png
 ```
 
 Per-person BED columns (admixture mode only):
@@ -340,6 +389,7 @@ synthetic_people/
 │   ├── admixture.py          # M6 UK-cohort demes pulse + local ancestry
 │   ├── sv.py                 # M8 structural variant generator (DEL/DUP/INV)
 │   ├── errors.py             # M9 lightweight per-call noise (GT flips + dropouts)
+│   ├── truth.py              # M11 golden + noise BED4 truth-set writer
 │   ├── validate.py           # M10 stats / LD decay / PCA primitives
 │   ├── plots.py              # M10 matplotlib plot helpers
 │   ├── titv.py               # M3+ Ti/Tv calibrator for de-novo SNVs
@@ -359,8 +409,11 @@ synthetic_people/
 │   ├── test_overlays.py      # M7 (pure-Python; no bcftools / network)
 │   ├── test_sv.py            # M8 (pure-Python; no bcftools / network)
 │   ├── test_errors.py        # M9 (pure-Python; no bcftools / network)
-│   └── test_validate.py      # M10 (gates plot/PCA tests on matplotlib/sklearn)
-└── out/                      # generated VCFs + summary/ + ancestry/ + validation/
+│   ├── test_validate.py      # M10 (gates plot/PCA tests on matplotlib/sklearn)
+│   └── test_truth.py         # M11 (pure-Python; no bcftools / network)
+├── scripts/
+│   └── smoke.sh              # M11 end-to-end CI smoke test
+└── out/                      # generated VCFs + truth/ + summary/ + ancestry/ + validation/
 ```
 
 ---
@@ -619,22 +672,65 @@ EUR/SAS/AFR, seed 42): **Ti/Tv = 1.882** ✓, LD decay monotone
 ancestry signal the spec calls for, with EUR / SAS / AFR-dominant
 labels visible as separable clusters in `pca.png`.
 
+### M11 — Delivery packaging
+
+`syntheticgen/truth.py` adds `TruthBedWriter`, which emits two BED4
+truth tracks per person under `out/truth/`:
+
+- `person_NNNN.golden.bed` — every record matching the spec's
+  "golden truth" set, tagged with priority `HIGHLIGHTED` >
+  `CLINVAR` > `COSMIC` > `SV` > `RSID`. Each row carries a
+  semicolon-separated `flag=…;id=…;ref=…;alt=…;gt=…;…` payload in
+  the BED4 name column so a downstream caller can split on `flag=`
+  to grade against the model. ClinVar rows additionally surface
+  `clnsig` / `clndn`; COSMIC rows surface `cosmic_id` / `cosmic_gene`;
+  SV rows surface `svtype` / `svlen`.
+- `person_NNNN.noise.bed` — one row per M9 noise event (`flag=FLIP`
+  or `flag=DROPOUT`) with `truth_gt=…;called_gt=…` so a caller's
+  per-call accuracy can be graded against the known noise model.
+
+Rows are buffered in memory and sorted by `(contig_order, chrom,
+start)` on close, so the BED is `sort -k1,1 -k2,2n`-friendly with
+no follow-up shell sort. BED coordinates are 0-based half-open
+(SNV at 1-based pos 1000 → `[999, 1000)`; a 4-base deletion at
+pos 1000 → `[999, 1003)`).
+
+The writer is created per-person in `cli.py` and threaded through
+`write_person_vcf`, so it sees both golden and noise events as the
+per-record loop runs. Manifest entries gain `golden_bed`,
+`noise_bed`, `n_golden`, and `n_noise` fields.
+
+`scripts/smoke.sh` runs an end-to-end 5-person × 0.5 Mb chr22 cohort
+plus the validation suite and asserts every advertised deliverable
+lands on disk (VCF + tbi, both BEDs per person, manifest, summary,
+all four validation PNGs, report.md, summary.json). Defaults to a
+deterministic seed and finishes in <2 min on a laptop.
+
+5-person × 0.5 Mb chr22 exit check (`scripts/smoke.sh`, seed 42,
+default error / dropout rates): every deliverable lands without
+manual intervention; realised FDR **0.293%** over 1,365 calls
+(2 flips + 2 dropouts). Per-person golden BEDs carry 56–69 rows
+each (highlighted + injected ClinVar + injected rsIDs + 3 SVs);
+noise BEDs carry 0–2 rows. Manifest exposes the new
+`golden_bed` / `noise_bed` / `n_golden` / `n_noise` fields per
+person.
+
 ---
 
 ## Test suite
 
-186 tests across eleven files; all passing with deps installed.
+206 tests across twelve files; all passing with deps installed.
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
 Without msprime / stdpopsim / demes / tskit / matplotlib / sklearn
-installed, the corresponding tests skip cleanly and **147/147**
-remaining still pass (`test_overlays.py`, `test_sv.py`, and
-`test_errors.py` are pure-Python; numpy-only validate tests still
-run if numpy is on PATH; matplotlib/sklearn-gated subset of
-`test_validate.py` skips when those deps are absent).
+installed, the corresponding tests skip cleanly and **165/165**
+remaining still pass (`test_overlays.py`, `test_sv.py`,
+`test_errors.py`, and `test_truth.py` are pure-Python; numpy-only
+validate tests still run if numpy is on PATH; matplotlib/sklearn-gated
+subset of `test_validate.py` skips when those deps are absent).
 
 | File | Count | Coverage |
 |---|---|---|
@@ -649,6 +745,7 @@ run if numpy is on PATH; matplotlib/sklearn-gated subset of
 | `test_sv.py` | 22 | `_draw_length` log-uniform skew + bounds + collapsed-range + invalid-range; `_build_sv_record` SVLEN sign by type, anchor base validity, CIPOS default, unknown-SVTYPE rejection; `generate_person_svs` count, zero-returns-empty, well-formed records, length bounds honoured, END inside chrom span, multi-chromosome distribution, type distribution within ±0.07 of (0.50, 0.30, 0.20), seed reproducibility, different-seed divergence, too-small-chrom and empty-chromosome rejection |
 | `test_errors.py` | 18 | `maybe_flip_gt` zero/negative-rate no-op, full-rate always-flips, realised flip rate ~1% on 10k draws, biallelic-only flip targets, hom→het 0.7-weight bias, het 0|1 50/50 split between hom-ref and hom-alt, `1\|2` multi-allelic collapse to REF, unparseable GT pass-through, seed reproducibility; `maybe_dropout` zero/full-rate, realised rate, seed reproducibility; `new_error_stats` shape, `merge_stats` in-place add + missing-key seeding; default-constants lock-in |
 | `test_validate.py` | 39 | `_parse_info` empty / single / multiple / flag forms; SNV / indel / SV classification; GT dosage hom-ref/het/hom-alt/multi-allelic/missing; dropout detection; Ti/Tv aggregation + zero-Tv + empty corner cases; Het/Hom ratio + zero-hom + zero-both; indel/SV aggregation; AF histogram bin placement + empty; `_r2_pair` perfect-corr / perfect-anticorr / uncorrelated / constant-vector / few-samples / missing-mask; `ld_decay` shape + short-vs-long ordering; cohort PCA on a clear 2-cluster signal (PC1 > 95% variance) + insufficient-columns guard; PNG smoke tests for every plot helper (LD / AF / indel / PCA-handles-None) |
+| `test_truth.py` | 20 | `classify_golden` priority (HIGHLIGHTED > CLINVAR > COSMIC > SV > RSID), `.` clnsig treated as missing, unannotated row returns None, GOLDEN_CATEGORIES priority lock-in; `golden_bed_line` half-open SNV interval, deletion ref-extends-end, SV uses explicit end, payload escapes tab / semicolon / newline, ClinVar payload carries clnsig / clndn; `noise_bed_line` flip records both GTs, dropout records `./.`; `TruthBedWriter` sorts by `(contig_order, chrom, start)` on close, count tracking, context-manager protocol, empty writer creates empty files, parent-dir creation |
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -660,10 +757,17 @@ hard failure).
 
 Tracked in `IMPLEMENTATION_PLAN.md`:
 
-- **M11** — delivery packaging (truth-set BED grading flipped/dropped
-  calls against the cohort truth, `scripts/smoke.sh` for CI, ART read
-  simulation gated by `--art`, GRCh38 reference FASTA wired in for
-  exact-anchor SV reporting).
+- **Heavy `--art` path** — ART read simulation + `bcftools call`
+  is gated and exits with a clear message. Wiring it on requires the
+  GRCh38 reference FASTA on disk (multi-GB download); deferred until
+  there's a concrete need beyond the lightweight noise model.
+- **Exact SV anchor REF** — currently a random standard base
+  placeholder; same FASTA dependency as `--art`.
+- **HapMap recombination map** — coalescent path uses uniform
+  recombination, so short-range r² caps at ~0.55 vs the spec's
+  aspirational 0.9. `HapMapII_GRCh38` hit a stdpopsim "missing data"
+  error on sub-chromosome regions; revisit when running full-chrom
+  sims.
 
 ## CLI reference
 

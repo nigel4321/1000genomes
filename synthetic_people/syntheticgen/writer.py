@@ -23,6 +23,7 @@ from .quality import (
     gq_from_ad,
     sample_lambda,
 )
+from .truth import TruthBedWriter, classify_golden
 
 
 def _contig_sort_key(chrom: str, pos: int,
@@ -36,7 +37,8 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                      dp_mean: float = DEFAULT_DP_MEAN,
                      error_rate: float = 0.0,
                      dropout_rate: float = 0.0,
-                     stats: dict | None = None) -> Path:
+                     stats: dict | None = None,
+                     truth_writer: TruthBedWriter | None = None) -> Path:
     """Write a single-sample bgzipped+indexed VCF.
 
     Each record carries simulated DP/GQ/AD alongside GT. The per-sample
@@ -52,6 +54,12 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
       * `stats` — optional dict mutated in place with running counts of
         `flipped`, `dropped`, `total_calls`. The caller seeds it with
         `errors.new_error_stats()`.
+
+    M11 truth-set tracking:
+      * `truth_writer` — optional `TruthBedWriter` that receives a row
+        per golden record (highlighted / ClinVar / COSMIC / SV / rsID)
+        and a row per noise event (FLIP / DROPOUT). The caller is
+        responsible for `.close()`-ing the writer to flush.
     """
     contigs = BUILDS[build]["contigs"]
     contig_order = {c: i for i, c in enumerate(contigs)}
@@ -117,6 +125,7 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
             # GQ (because gq_from_ad sees the inconsistency).
             dp, ad, gq = draw_site_quality(gt, n_alleles, sample_lam, rng)
             called_gt = gt
+            event_kind: str | None = None
             if stats is not None:
                 stats["total_calls"] = stats.get("total_calls", 0) + 1
             if dropout_rate > 0 and maybe_dropout(rng, dropout_rate):
@@ -124,6 +133,7 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                 dp = 0
                 ad = (0,) * n_alleles
                 gq = 0
+                event_kind = "DROPOUT"
                 if stats is not None:
                     stats["dropped"] = stats.get("dropped", 0) + 1
             elif error_rate > 0:
@@ -131,8 +141,16 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                 if flipped:
                     called_gt = new_gt
                     gq = gq_from_ad(called_gt, ad)
+                    event_kind = "FLIP"
                     if stats is not None:
                         stats["flipped"] = stats.get("flipped", 0) + 1
+            if truth_writer is not None:
+                cat = classify_golden(variant, is_hi)
+                if cat is not None:
+                    truth_writer.add_golden(variant, cat, gt)
+                if event_kind is not None:
+                    truth_writer.add_noise(variant, event_kind, gt,
+                                           called_gt)
             ad_str = ",".join(str(x) for x in ad)
             sample_field = f"{called_gt}:{dp}:{gq}:{ad_str}"
             fh.write("\t".join([
