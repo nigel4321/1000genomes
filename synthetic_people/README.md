@@ -269,9 +269,22 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
 
 ### Reproducibility
 
-- `--seed N` — same inputs + same seed → byte-identical output.
+- `--seed N` — same inputs + same seed → byte-identical output, and
+  the same regardless of `--workers`. Note: Phase 1 changed how the
+  master rng is consumed, so output at a given seed differs from
+  pre-Phase-1 runs.
 - Omit `--seed` — each invocation produces different people (different
   sample IDs, different highlighted variants, different genotypes).
+
+### Performance / parallelism
+
+- `--workers N` — fan out per-chromosome simulations and per-person
+  VCF writes across `N` worker processes. `0` (default) means auto
+  (`os.cpu_count()`); `1` means serial. Linux only — non-Linux hosts
+  silently fall back to serial because the parallel path uses
+  `fork`-based multiprocessing. See TUTORIAL.md §9.1 for details.
+- The writer streams records straight into `bgzip -c` (no plain `.vcf`
+  intermediate), so per-person disk I/O is one pass instead of two.
 
 ---
 
@@ -808,3 +821,4 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--n-background` | [legacy] Shared background site count | `500` |
 | `--af-min` | [legacy] Minimum AF when loading the pool | `0.05` |
 | `--sfs-alpha` | [legacy] Power-law exponent for the SFS | `2.0` |
+| `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`), `1` = serial. Linux only. | `0` |
