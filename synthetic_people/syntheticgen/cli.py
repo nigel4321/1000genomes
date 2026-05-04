@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import random
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from .admixture import (
@@ -67,6 +69,140 @@ from .sv import (
 )
 from .truth import TruthBedWriter
 from .writer import write_person_vcf
+
+
+# Shared state that the per-person worker reads. Populated in main()
+# before the worker pool is created so the children inherit it via the
+# fork start method's copy-on-write semantics. Keep it module-level
+# (not closure-captured) so workers under fork pick it up directly,
+# without pickling the cohort_sites payload across the task boundary.
+_PERSON_WORKER_STATE: dict = {}
+
+
+def _person_worker(i: int, sid: str, seed: int) -> tuple:
+    """Run the per-person work for cohort index ``i``.
+
+    Returns a tuple of ``(person_entry, person_stats, n_svs)``. The
+    function reads shared inputs from :data:`_PERSON_WORKER_STATE` so
+    they are inherited via fork rather than pickled per task.
+    """
+    state = _PERSON_WORKER_STATE
+    rng = random.Random(seed)
+
+    candidates = state["candidates"]
+    cohort_sites = state["cohort_sites"]
+    build = state["build"]
+    output_dir = state["output_dir"]
+    truth_dir = state["truth_dir"]
+    contig_order = state["contig_order"]
+    svs_per_person = state["svs_per_person"]
+    sv_length_max = state["sv_length_max"]
+    sv_length_min = state["sv_length_min"]
+    sv_chrom_span = state["sv_chrom_span"]
+    sv_chromosomes = state["sv_chromosomes"]
+    error_rate = state["error_rate"]
+    dropout_rate = state["dropout_rate"]
+    person_ancestry = state["person_ancestry"]
+
+    hi = dict(rng.choice(candidates))
+    hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
+    background = person_records_from_cohort(cohort_sites, i)
+    person_svs: list = []
+    if svs_per_person > 0 and sv_chrom_span > sv_length_max:
+        person_svs = generate_person_svs(
+            rng, sv_chromosomes, sv_chrom_span,
+            n_svs=svs_per_person,
+            length_min_bp=sv_length_min,
+            length_max_bp=sv_length_max,
+        )
+        background.extend(person_svs)
+    person = {
+        "sample_id": sid,
+        "highlighted": hi,
+        "background": background,
+    }
+    out = output_dir / f"person_{i+1:04d}.vcf.gz"
+    person_stats = new_error_stats()
+    golden_path = truth_dir / f"person_{i+1:04d}.golden.bed"
+    noise_path = truth_dir / f"person_{i+1:04d}.noise.bed"
+    tw = TruthBedWriter(golden_path, noise_path,
+                        contig_order=contig_order)
+    write_person_vcf(
+        out, person, build, rng,
+        error_rate=error_rate,
+        dropout_rate=dropout_rate,
+        stats=person_stats,
+        truth_writer=tw,
+    )
+    tw.close()
+
+    person_entry = {
+        "index": i + 1,
+        "sample_id": sid,
+        "vcf": out.name,
+        "highlighted": {
+            "id": hi["id"],
+            "chrom": hi["chrom"],
+            "pos": hi["pos"],
+            "ref": hi["ref"],
+            "alt": ",".join(hi["alts"]),
+            "gt": hi["gt"],
+        },
+        "n_background_records": len(background),
+        "n_svs": len(person_svs),
+        "errors": dict(person_stats),
+        "golden_bed": f"truth/{golden_path.name}",
+        "noise_bed": f"truth/{noise_path.name}",
+        "n_golden": tw.golden_count,
+        "n_noise": tw.noise_count,
+    }
+
+    if person_ancestry:
+        bed_path = output_dir / "ancestry" / f"person_{i+1:04d}.bed"
+        write_ancestry_bed(bed_path, person_ancestry[i])
+        fracs = ancestry_fractions(person_ancestry[i])
+        person_entry["ancestry_bed"] = f"ancestry/{bed_path.name}"
+        person_entry["ancestry_fractions"] = {
+            p: round(v, 4) for p, v in fracs.items()
+        }
+
+    return person_entry, person_stats, len(person_svs)
+
+
+def _format_person_log(entry: dict, n_total: int) -> str:
+    """Format the one-line progress log emitted per person."""
+    hi = entry["highlighted"]
+    base = (
+        f"  [{entry['index']:>4}/{n_total}] {entry['vcf']} — "
+        f"{entry['sample_id']} — "
+        f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
+        f"{hi['ref']}>{hi['alt']} ({hi['gt']}), "
+        f"{entry['n_background_records']} background records"
+    )
+    if "ancestry_fractions" in entry:
+        base += ", ancestry " + ",".join(
+            f"{p}={v:.2f}" for p, v in entry["ancestry_fractions"].items()
+        )
+    return base
+
+
+def resolve_workers(requested: int) -> int:
+    """Return the effective worker count.
+
+    `requested == 0` means auto: use ``os.cpu_count()``. `requested == 1`
+    runs serially. On non-Linux hosts we always fall back to 1, because
+    Phase-1 parallelism uses ``mp.get_context("fork")`` which is unsafe
+    or unsupported elsewhere.
+    """
+    if requested < 0:
+        raise ValueError("--workers must be >= 0")
+    import os as _os
+    import sys as _sys
+    if _sys.platform != "linux":
+        return 1
+    if requested == 0:
+        return max(1, _os.cpu_count() or 1)
+    return requested
 
 
 def parse_chromosomes(spec: str, build: str) -> list[str]:
@@ -306,6 +442,15 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "noise model. Requires a reference FASTA on "
                         "disk and the `art_illumina` binary on PATH; "
                         "wired in M11 alongside the GRCh38 reference.")
+    p.add_argument("--workers", type=int, default=0,
+                   help="[perf] Worker processes for per-chromosome "
+                        "msprime simulations and per-person VCF writes. "
+                        "0 = auto (os.cpu_count()), 1 = serial. Linux "
+                        "only — non-Linux hosts fall back to serial. "
+                        "Output is deterministic for a given --seed "
+                        "regardless of --workers, but differs from a "
+                        "pre-Phase-1 run at the same seed because the "
+                        "rng consumption pattern changed.")
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
@@ -337,6 +482,19 @@ def main(argv: list[str] | None = None) -> int:
         chromosomes = parse_chromosomes(args.chromosomes, args.build)
     except ValueError as exc:
         sys.exit(f"--chromosomes: {exc}")
+
+    try:
+        workers = resolve_workers(args.workers)
+    except ValueError as exc:
+        sys.exit(f"--workers: {exc}")
+    if args.workers != 0 and args.workers != workers:
+        # Requested non-zero workers but resolve_workers downgraded
+        # (e.g. non-Linux host). Tell the user.
+        print(
+            f"  [warn] --workers={args.workers} downgraded to "
+            f"{workers} (parallelism is Linux-only in Phase 1)",
+            file=sys.stderr,
+        )
 
     rng = random.Random(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -393,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
             n_people=args.n, length_mb=args.chr_length_mb,
             proportions=proportions,
             rec_rate=args.rec_rate, mu=args.mu,
-            rng=rng, verbose=True,
+            rng=rng, verbose=True, workers=workers,
         )
     else:
         demo_model = None if args.demo_model.lower() == "none" \
@@ -410,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
             n_people=args.n, length_mb=args.chr_length_mb,
             demo_model=demo_model, population=args.population,
             rec_rate=args.rec_rate, mu=args.mu,
-            rng=rng, verbose=True,
+            rng=rng, verbose=True, workers=workers,
         )
 
     overlay_stats = {
@@ -519,6 +677,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  SFS histogram written to {sfs_path}", file=sys.stderr)
 
     sample_ids = [random_sample_id(rng) for _ in range(args.n)]
+    # Pre-derive per-person seeds from the master rng before any
+    # per-person work runs. This is what makes the output deterministic
+    # for a given --seed regardless of --workers: the per-person rng
+    # depends only on its seed, and the seeds are sampled from the
+    # master rng in a fixed order.
+    person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
 
     # SV bounds: each SV occupies [pos, pos + svlen]; we draw POS up to
     # `chrom_length_bp - sv_length_max` to keep the END inside the
@@ -548,94 +712,58 @@ def main(argv: list[str] | None = None) -> int:
     truth_dir = args.output_dir / "truth"
     contig_order = {c: i for i, c
                     in enumerate(BUILDS[args.build]["contigs"])}
+
+    _PERSON_WORKER_STATE.update({
+        "candidates": candidates,
+        "cohort_sites": cohort_sites,
+        "build": args.build,
+        "output_dir": args.output_dir,
+        "truth_dir": truth_dir,
+        "contig_order": contig_order,
+        "svs_per_person": args.svs_per_person,
+        "sv_length_max": args.sv_length_max,
+        "sv_length_min": args.sv_length_min,
+        "sv_chrom_span": sv_chrom_span,
+        "sv_chromosomes": sv_chromosomes,
+        "error_rate": args.error_rate,
+        "dropout_rate": args.dropout_rate,
+        "person_ancestry": person_ancestry,
+    })
+
+    use_pool = workers > 1 and args.n > 1
+    if use_pool:
+        print(f"  fan-out: {workers} worker processes "
+              f"(fork start method, --n={args.n})",
+              file=sys.stderr)
+        ctx = mp.get_context("fork")
+        results: list = [None] * args.n
+        with ProcessPoolExecutor(max_workers=workers,
+                                 mp_context=ctx) as ex:
+            futures = [
+                ex.submit(_person_worker, i, sample_ids[i],
+                          person_seeds[i])
+                for i in range(args.n)
+            ]
+            # Iterate in submission order so progress logs come out in
+            # person order even if workers complete out of order.
+            for i, fut in enumerate(futures):
+                results[i] = fut.result()
+    else:
+        results = [
+            _person_worker(i, sample_ids[i], person_seeds[i])
+            for i in range(args.n)
+        ]
+
+    # Drop the shared payload now that workers have finished, so the
+    # cohort_sites reference can be GC'd before manifest writing.
+    _PERSON_WORKER_STATE.clear()
+
     manifest_people: list = []
-    for i, sid in enumerate(sample_ids):
-        hi = dict(rng.choice(candidates))
-        hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
-        background = person_records_from_cohort(cohort_sites, i)
-        person_svs: list = []
-        if args.svs_per_person > 0 and sv_chrom_span > args.sv_length_max:
-            person_svs = generate_person_svs(
-                rng, sv_chromosomes, sv_chrom_span,
-                n_svs=args.svs_per_person,
-                length_min_bp=args.sv_length_min,
-                length_max_bp=args.sv_length_max,
-            )
-            background.extend(person_svs)
-            sv_total += len(person_svs)
-        person = {
-            "sample_id": sid,
-            "highlighted": hi,
-            "background": background,
-        }
-        out = args.output_dir / f"person_{i+1:04d}.vcf.gz"
-        person_stats = new_error_stats()
-        golden_path = truth_dir / f"person_{i+1:04d}.golden.bed"
-        noise_path = truth_dir / f"person_{i+1:04d}.noise.bed"
-        tw = TruthBedWriter(golden_path, noise_path,
-                            contig_order=contig_order)
-        write_person_vcf(
-            out, person, args.build, rng,
-            error_rate=args.error_rate,
-            dropout_rate=args.dropout_rate,
-            stats=person_stats,
-            truth_writer=tw,
-        )
-        tw.close()
+    for entry, person_stats, n_svs in results:
         merge_stats(error_stats_total, person_stats)
-
-        person_entry = {
-            "index": i + 1,
-            "sample_id": sid,
-            "vcf": out.name,
-            "highlighted": {
-                "id": hi["id"],
-                "chrom": hi["chrom"],
-                "pos": hi["pos"],
-                "ref": hi["ref"],
-                "alt": ",".join(hi["alts"]),
-                "gt": hi["gt"],
-            },
-            "n_background_records": len(background),
-            "n_svs": len(person_svs),
-            "errors": dict(person_stats),
-            "golden_bed": f"truth/{golden_path.name}",
-            "noise_bed": f"truth/{noise_path.name}",
-            "n_golden": tw.golden_count,
-            "n_noise": tw.noise_count,
-        }
-
-        if person_ancestry:
-            bed_path = args.output_dir / "ancestry" / \
-                f"person_{i+1:04d}.bed"
-            write_ancestry_bed(bed_path, person_ancestry[i])
-            fracs = ancestry_fractions(person_ancestry[i])
-            person_entry["ancestry_bed"] = \
-                f"ancestry/{bed_path.name}"
-            person_entry["ancestry_fractions"] = {
-                p: round(v, 4) for p, v in fracs.items()
-            }
-            print(
-                f"  [{i+1:>4}/{args.n}] {out.name} — {sid} — "
-                f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
-                f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
-                f"{len(background)} background records, "
-                f"ancestry "
-                + ",".join(f"{p}={v:.2f}"
-                           for p, v in person_entry["ancestry_fractions"]
-                           .items()),
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"  [{i+1:>4}/{args.n}] {out.name} — {sid} — "
-                f"highlighted {hi['id']} at {hi['chrom']}:{hi['pos']} "
-                f"{hi['ref']}>{','.join(hi['alts'])} ({hi['gt']}), "
-                f"{len(background)} background records",
-                file=sys.stderr,
-            )
-
-        manifest_people.append(person_entry)
+        sv_total += n_svs
+        manifest_people.append(entry)
+        print(_format_person_log(entry, args.n), file=sys.stderr)
 
     mode = ("legacy-background" if args.legacy_background
             else "admixture-uk" if args.admixture

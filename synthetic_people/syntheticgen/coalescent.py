@@ -15,8 +15,10 @@ sampler returns (`chrom`, `pos`, `id`, `ref`, `alts`, `afs`, `acs`,
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 from .builds import BUILDS
 from .titv import DEFAULT_TARGET_TITV, choose_alt
@@ -147,25 +149,87 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
     return sites
 
 
+def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
+                                   length_mb: float,
+                                   demo_model: str | None,
+                                   population: str, rec_rate: float,
+                                   mu: float, seed: int,
+                                   titv_target: float) -> list:
+    """Worker entry point — builds its own rng from the given seed.
+
+    Module-level so it's picklable across the ProcessPoolExecutor task
+    boundary.
+    """
+    rng = random.Random(seed)
+    return simulate_chromosome(
+        chrom, build, n_people, length_mb, demo_model, population,
+        rec_rate, mu, rng, titv_target,
+    )
+
+
 def simulate_cohort(chromosomes: list, build: str, n_people: int,
                     length_mb: float, demo_model: str | None,
                     population: str, rec_rate: float, mu: float,
                     rng: random.Random,
                     titv_target: float = DEFAULT_TARGET_TITV,
-                    verbose: bool = False) -> list:
-    """Simulate a cohort across one or more chromosomes."""
-    all_sites: list = []
-    for chrom in chromosomes:
-        if verbose:
-            print(f"  simulating chrom {chrom} (length {length_mb} Mb, "
-                  f"model={demo_model or 'uniform'})...",
-                  file=sys.stderr)
-        sites = simulate_chromosome(
-            chrom, build, n_people, length_mb, demo_model, population,
-            rec_rate, mu, rng, titv_target,
-        )
-        if verbose:
-            print(f"    {len(sites)} variable sites on chrom {chrom}",
-                  file=sys.stderr)
-        all_sites.extend(sites)
+                    verbose: bool = False,
+                    workers: int = 1) -> list:
+    """Simulate a cohort across one or more chromosomes.
+
+    With ``workers > 1`` and more than one chromosome to simulate, each
+    chromosome runs in its own process via ``ProcessPoolExecutor``.
+    Per-chromosome seeds are pre-derived from ``rng`` *before* spawning,
+    so the cohort output is deterministic for a given master seed
+    regardless of the worker count. Note: the rng consumption pattern
+    changed in Phase 1 (one ``rng.randint`` per chromosome up front,
+    each chromosome then uses its own child rng), so output differs
+    from pre-Phase-1 runs at the same ``--seed``.
+    """
+    seeds = [rng.randint(1, 2**31 - 1) for _ in chromosomes]
+
+    use_pool = workers > 1 and len(chromosomes) > 1
+    if not use_pool:
+        all_sites: list = []
+        for chrom, seed in zip(chromosomes, seeds):
+            if verbose:
+                print(f"  simulating chrom {chrom} (length {length_mb} "
+                      f"Mb, model={demo_model or 'uniform'})...",
+                      file=sys.stderr)
+            sites = _simulate_chromosome_from_seed(
+                chrom, build, n_people, length_mb, demo_model,
+                population, rec_rate, mu, seed, titv_target,
+            )
+            if verbose:
+                print(f"    {len(sites)} variable sites on chrom "
+                      f"{chrom}", file=sys.stderr)
+            all_sites.extend(sites)
+        return all_sites
+
+    if verbose:
+        print(f"  simulating {len(chromosomes)} chromosomes "
+              f"(length {length_mb} Mb, "
+              f"model={demo_model or 'uniform'}) "
+              f"in parallel with {workers} workers...",
+              file=sys.stderr)
+
+    # fork shares the parent's already-loaded msprime/stdpopsim modules
+    # via copy-on-write — much faster startup than spawn, which would
+    # re-import them per worker.
+    ctx = mp.get_context("fork")
+    futures = []
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        for chrom, seed in zip(chromosomes, seeds):
+            futures.append((chrom, ex.submit(
+                _simulate_chromosome_from_seed,
+                chrom, build, n_people, length_mb, demo_model,
+                population, rec_rate, mu, seed, titv_target,
+            )))
+
+        all_sites = []
+        for chrom, fut in futures:
+            sites = fut.result()
+            if verbose:
+                print(f"    {len(sites)} variable sites on chrom "
+                      f"{chrom}", file=sys.stderr)
+            all_sites.extend(sites)
     return all_sites

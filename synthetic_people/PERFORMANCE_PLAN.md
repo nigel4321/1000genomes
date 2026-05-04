@@ -42,7 +42,7 @@ data-shape changes. Visible end-to-end runtime win on multi-core hosts.
 
 **Branch:** `perf/phase1-concurrency`
 
-- [ ] Parallelise per-chromosome msprime simulations
+- [x] Parallelise per-chromosome msprime simulations
   - `coalescent.py:simulate_cohort` currently iterates chromosomes
     serially. Each chromosome is independent.
   - Use `concurrent.futures.ProcessPoolExecutor`,
@@ -51,7 +51,7 @@ data-shape changes. Visible end-to-end runtime win on multi-core hosts.
     `--seed` *before* spawning workers — determinism must survive.
   - Add a `--workers` CLI flag (default: auto) to cap concurrency for
     constrained hosts.
-- [ ] Parallelise per-person VCF writes
+- [x] Parallelise per-person VCF writes
   - The loop at `cli.py:552` is the hot path for large `--n`.
   - Use `ProcessPoolExecutor` with the default fork start method on
     Linux so `cohort_sites` is shared copy-on-write — do not pickle
@@ -60,18 +60,24 @@ data-shape changes. Visible end-to-end runtime win on multi-core hosts.
     so output stays bit-identical to the serial run when the same
     `--seed` is passed.
   - Reuse the `--workers` flag added above.
-- [ ] Stream straight into `bgzip -c`
+- [x] Stream straight into `bgzip -c`
   - Drop the plain `.vcf` intermediate in `writer.py:81-167`.
   - Open `Popen(["bgzip", "-c"], stdin=PIPE, stdout=open(out, "wb"))`,
     write records into stdin, close, then run `tabix` against the
     final `.vcf.gz`.
   - Saves one disk pass per person and removes a fork/exec.
-- [ ] **Tests** — extend `tests/test_writer.py` (or add a new module) to
+- [x] **Tests** — extend `tests/test_writer.py` (or add a new module) to
   cover: deterministic output across `--workers=1` vs `--workers=N`
   given the same seed; correctness of the bgzip-pipe path (round-trip
-  via `bcftools view`).
-- [ ] **Docs** — `README.md` Performance section, `TUTORIAL.md` §9
+  via `bcftools view`). Added in `tests/test_phase1_concurrency.py`.
+- [x] **Docs** — `README.md` Performance section, `TUTORIAL.md` §9
   ("Performance and scaling"), and the `--workers` `--help` text.
+
+> **Phase 1 caveat:** Phase 1 changed how the master rng is consumed
+> (one `rng.randint` per chromosome and per person up front), so output
+> at a given `--seed` differs from pre-Phase-1 runs at the same seed.
+> Output remains deterministic for any choice of `--workers` once on
+> the post-Phase-1 code, which is what the determinism tests verify.
 
 ---
 

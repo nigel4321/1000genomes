@@ -706,6 +706,43 @@ Scaling rules of thumb:
 - Validation (`validate_batch.py`) builds a full dosage matrix in RAM;
   drop `--ld-pairs-per-bin` to 1000 if you're tight.
 
+### 9.1 Worker processes (Phase 1)
+
+Multi-chromosome simulations and per-person VCF writes run in parallel
+process pools on Linux. Control the fan-out with `--workers`:
+
+| `--workers` | Behaviour |
+|---|---|
+| `0` (default) | Auto = `os.cpu_count()`. |
+| `1` | Serial. Useful for profiling and for environments where parallelism is unwanted. |
+| `N > 1` | Up to `N` worker processes for the per-chromosome pool *and* the per-person pool. |
+
+```bash
+# Force serial for an apples-to-apples profiling baseline.
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 30 --seed 17 --chromosomes 22 --chr-length-mb 5.0 \
+    --workers 1
+
+# Cap at 4 workers on a constrained host (default would have used all cores).
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 30 --seed 17 --chromosomes 19,20,21,22 --chr-length-mb 5.0 \
+    --workers 4
+```
+
+Determinism: output is identical for any `--workers` value at a fixed
+`--seed`. Output **does** differ from pre-Phase-1 runs at the same
+seed, however — Phase 1 changed how the master rng is consumed (one
+`randint` per chromosome and per person up front). If you need to
+reproduce a pre-Phase-1 run exactly, check out the pre-Phase-1 commit.
+
+Non-Linux hosts (macOS / Windows) silently fall back to `--workers=1`
+because the parallel path uses fork-based multiprocessing. A warning
+is printed when you ask for more workers than the host can provide.
+
+The writer also pipes records straight into `bgzip -c` instead of
+writing a plain `.vcf` first; this is transparent to the user but
+shaves one disk pass per person.
+
 ---
 
 ## 10. Troubleshooting

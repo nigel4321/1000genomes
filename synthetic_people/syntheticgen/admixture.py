@@ -17,9 +17,11 @@ writer and CLI per-person loop are unchanged.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import random
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from .builds import BUILDS
@@ -260,17 +262,35 @@ def _intersect_haplotype_segments(h1: list, h2: list) -> list:
     return out
 
 
+def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
+                                   length_mb: float, proportions: tuple,
+                                   rec_rate: float, mu: float, seed: int,
+                                   titv_target: float,
+                                   pulse_time: float) -> tuple:
+    """Worker entry point — builds its own rng from the given seed."""
+    rng = random.Random(seed)
+    return simulate_chromosome(
+        chrom, build, n_people, length_mb, proportions,
+        rec_rate, mu, rng, titv_target, pulse_time=pulse_time,
+    )
+
+
 def simulate_cohort(chromosomes: list, build: str, n_people: int,
                     length_mb: float, proportions: tuple,
                     rec_rate: float, mu: float, rng: random.Random,
                     titv_target: float = DEFAULT_TARGET_TITV,
                     pulse_time: float = PULSE_TIME,
-                    verbose: bool = False) -> tuple:
+                    verbose: bool = False,
+                    workers: int = 1) -> tuple:
     """Simulate the UK admixed cohort across one or more chromosomes.
 
     Returns ``(sites, ancestry)`` where ``ancestry[i]`` is a list of
     ``(chrom, start, end, h1_pop, h2_pop)`` rows for person ``i``,
     spanning all chromosomes in input order.
+
+    With ``workers > 1`` and more than one chromosome, each chromosome
+    runs in its own process. Per-chromosome seeds are pre-derived so
+    output is deterministic regardless of the worker count.
     """
     eur, sas, afr = proportions
     if verbose:
@@ -279,23 +299,53 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
             f"AFR={afr:.2f} (pulse {pulse_time:g} gens ago)",
             file=sys.stderr,
         )
+    seeds = [rng.randint(1, 2**31 - 1) for _ in chromosomes]
+
+    use_pool = workers > 1 and len(chromosomes) > 1
     all_sites: list = []
     ancestry: list = [[] for _ in range(n_people)]
-    for chrom in chromosomes:
-        if verbose:
-            print(f"  simulating chrom {chrom} (length {length_mb} Mb, "
-                  f"UK admixture)...", file=sys.stderr)
-        sites, person_segs = simulate_chromosome(
-            chrom, build, n_people, length_mb, proportions,
-            rec_rate, mu, rng, titv_target, pulse_time=pulse_time,
-        )
-        if verbose:
-            print(f"    {len(sites)} variable sites on chrom {chrom}",
-                  file=sys.stderr)
+
+    def _accumulate(chrom: str, sites: list, person_segs: list) -> None:
         all_sites.extend(sites)
         for i, segs in enumerate(person_segs):
             for L, R, h1, h2 in segs:
                 ancestry[i].append((chrom, L, R, h1, h2))
+
+    if not use_pool:
+        for chrom, seed in zip(chromosomes, seeds):
+            if verbose:
+                print(f"  simulating chrom {chrom} (length {length_mb} "
+                      f"Mb, UK admixture)...", file=sys.stderr)
+            sites, person_segs = _simulate_chromosome_from_seed(
+                chrom, build, n_people, length_mb, proportions,
+                rec_rate, mu, seed, titv_target, pulse_time,
+            )
+            if verbose:
+                print(f"    {len(sites)} variable sites on chrom "
+                      f"{chrom}", file=sys.stderr)
+            _accumulate(chrom, sites, person_segs)
+        return all_sites, ancestry
+
+    if verbose:
+        print(f"  simulating {len(chromosomes)} chromosomes "
+              f"in parallel with {workers} workers (UK admixture)...",
+              file=sys.stderr)
+
+    ctx = mp.get_context("fork")
+    futures = []
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
+        for chrom, seed in zip(chromosomes, seeds):
+            futures.append((chrom, ex.submit(
+                _simulate_chromosome_from_seed,
+                chrom, build, n_people, length_mb, proportions,
+                rec_rate, mu, seed, titv_target, pulse_time,
+            )))
+        for chrom, fut in futures:
+            sites, person_segs = fut.result()
+            if verbose:
+                print(f"    {len(sites)} variable sites on chrom "
+                      f"{chrom}", file=sys.stderr)
+            _accumulate(chrom, sites, person_segs)
     return all_sites, ancestry
 
 
