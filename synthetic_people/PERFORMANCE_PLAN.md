@@ -108,13 +108,87 @@ downstream loops.
 
 **Branch:** `perf/phase3-genotype-matrix`
 
+> **Measure before refactoring.** CPython interns short repetitive
+> strings (`"0|0"`, `"0|1"`, etc.), so the projected ~1.25 GB number
+> below is a worst case. The refactor only earns its complexity if a
+> measured baseline confirms the win. The first task in this phase is
+> to take that measurement; the rest of the phase only proceeds if the
+> baseline justifies it.
+
+### What we lose by switching representations
+
+Be eyes-open about the tradeoffs before starting. The list-of-strings
+representation gives us several things that the numpy uint8 path
+either has to encode explicitly or drop:
+
+- **Phasing as data, not assumption.** `"0|1"` (phased) vs `"0/1"`
+  (unphased) lives in the string today. uint8 only encodes indices, so
+  we'd be hardcoding "the cohort is always phased" into the data
+  model. The pipeline does emit phased GTs uniformly, so this is
+  mostly a documentation issue — but it means the data shape can no
+  longer represent unphased calls without an extra flag. Mitigation:
+  add a `cohort_phased: bool` flag at the top of the data structure
+  to keep phasing explicit.
+- **Per-call missingness.** `./.` for dropouts has no obvious uint8
+  home — you'd reserve a sentinel (e.g. 255) or carry a parallel mask.
+  Currently dodged because dropouts are layered on at write time in
+  `writer.py` and never stored on cohort sites; only a problem if a
+  future change wants missingness to live on `cohort_sites`.
+- **Multi-allelic ceiling.** uint8 caps allele indices at 255. Trivial
+  for human germline biallelic SNVs/indels; uint16 buys 65k alts at 2×
+  the RAM if we ever need it.
+- **Overlay-injection delicacy.** ClinVar / rsID / COSMIC injection
+  (`cli.py:443-504`) currently mutates site dicts in place by index.
+  With a cohort-wide matrix `(n_sites, 2*n_people)` plus parallel
+  metadata, sorting / deduping / reordering becomes "two arrays moving
+  together" instead of "one list of dicts." Mitigation: wrap the
+  matrix + metadata in a small `CohortSites` dataclass with mutation
+  methods rather than letting them float free.
+- **Debugger / fixture ergonomics.** `site["gts"] == ["0|1", "1|1",
+  ...]` is instantly readable in a debugger and trivially JSON-
+  serialisable. Numpy arrays aren't. Every test that hand-constructs
+  a site dict needs rewriting against the new shape — affects roughly
+  10 test files including `test_cohort.py`, `test_overlays.py`,
+  `test_truth.py`. This is dev-time cost, not runtime cost, but it's
+  real.
+- **Per-site heterogeneity (theoretical).** Each site dict can in
+  principle carry its own length / ploidy / encoding. A cohort-wide
+  matrix locks every site to exactly `2*n_people` slots. Not exploited
+  today, but it removes a degree of freedom we have today.
+
+If the baseline measurement comes back small (e.g. <30% RAM win at
+`n=500`), reconsider the cost/benefit before pressing on. A cheaper
+intermediate is to keep `list[str]` but call `sys.intern("0|1")` etc.
+explicitly so the saving is documented, not incidental.
+
+### Tasks
+
+- [ ] **Measure first** — establish the baseline before any refactor
+  - Add a small profiling script (e.g. `scripts/profile_memory.py`)
+    that runs `generate_people` at `n ∈ {200, 500, 1000}` with a
+    fixed `--chr-length-mb` and reports peak RSS via `tracemalloc`
+    or `resource.getrusage(RUSAGE_SELF).ru_maxrss`.
+  - Capture the per-site `list[str]` overhead specifically with
+    `pympler.asizeof` or equivalent, so we know the slice we're
+    targeting.
+  - Record the numbers (and the host they were measured on) in this
+    file under a "Baseline" subsection so future work can compare.
+  - **Decision gate:** if the targeted slice is <20% of total peak
+    RSS, stop — the refactor is not worth the tradeoffs above. Land
+    `sys.intern` instead and close the phase.
 - [ ] Replace `gts: list[str]` with a numpy uint8 representation
   - Today: every site dict carries a list of `"0|1"` strings of length
     `n_people`. At `n=500, n_sites=50_000` this is ~25M Python strings
-    (~50 B each → ~1.25 GB before measuring overhead).
+    (~50 B each → ~1.25 GB *worst case* — measure before relying on
+    this number).
   - Switch to `numpy.ndarray[uint8]` of shape `(2*n_people,)` per site,
     or — preferred — a single cohort-wide matrix
     `(n_sites, 2*n_people)` that all downstream code indexes.
+  - Wrap the matrix + per-site metadata in a `CohortSites` dataclass
+    with explicit mutation methods (sort, dedupe, inject, annotate)
+    so overlay code keeps the two arrays in lockstep.
+  - Add a `cohort_phased: bool` flag on the dataclass to keep the
+    phasing assumption explicit.
   - Format `"0|1"` strings only at the moment of writing, in
     `writer.py`.
   - Touches: `coalescent.py`, `cohort.py`, `admixture.py`, `writer.py`,
@@ -131,6 +205,11 @@ downstream loops.
     O(total cohort sites).
   - Win is linear in `n_people` and largest on singleton-heavy SFS
     (the default).
+- [ ] **Re-measure** — re-run the baseline script after the refactor
+  and record the realised RAM win in this file alongside the
+  baseline. If the realised win is materially below the projection,
+  capture why so we don't make the same mistake on a future
+  optimisation.
 - [ ] **Tests** — every test that constructs a site dict by hand needs
   updating; the genotype-matrix refactor is the riskiest item in this
   plan, so plan extra coverage of:
@@ -138,10 +217,30 @@ downstream loops.
     - `person_records_from_cohort` generator yields the same records
       in the same order as the old list-returning version;
     - SFS histogram and overlay-stats numbers are byte-for-byte
-      unchanged.
-- [ ] **Docs** — note the new in-memory representation in
-  `IMPLEMENTATION_PLAN.md` (architecture section), and call out the
-  RAM win in `README.md` Performance and `TUTORIAL.md` §9.
+      unchanged;
+    - `cohort_phased=False` round-trips correctly (even if not used
+      in production today, the flag should be exercised so it doesn't
+      silently rot).
+- [ ] **Docs** — note the new in-memory representation and the
+  `cohort_phased` flag in `IMPLEMENTATION_PLAN.md` (architecture
+  section); call out the realised (measured, not projected) RAM win
+  in `README.md` Performance and `TUTORIAL.md` §9.
+
+### Baseline (to be filled in by the measure-first task)
+
+| n | n_sites | host | peak RSS | gts overhead | gts share |
+|---|---------|------|----------|--------------|-----------|
+| 200  | TBD | TBD | TBD | TBD | TBD |
+| 500  | TBD | TBD | TBD | TBD | TBD |
+| 1000 | TBD | TBD | TBD | TBD | TBD |
+
+### After-refactor numbers (to be filled in by the re-measure task)
+
+| n | n_sites | host | peak RSS | delta vs baseline |
+|---|---------|------|----------|-------------------|
+| 200  | TBD | TBD | TBD | TBD |
+| 500  | TBD | TBD | TBD | TBD |
+| 1000 | TBD | TBD | TBD | TBD |
 
 ---
 
