@@ -24,6 +24,15 @@ land it, then move to the next phase. **Do not bundle phases.**
 - Branch naming convention: `perf/phase<N>-<short-slug>` (e.g.
   `perf/phase1-concurrency`).
 
+## Workload assumptions (drives priority)
+
+- **Primary scaling axis: `--n`** (cohort size). Treat per-person work
+  as the dominant cost. The highest-ROI items are therefore Phase 1b
+  (parallel per-person writes) and Phase 3a (numpy genotype matrix).
+- **Target host: single machine.** `ProcessPoolExecutor` with the
+  Linux fork start method is the right primitive — no need for a
+  chunked work-queue or any inter-host coordination layer.
+
 ---
 
 ## Phase 1 — concurrency, low risk
@@ -154,19 +163,6 @@ them.
 - [ ] **Tests** — confirm site-dedupe parity with a fixed seed; spot-
   check `alt_dosages` on the new path.
 - [ ] **Docs** — none needed unless behaviour changes.
-
----
-
-## Open questions to resolve before starting
-
-These don't block Phase 1, but the answers shape Phase 3 and the
-choice of mechanism in Phase 1b.
-
-- Which dimension does the user typically scale — `--n` or
-  `--chromosomes`/`--chr-length-mb`?
-- Single-machine only, or do we ever need to distribute across hosts?
-  (Multi-host changes Phase 1b away from `ProcessPoolExecutor` toward
-  a chunked work-queue.)
 
 ---
 
