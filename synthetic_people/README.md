@@ -285,6 +285,11 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   `fork`-based multiprocessing. See TUTORIAL.md §9.1 for details.
 - The writer streams records straight into `bgzip -c` (no plain `.vcf`
   intermediate), so per-person disk I/O is one pass instead of two.
+- The overlay loaders (ClinVar, dbSNP, COSMIC) are bcftools-driven and
+  bound on subprocess I/O. They are submitted to a small thread pool
+  *before* the coalescent simulation runs, so the loader work overlaps
+  with msprime instead of running serially after it. No flag —
+  prefetch is always on for the non-legacy path.
 
 ---
 

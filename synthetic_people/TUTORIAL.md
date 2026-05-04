@@ -743,6 +743,25 @@ The writer also pipes records straight into `bgzip -c` instead of
 writing a plain `.vcf` first; this is transparent to the user but
 shaves one disk pass per person.
 
+### 9.2 Overlay prefetch (Phase 2)
+
+The ClinVar / dbSNP / COSMIC loaders are bcftools-driven and bound on
+subprocess I/O. They are submitted to a small thread pool *before* the
+coalescent simulation runs, so the loader work overlaps with msprime
+instead of running serially after it. There's no flag — prefetch is
+always on for the non-legacy path.
+
+You'll see a line like
+
+```
+  prefetching overlay loaders in background: clinvar_index, rsid_pool
+```
+
+right before the simulation starts, and `Awaiting <name>...` lines
+inside the overlay block as each future is resolved. If a loader
+finished while the simulation was running, the `Awaiting` line returns
+immediately.
+
 ---
 
 ## 10. Troubleshooting
