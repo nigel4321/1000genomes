@@ -8,7 +8,7 @@ import multiprocessing as mp
 import random
 import shutil
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 from .admixture import (
@@ -184,6 +184,47 @@ def _format_person_log(entry: dict, n_total: int) -> str:
             f"{p}={v:.2f}" for p, v in entry["ancestry_fractions"].items()
         )
     return base
+
+
+def submit_overlays(args, chromosomes: list, clinvar_vcf: Path,
+                    sig_filter: set,
+                    executor: ThreadPoolExecutor) -> dict:
+    """Submit the ClinVar / rsID / COSMIC loader futures.
+
+    All three loaders are bcftools subprocess + I/O: they release the
+    GIL, so they can run on a thread pool concurrently with the
+    compute-heavy coalescent simulation.
+
+    Returns a dict with keys ``clinvar_index``, ``rsid_pool``,
+    ``cosmic_pool``. Each value is either a ``Future`` that resolves
+    to the loaded structure, or ``None`` if that overlay is skipped
+    (rsID with ``--rsid-density 0``; COSMIC unless ``--somatic``).
+
+    The caller must validate ``--somatic`` / ``--cosmic-vcf`` before
+    invoking this so a bad path doesn't get silently scheduled. The
+    helper trusts its inputs.
+    """
+    futures: dict = {
+        "clinvar_index": None,
+        "rsid_pool": None,
+        "cosmic_pool": None,
+    }
+    futures["clinvar_index"] = executor.submit(
+        load_clinvar_index, clinvar_vcf, chromosomes,
+        sig_filter=sig_filter, max_per_chrom=20_000,
+    )
+    if args.rsid_density > 0:
+        rsid_source = args.dbsnp_vcf or clinvar_vcf
+        futures["rsid_pool"] = executor.submit(
+            load_rsid_pool, rsid_source, chromosomes,
+            max_per_chrom=20_000,
+        )
+    if args.somatic:
+        futures["cosmic_pool"] = executor.submit(
+            load_cosmic_records, args.cosmic_vcf, chromosomes,
+            max_per_chrom=20_000,
+        )
+    return futures
 
 
 def resolve_workers(requested: int) -> int:
@@ -514,6 +555,41 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("no ClinVar variants matched the CLNSIG filter — widen "
                  "--clinvar-sig")
 
+    # Validate --somatic / --cosmic-vcf up front so the overlay
+    # prefetch below can trust its inputs and so failures land before
+    # the (long) simulation runs.
+    if args.somatic and not args.legacy_background:
+        if args.cosmic_vcf is None:
+            sys.exit("--somatic requires --cosmic-vcf (COSMIC is "
+                     "registration-gated; supply a local VCF path)")
+        if not args.cosmic_vcf.exists():
+            sys.exit(f"--cosmic-vcf not found: {args.cosmic_vcf}")
+
+    # Phase 2: prefetch the overlay loaders concurrently with the
+    # simulation. ClinVar / rsID / COSMIC each kick off a bcftools
+    # subprocess that releases the GIL, so a thread pool overlaps
+    # neatly with the msprime / process-pool work below. Skipped on
+    # the legacy path because that path doesn't run overlays.
+    overlay_executor: ThreadPoolExecutor | None = None
+    overlay_futures: dict = {
+        "clinvar_index": None,
+        "rsid_pool": None,
+        "cosmic_pool": None,
+    }
+    if not args.legacy_background:
+        overlay_executor = ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="overlay")
+        overlay_futures = submit_overlays(
+            args, chromosomes, clinvar_vcf, sig_filter,
+            overlay_executor,
+        )
+        scheduled = [k for k, v in overlay_futures.items() if v is not None]
+        print(
+            f"  prefetching overlay loaders in background: "
+            f"{', '.join(scheduled)}",
+            file=sys.stderr,
+        )
+
     person_ancestry: list = []  # admixture path fills per-person segments
     if args.legacy_background:
         bg_globs = args.background_glob or [args._default_bg]
@@ -584,12 +660,9 @@ def main(argv: list[str] | None = None) -> int:
         # natural collision rate is essentially zero, but we still run
         # annotate_clinvar so a future demography that lands on real
         # coordinates picks up CLNSIG for free.
-        print("Loading ClinVar overlay index for "
-              f"{chromosomes}...", file=sys.stderr)
-        clinvar_index = load_clinvar_index(
-            clinvar_vcf, chromosomes, sig_filter=sig_filter,
-            max_per_chrom=20_000,
-        )
+        print(f"Awaiting ClinVar overlay index for {chromosomes}...",
+              file=sys.stderr)
+        clinvar_index = overlay_futures["clinvar_index"].result()
         print(f"  {len(clinvar_index)} ClinVar pathogenic records "
               "available for overlay", file=sys.stderr)
         overlay_stats["clinvar_annotated"] = annotate_clinvar(
@@ -617,12 +690,11 @@ def main(argv: list[str] | None = None) -> int:
 
         # rsID injection: prefer a user-supplied dbSNP VCF, fall back to
         # ClinVar's own INFO/RS field (no extra download required).
-        if args.rsid_density > 0:
+        if overlay_futures["rsid_pool"] is not None:
             rsid_source = args.dbsnp_vcf or clinvar_vcf
-            print(f"Loading rsID pool from {rsid_source}...",
+            print(f"Awaiting rsID pool from {rsid_source}...",
                   file=sys.stderr)
-            rsid_pool = load_rsid_pool(rsid_source, chromosomes,
-                                       max_per_chrom=20_000)
+            rsid_pool = overlay_futures["rsid_pool"].result()
             print(f"  {len(rsid_pool)} rsID-bearing records available",
                   file=sys.stderr)
             overlay_stats["rsid_injected"] = inject_rsids(
@@ -639,16 +711,10 @@ def main(argv: list[str] | None = None) -> int:
                                 if s.get("clnsig") or
                                 s["id"].startswith("rs")}
 
-        if args.somatic:
-            if args.cosmic_vcf is None:
-                sys.exit("--somatic requires --cosmic-vcf (COSMIC is "
-                         "registration-gated; supply a local VCF path)")
-            if not args.cosmic_vcf.exists():
-                sys.exit(f"--cosmic-vcf not found: {args.cosmic_vcf}")
-            print(f"Loading COSMIC pool from {args.cosmic_vcf}...",
+        if overlay_futures["cosmic_pool"] is not None:
+            print(f"Awaiting COSMIC pool from {args.cosmic_vcf}...",
                   file=sys.stderr)
-            cosmic_pool = load_cosmic_records(
-                args.cosmic_vcf, chromosomes, max_per_chrom=20_000)
+            cosmic_pool = overlay_futures["cosmic_pool"].result()
             print(f"  {len(cosmic_pool)} COSMIC records available",
                   file=sys.stderr)
             overlay_stats["cosmic_injected"] = inject_cosmic(
@@ -660,6 +726,11 @@ def main(argv: list[str] | None = None) -> int:
                   "COSMIC records "
                   f"(density={args.cosmic_inject_density:.3f})",
                   file=sys.stderr)
+
+    if overlay_executor is not None:
+        # All futures have been .result()'d above; shutting down here
+        # frees the threads while the cohort is still in scope.
+        overlay_executor.shutdown(wait=True)
 
     hist = sfs_histogram(cohort_sites)
     total_alts = sum(hist.values())

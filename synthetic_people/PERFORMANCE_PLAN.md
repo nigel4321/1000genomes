@@ -88,21 +88,25 @@ still simulating, since they're I/O-bound on bcftools subprocesses.
 
 **Branch:** `perf/phase2-overlap-loaders`
 
-- [ ] Run overlay loaders concurrently with simulation
-  - `load_clinvar_index` (`cli.py:431`),
-    `load_rsid_pool` (`cli.py:466`), and `load_cosmic_records`
-    (`cli.py:492`) are all bcftools subprocess + I/O. They release
-    the GIL.
-  - Submit all three to a `ThreadPoolExecutor` *before*
-    `simulate_cohort` runs. Block on the futures only at the point
-    `cohort_sites` actually needs them.
-  - Skip COSMIC submission unless `--somatic` is set, to preserve the
+- [x] Run overlay loaders concurrently with simulation
+  - `load_clinvar_index`, `load_rsid_pool`, and
+    `load_cosmic_records` are all bcftools subprocess + I/O. They
+    release the GIL.
+  - Submitted via `submit_overlays(...)` to a 3-worker
+    `ThreadPoolExecutor` *before* `simulate_cohort` runs. Blocked on
+    each future at the point `cohort_sites` needs it (inside the
+    existing overlay-injection block).
+  - COSMIC submission is gated on `--somatic`, preserving the
     "registration-gated, never auto-fetch" guarantee.
-- [ ] **Tests** — add a regression test that the overlay-stats output
-  is identical with and without the threaded prefetch, given a fixed
-  seed.
-- [ ] **Docs** — note in `IMPLEMENTATION_PLAN.md` and `README.md` that
-  overlays prefetch in parallel; no user-visible flag change.
+  - `--somatic` / `--cosmic-vcf` validation moved up before the
+    prefetch so a bad path fails fast (before the simulation).
+- [x] **Tests** — `tests/test_phase2_prefetch.py` covers skip rules
+  (default / `--rsid-density=0` / `--somatic`), loader-arg pass-
+  through, and identity (resolved-future payloads match what calling
+  the loaders directly returns).
+- [x] **Docs** — README.md notes overlays prefetch in parallel with
+  the simulation; PERFORMANCE_PLAN.md ticks the Phase 2 boxes. No
+  user-visible flag change.
 
 ---
 
