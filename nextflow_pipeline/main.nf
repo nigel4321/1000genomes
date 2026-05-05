@@ -4,6 +4,7 @@ nextflow.enable.dsl = 2
 
 include { QC_VALIDATE }                     from './modules/qc_validate.nf'
 include { BCFTOOLS_STATS }                  from './modules/bcftools_stats.nf'
+include { PCA_PLOT }                        from './modules/pca_plot.nf'
 include { MULTIQC }                         from './modules/multiqc.nf'
 include { INSPECT_VCF }                     from './modules/inspect_vcf.nf'
 include { SCAN_VARIANT }                    from './modules/scan_variant.nf'
@@ -43,6 +44,7 @@ workflow {
     INSPECT_VCF(validated_ch)
     SCAN_VARIANT(validated_ch)
     BCFTOOLS_STATS(validated_ch)
+    PCA_PLOT(validated_ch)
 
     QC_REPORT(QC_VALIDATE.out.json.collect())
     METADATA_REPORT(INSPECT_VCF.out.collect())
@@ -50,11 +52,13 @@ workflow {
     CARRIER_REPORT(SCAN_VARIANT.out.carriers.collect())
 
     // MultiQC stitches together bcftools-stats (Ti/Tv per sample, indel
-    // distribution, substitution-by-type) and qc_validate's custom-content
-    // sidecar (build / contig sanity / INFO+FORMAT presence) into one
-    // interactive HTML report alongside the markdown QC report.
+    // distribution, substitution-by-type), qc_validate's custom-content
+    // sidecar (build / contig sanity / INFO+FORMAT presence), and the
+    // per-VCF PCA scatter into one interactive HTML report alongside
+    // the markdown QC report.
     MULTIQC(
         BCFTOOLS_STATS.out.stats.collect(),
         QC_VALIDATE.out.mqc.collect(),
+        PCA_PLOT.out.mqc.collect(),
     )
 }

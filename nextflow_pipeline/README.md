@@ -1,13 +1,14 @@
 # variant-scan — Nextflow pipeline
 
-Scan a directory of VCF files for a target variant, producing four markdown reports plus a carrier-level TSV plus a cohort MultiQC HTML:
+Scan a directory of VCF files for a target variant, producing four markdown reports plus a carrier-level TSV, a per-VCF PCA scatter, and a cohort MultiQC HTML:
 
 1. **`qc_report.md`** — per-file validation run before anything else happens: file integrity, tabix index, header parseability, sample/variant presence, plus soft checks that the file looks like human genomic data (recognised reference build, human chromosome names, `FORMAT=GT`, `AF`/`AC`+`AN` present). Hard failures abort the pipeline in strict mode (the default).
 2. **`metadata_report.md`** — cohort-level and per-file overview for researchers orienting themselves to an unfamiliar dataset.
 3. **`variant_report.md`** — which files contain the target variant within an acceptable allele-frequency range, with per-population breakdowns.
 4. **`carriers_report.md`** — how many individuals carry the alt allele, split by heterozygous / homozygous, with integrity checks against cohort AC.
 5. **`carriers.tsv`** — one row per (file, sample) where the individual carries the alt allele. Suitable for downstream joins with a sample/population panel.
-6. **`multiqc_report.html`** + `multiqc_data/` — interactive cohort report from `bcftools stats` (Ti/Tv per sample, indel-length distribution, SNP/indel/multi-allelic counts, substitution-by-type) plus a custom-content table of `qc_validate.py`'s checks (build, contig sanity, INFO/FORMAT presence, warning/error counts) — suitable for supplementary material of a methods paper or a single-page cohort overview.
+6. **`pca/<name>.pca.png` + `pca/<name>.pca.json`** — per-VCF cohort PCA scatter (2 components, mean-imputed missing genotypes, zero-variance columns dropped) plus a machine-readable summary with per-sample PC1 / PC2 coordinates and the variance-explained ratio. Skips small inputs cleanly with a `{"skipped": "..."}` JSON marker.
+7. **`multiqc_report.html`** + `multiqc_data/` — interactive cohort report from `bcftools stats` (Ti/Tv per sample, indel-length distribution, SNP/indel/multi-allelic counts, substitution-by-type), a custom-content table of `qc_validate.py`'s checks (build, contig sanity, INFO/FORMAT presence, warning/error counts), and the per-VCF PCA scatters embedded inline — suitable for supplementary material of a methods paper or a single-page cohort overview.
 
 Designed for a standalone VM (local executor). Scales to hundreds of VCFs via per-file parallelism.
 
@@ -15,7 +16,7 @@ Designed for a standalone VM (local executor). Scales to hundreds of VCFs via pe
 
 - Nextflow ≥ 22.10 — `curl -s https://get.nextflow.io | bash`
 - `bcftools` ≥ 1.9 on PATH
-- Python 3.8+ — `bin/` scripts use stdlib only; the MultiQC stage additionally needs `multiqc>=1.18` importable as a module (`pip install multiqc` or `apt install python3-multiqc`). Invoked as `python3 -m multiqc` so the console-script shim doesn't need to be on PATH.
+- Python 3.8+ — most `bin/` scripts use stdlib only. Two stages need pip packages on the executor host: MULTIQC needs `multiqc>=1.18` importable as a module (`python3 -m multiqc`); PCA_PLOT needs `numpy>=1.24`, `scikit-learn>=1.3`, and `matplotlib>=3.7`. Missing any of the PCA deps is non-fatal — the script writes a tombstone JSON and a zero-byte PNG so the pipeline doesn't abort, but no scatter is produced. See `bin/requirements.txt`.
 - Each input VCF must be bgzipped (`.vcf.gz`) with a matching tabix index (`.vcf.gz.tbi`)
 
 ## Usage
@@ -61,12 +62,14 @@ nextflow_pipeline/
 ├── modules/
 │   ├── qc_validate.nf               # per-VCF QC + validation (first stage); also emits MultiQC sidecar
 │   ├── bcftools_stats.nf            # per-VCF `bcftools stats -s -` for MultiQC's native parser
+│   ├── pca_plot.nf                  # per-VCF cohort PCA scatter (PNG + JSON sidecar)
 │   ├── multiqc.nf                   # cohort-level interactive HTML report
 │   ├── inspect_vcf.nf               # per-VCF metadata collection
 │   ├── scan_variant.nf              # per-VCF variant lookup
 │   └── reports.nf                   # markdown aggregation
 ├── bin/                             # scripts auto-added to PATH by Nextflow
 │   ├── qc_validate.py               # --mqc-out emits a MultiQC custom-content sidecar
+│   ├── plot_pca.py                  # per-VCF cohort PCA → PNG + JSON
 │   ├── inspect_vcf.py
 │   ├── scan_variant.py              # also emits per-file carriers.tsv
 │   ├── build_qc_report.py
@@ -86,6 +89,7 @@ Per input VCF, Nextflow runs QC first, then three independent parallel tasks:
 - `INSPECT_VCF` — contigs, sample count, variant count, reference build heuristic, pipeline/date tags, sample-list hash (to detect cohort mismatches across files).
 - `SCAN_VARIANT` — tabix region query, strict REF/ALT match, AF extraction from INFO (or recomputed via `bcftools +fill-tags` if missing), classification into one of seven statuses, **and per-sample genotype extraction** for any file where the variant is present.
 - `BCFTOOLS_STATS` — per-VCF `bcftools stats -s -` output. Consumed by MultiQC's built-in bcftools-stats parser to produce per-sample Ti/Tv, indel-length distribution, substitution-by-type, and singleton stats — none of which the markdown reports compute.
+- `PCA_PLOT` — per-VCF cohort PCA. Reads genotypes via `bcftools query`, builds a samples × variants dosage matrix, mean-imputes missing calls, drops zero-variance columns, fits a 2-component sklearn PCA, and writes both `<name>.pca.png` (scatter, published to `results/pca/`) and `<name>.pca.json` (per-sample PC1 / PC2 coords + variance explained). Skips inputs that are too small (`< 3` samples or `< 10` variable sites by default) with a `{"skipped": "..."}` JSON marker rather than failing the pipeline.
 
 Each `SCAN_VARIANT` task emits two files:
 
@@ -98,7 +102,7 @@ Aggregation runs once all per-file fan-outs finish:
 - `METADATA_REPORT` → `metadata_report.md`
 - `VARIANT_REPORT` → `variant_report.md` (highlights files where the variant is in range)
 - `CARRIER_REPORT` → `carriers.tsv` + `carriers_report.md` (concatenates per-file carrier TSVs, totals het/hom counts, verifies `het + 2·hom == cohort AC`)
-- `MULTIQC` → `multiqc_report.html` + `multiqc_data/` (cohort-level interactive report combining `bcftools stats` and the QC sidecar)
+- `MULTIQC` → `multiqc_report.html` + `multiqc_data/` (cohort-level interactive report combining `bcftools stats`, the QC sidecar, and the per-VCF PCA scatters)
 
 ### Carrier extraction scope
 
@@ -135,7 +139,10 @@ results/
 ├── variant_report.md        # file-level classification + AF per population
 ├── carriers_report.md       # individual-level summary: het, hom, totals
 ├── carriers.tsv             # full per-carrier table (file, sample, GT, dosage)
-├── multiqc_report.html      # cohort-level interactive HTML (bcftools stats + QC sidecar)
+├── pca/
+│   ├── <name>.pca.png       # per-VCF cohort PCA scatter (PC1 vs PC2)
+│   └── <name>.pca.json      # per-sample PC coords + explained-variance ratio
+├── multiqc_report.html      # cohort-level interactive HTML (bcftools stats + QC sidecar + PCA scatters)
 └── multiqc_data/            # MultiQC's parsed-data drop, including multiqc_data.json (machine-readable)
 ```
 
