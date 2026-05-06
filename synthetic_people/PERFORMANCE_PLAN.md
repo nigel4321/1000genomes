@@ -618,6 +618,384 @@ bottleneck at 1M is the writer side — see Phase 5d below.
 
 ---
 
+## Phase 5f — chunked simulation within a chromosome
+
+**Status:** planned, not started. **Highest priority of the
+remaining 5 series** — directly addresses the user-reported OOM
+that surfaced post-5c, and Phase 5e's parallel-extraction model
+isn't useful until each tree sequence fits.
+
+**Goal:** bound msprime's per-chromosome working memory by splitting
+each chromosome into sub-chunks of fixed length (e.g. 5-10 Mb),
+each simulated as an independent tree sequence. Targets the OOM
+the user hit *during the simulation itself*, not the extraction
+phase.
+
+**Branch (when implemented):** `perf/phase5f-chunked-simulation`
+
+### Why even one tree sequence doesn't fit
+
+Phase 5c took cohort-sites RAM out of the picture; the user's
+n=3000 × full chr1 70Mb run *now OOMs in msprime's working memory*
+during simulation, before extraction even starts. The output trace
+from the failing run:
+
+```
+  simulating chrom 1 (length 70.0 Mb, model=OutOfAfrica_3G09)...
+Killed
+```
+
+stdpopsim's `OutOfAfrica_3G09` simulates three populations with
+bottlenecks, migrations, and an out-of-Africa expansion. During
+the coalescent backward-walk, the **active-lineage count peaks at
+many multiples of n** through bottlenecks (likely 10-50× at
+n=3000), and each lineage carries segment metadata that
+recombination splits further. Combined with full chr1 length
+(most recombination, biggest tree count), msprime's working memory
+can be 8-16+ GB at n=3000 × 70Mb. That exceeds the budget on
+workstation-class hosts even before Phase 5e gets a chance to
+parallelise the extraction.
+
+### Proposed structure
+
+1. Split each chromosome into K sub-chunks of fixed length
+   (e.g. `--chr-chunk-mb 10` produces 7 chunks for a 70 Mb chrom).
+2. For each chunk, simulate independently using msprime/stdpopsim
+   with the contig sliced to that chunk's range. Each chunk's
+   tree sequence is roughly 1/K the size of the full-chromosome
+   version.
+3. Iterate variants out of each chunk's tree sequence into the
+   per-chrom BCF in genome order — chunks are processed in order,
+   positions adjusted by the chunk's start offset.
+4. Free each chunk's tree sequence before starting the next.
+
+### Memory model
+
+| Path | Per-chrom peak | Status at n=3000 × 70Mb |
+|---|---|---|
+| Pre-5f, full-chrom simulation | 8-16+ GB | OOMs workstation-class hosts |
+| 5f at `--chr-chunk-mb 10` (7 × 10Mb) | ~1-2 GB per chunk | Fits 16 GB host |
+| 5f at `--chr-chunk-mb 5` (14 × 5Mb) | ~500 MB - 1 GB per chunk | Fits 8 GB host |
+
+Total per-chrom wall time: roughly the same total work, with
+overhead from K independent simulations. Each chunk pays msprime's
+startup cost; for 5-10 Mb chunks at n=3000 that overhead is small
+compared to the simulation itself.
+
+### What we lose: cross-chunk LD
+
+The big tradeoff. Recombination events that would have spanned
+chunk boundaries are lost — chunks simulate independently, so
+haplotypes are uncorrelated across chunk boundaries. In genetics
+terms: linkage disequilibrium decays sharply at chunk boundaries.
+
+Effect on common analyses:
+
+| Analysis | Impact |
+|---|---|
+| Ti/Tv | unaffected |
+| Allele frequency spectrum | unaffected |
+| Per-person genotype lists | unaffected (each chunk's haplotypes stay consistent across the cohort) |
+| ClinVar / dbSNP overlay placement | unaffected (overlays operate on positions within chunks) |
+| Short-range LD (≤ chunk_length) | preserved within chunks |
+| Long-range LD (> chunk_length) | NOT realistic — analyses requiring chr-scale haplotype block structure should not use chunked mode |
+
+Documented as a 5f-specific caveat alongside Phase 1's
+rng-consumption note.
+
+### Tasks (when implementation starts)
+
+- [ ] Add `--chr-chunk-mb N` CLI flag. Default `0` = auto-pick
+  from available RAM at run start; explicit `N > 0` overrides.
+  Chunk-size selection logged so the user sees what was picked.
+  Add `psutil>=5.9` to `synthetic_people/requirements.txt` for
+  the `virtual_memory()` query.
+- [ ] **Auto-pick logic** in `cli.py`. Estimate per-chunk peak
+  working memory as a function of `(n_people, demo_model,
+  chunk_size_bp)` — calibrate from a small benchmarking pass on
+  a known config, store coefficients in
+  `coalescent.py:CHUNK_RAM_MODEL` so the formula is testable in
+  isolation. Pick the largest chunk size whose estimate fits in
+  ≤ 50% of `psutil.virtual_memory().available`. Cap at the
+  configured `--chr-length-mb` (no point chunking smaller than
+  the chromosome itself).
+- [ ] **Chunk overlap** with default ~5-10% of chunk size. Each
+  chunk simulates `chunk_size + overlap_margin` bp; variants in
+  the overlap region of chunk K and chunk K+1 are written only
+  once (taken from chunk K) so the per-chrom BCF stays
+  duplicate-free. Overlap is documented as boundary smoothing,
+  not true LD recovery.
+- [ ] **Refactor `coalescent.simulate_chromosome`** (and its
+  admixture twin) to optionally split into sub-chunks. Each
+  sub-chunk runs the existing simulation pipeline against a
+  `species.get_contig(chrom, right=chunk_size_bp + overlap)`
+  contig (independent simulation, chunk-specific seed). Variants
+  are emitted with positions offset by `chunk_index ×
+  chunk_size`.
+- [ ] **Per-chunk seeds** derive deterministically from the
+  chromosome's seed + chunk index, so `--seed` reproducibility
+  holds across both chunked and unchunked invocations (with the
+  documented caveat that chunked vs unchunked output isn't
+  byte-identical at the same `--seed` because the chunk seeds
+  consume rng differently).
+- [ ] **Free per-chunk tree sequence** before the next chunk's
+  simulation starts. Per-chrom BCF writer accumulates chunks in
+  genome order; tree sequences are not retained.
+- [ ] **Tests.**
+  - Auto-pick exercise: stub `psutil.virtual_memory().available`
+    to known sizes (8/16/32/64 GB) at n=3000 and assert the
+    auto-picked chunk size matches expectation.
+  - Override exercise: `--chr-chunk-mb 10` always picks 10
+    regardless of available RAM.
+  - Chunked vs unchunked at small n produces equivalent
+    per-record summary statistics (counts, Ti/Tv, AF
+    distribution) within stochastic noise.
+  - Overlap dedup: simulate `--chr-length-mb 20 --chr-chunk-mb 10`
+    with overlap, assert no duplicate positions in the per-chrom
+    BCF.
+  - Memory bound: regression test runs `--n 1000 --chr-length-mb
+    70 --chr-chunk-mb 10` and asserts peak RSS scales with one
+    chunk's tree sequence (a few GB, not the unchunked 8-16 GB).
+  - Chunk-boundary determinism: same seed + same chunk size →
+    byte-identical BCFs across runs.
+- [ ] **Docs.** README + TUTORIAL: explain `--chr-chunk-mb`
+  semantics (auto-pick default, explicit override, overlap
+  behaviour), document the cross-chunk LD caveat, link the
+  auto-pick formula to the tuning section.
+
+### Resolved decisions
+
+1. **Default chunk size: auto-pick based on host hardware.**
+   `--chr-chunk-mb 0` (the default) detects available RAM at
+   startup via `psutil.virtual_memory().available`, estimates
+   per-chunk working memory from `(n_people, demo_model,
+   chunk_size)`, and picks the largest chunk size that fits the
+   available budget with comfortable margin (target: peak working
+   set ≤ 50% of available RAM, leaving room for parent process,
+   overlay loaders, ClinVar pool, OS cache, and the
+   simulation-startup spike). `--chr-chunk-mb N` (with N > 0) is
+   the explicit override for users who want to pin a specific
+   chunk size — useful for reproducibility across heterogeneous
+   hosts, or to force a smaller chunk for safety. Chunk-size
+   selection is logged so the user sees what was picked and why
+   (`auto-selected chunk size 5 Mb based on 14 GB available RAM
+   at n=3000`).
+2. **Chunk overlap: yes, implemented.** Adjacent chunks simulate
+   with a configurable overlap margin (default ~5-10% of chunk
+   size). The overlap regions are discarded at write time —
+   variants in the overlap of chunk K and chunk K+1 are written
+   only once, taken from chunk K. This doesn't fully recover
+   cross-chunk LD (each chunk is still an independent simulation),
+   but it gives the central region of each chunk a less abrupt
+   boundary effect: LD decays naturally inside each chunk's
+   simulated region rather than terminating sharply at the chunk
+   boundary. Documented in 5f's caveat as "boundary smoothing"
+   rather than "true LD recovery". Full cross-chunk LD recovery
+   would require msprime's tree-sequence continuation API and is
+   left to a future phase.
+3. **stdpopsim contig slicing: use `right=`.** Each chunk
+   simulates an *independent* small contig (length =
+   chunk_size + overlap_margin) using its own seed; chunk K's
+   variants then have positions offset by `K × chunk_size`
+   when written to the per-chrom BCF. We don't try to "extract
+   chunk K of chr1" using `right=chunk_end` (which would re-
+   simulate the prefix at every chunk and balloon work
+   quadratically). Instead each chunk is biologically equivalent
+   to "the first chunk_size bp of chr1", with chunk-specific
+   seeds making them independent. For the user-facing analyses
+   we care about (Ti/Tv, AF spectrum, per-person genotypes,
+   ClinVar overlay placement, short-range LD inside each chunk)
+   this is identical; for long-range LD across chunks it isn't,
+   which is the documented caveat.
+4. **Sizing: detect host RAM, no hardcoded numbers.** The
+   auto-pick formula uses `psutil.virtual_memory().available`
+   at run start. Plan and TUTORIAL document the formula as
+   "chunk size scales linearly with available RAM and inversely
+   with cohort size; auto-picked chunks aim for peak working set
+   ≤ 50% of free RAM". Users can override with
+   `--chr-chunk-mb N` if their environment has surprising memory
+   pressure (e.g. running alongside other big processes).
+
+### Relationship to Phase 5e
+
+5f and 5e compose. **5f reduces the size of each tree sequence**
+so it fits in RAM at all. **5e parallelises extraction** across
+workers consuming sample slices of that smaller tree sequence.
+
+| Host RAM | Chunk size | Workers (5e) | What gets unlocked |
+|---|---|---|---|
+| 16 GB | 5 Mb chunks | 2-4 sample-slice workers | n=3000 completes |
+| 32 GB | 10 Mb chunks | 4-8 sample-slice workers | n=3000+ at higher throughput |
+| 64+ GB | 20 Mb chunks | 8-16 sample-slice workers | n=10k+ feasible |
+
+**Implementation order: 5f first** (unblocks the immediate user
+case), then 5e (squeezes within-chunk extraction throughput on
+top). 5e standalone helps only when one full-chromosome tree
+sequence fits in RAM — for the user's current workload it
+doesn't.
+
+---
+
+## Phase 5e — within-chromosome parallel extraction over a shared tree sequence
+
+**Status:** planned, **gated on Phase 5f landing first**. The user's
+n=3000 × full-chr1 OOM happens *during simulation* of a single
+chromosome — Phase 5e's parallel-extraction model only helps once
+one tree sequence fits in RAM. 5f (chunked simulation) gets each
+tree sequence to fit; 5e then parallelises extraction across that
+smaller tree sequence.
+
+**Goal:** bound peak RAM at one msprime tree sequence per run
+regardless of `--workers`. After Phase 5c made cohort-sites RAM
+negligible, msprime's tree sequence is the central remaining RAM
+cost at any non-trivial cohort size — and today's
+"one-worker-per-chromosome" parallelism multiplies it by the worker
+count, OOMing on workstation-class hardware at cohort sizes msprime
+itself could simulate fine.
+
+**Branch (when implemented):** `perf/phase5e-shared-tree-extraction`
+
+### Why each worker holds its own tree today
+
+The parallelism is sliced *across chromosomes*, not within one.
+Worker 1 builds chr1's full tree sequence (all n samples, full
+chromosome length); worker 2 builds chr2's full tree (also n
+samples). Each worker is doing different work — there's no
+redundancy — but each holds its own multi-GB tree sequence
+concurrently, so peak system RAM is:
+
+```
+peak system RAM ≈ workers × tree_sequence_size + ~1-2 GB process overhead
+```
+
+For `n=3000 × 70 Mb`, tree-sequence size is ~3-5 GB; four parallel
+workers OOM a 16 GB host. This was the user-reported failure at
+`--n 3000 --chromosomes 1-22 --chr-length-mb 70` after Phase 5c
+landed.
+
+### Proposed structure
+
+1. Parent process simulates **one** chromosome's tree sequence (n
+   samples, full chromosome length) — msprime is single-threaded
+   internally, so running it serially in the parent matches today's
+   per-chromosome cost.
+2. Parent forks N workers via Linux's copy-on-write semantics.
+   Workers inherit the parent's tree sequence in shared memory —
+   no per-worker copy.
+3. Each worker handles a different sample slice (samples
+   `0..n/W`, `n/W..2n/W`, …), iterating variants for its slice and
+   writing its portion of the chromosome's records to a per-worker
+   intermediate.
+4. After workers finish, merge their outputs into the per-chrom BCF
+   in genome order (`bcftools concat` or comparable join).
+5. Parent frees the tree sequence; loop to next chromosome.
+
+### Why it works
+
+tskit's tree sequence is mostly C-level allocations — raw tables
+(`NodeTable`, `EdgeTable`, `MutationTable`, `SiteTable`) and numpy
+buffers. Fork-COW shares these cleanly because workers read but
+don't write. Per-worker incremental RAM is the small Python
+overhead plus per-variant wrapper objects (which dirty COW pages
+but are bounded). New memory model:
+
+```
+peak system RAM ≈ 1 × tree_sequence_size
+                + workers × ~100 MB
+                + ~1-2 GB process overhead
+```
+
+At `n=3000 × 70 Mb` that's ~3-5 GB regardless of `--workers`, vs
+~12-20 GB pre-5e.
+
+### What we lose
+
+Simulation goes serial across chromosomes — only one tree sequence
+is ever being built at a time. Today's parallel-chromosome model
+finishes faster *when RAM allows it* because msprime simulation is
+the dominant per-chromosome cost (~5× the extraction phase). Wall
+time tradeoff:
+
+| Path | Wall time | RAM |
+|---|---|---|
+| Pre-5e parallel chromosomes (when RAM allows) | fastest | OOMs at n=3000+ on 16-32 GB hosts |
+| Phase 5e (this) | ~3-5× slower than parallel-chromosome ideal | bounded at 1 × tree sequence |
+| `--workers 1` (current OOM workaround) | ~22× slower than parallel-chromosome ideal | 1 × tree sequence |
+
+5e is significantly faster than `--workers 1` (parallel extraction
+inside one chromosome at a time) and bounded-RAM, at the cost of
+being slower than parallel-chromosome when the host has the RAM.
+There's no good way to recover the parallel-chromosome speed
+without paying its RAM cost; that path stays available behind a
+flag if a user has the RAM and wants the wall-time win.
+
+### Tasks (when implementation starts)
+
+- [ ] **Refactor `coalescent.simulate_cohort_iter`** along the
+  structure above — simulate in parent, fork extractor pool, merge
+  per-worker outputs into the per-chrom BCF.
+- [ ] **`admixture.simulate_cohort` mirror.** The admixture path
+  uses `BinaryMutationModel` and emits per-person ancestry segments
+  alongside cohort sites; local-ancestry tracking interacts with
+  the tree sequence walk, so the refactor is more delicate but
+  follows the same principle.
+- [ ] **Tests.**
+  - Determinism: same seed → same per-chrom BCF byte-for-byte
+    regardless of `--workers`. Sample slices split deterministically;
+    merge order is fixed.
+  - Memory bound: regression test that runs at moderate n and
+    asserts peak RSS scales with one tree sequence (not workers ×
+    tree sequence).
+  - End-to-end: the user's failing command (`--n 3000 --chromosomes
+    1-22 --chr-length-mb 70`) completes on a 32 GB host.
+- [ ] **Re-measure** at the configurations 5c was measured against
+  (`n=500 / 3000 / 10 000`) so the comparison is direct.
+- [ ] **Docs** — README + TUTORIAL: clarify that `--workers` now
+  controls within-chromosome parallelism (sample-slice extraction),
+  not across-chromosome simulation; chromosomes simulate one at a
+  time. Note that hosts with enough RAM for parallel chromosome
+  simulation can opt into the old behaviour via a separate flag
+  if we keep it.
+
+### What this means for `--workers`
+
+After 5e, `--workers` semantics change from "parallel chromosomes"
+to "parallel sample-slice extractors within one chromosome at a
+time". For a fixed `--n`, doubling workers no longer doubles peak
+RAM — it just speeds up the (already-cheap) extraction phase. The
+auto-derate-workers idea that surfaced as a stopgap during the 5c
+discussion falls away because RAM stops scaling with `--workers`.
+
+### Open questions for review
+
+- **Per-worker output format.** Per-worker text-VCF chunks merged
+  via `bcftools concat`, or per-worker pickle of records merged in
+  the parent? Concat is simpler and matches the existing BCF
+  writer; pickle keeps everything in Python and avoids the extra
+  disk write. Lean toward concat for parity with 5b's pipeline.
+- **Sample-slice vs position-slice.** Sample-slice gives equal
+  work per worker assuming roughly uniform allele frequencies;
+  position-slice gives genome-ordered output but unequal work.
+  Recommend sample-slice because msprime's variant iteration is
+  deterministic and equal slices fall out cleanly from the tree
+  sequence's sample list. Sample-slice also fits admixture's
+  per-person ancestry segments naturally (each worker emits its own
+  slice's ancestry).
+- **Keep parallel-chromosome path as opt-in?** Users with 64+ GB
+  hosts and large chromosome counts get the old wall-time win for
+  free today. Consider a `--parallel-chromosomes` flag that retains
+  the pre-5e behaviour for those users; default off.
+
+### Relationship to Phase 5d
+
+Orthogonal axis. 5d (pysam-based direct binary BCF write) addresses
+the *writer* throughput at n=1M+. 5e addresses the *simulation*
+RAM at n=3000+. Both real follow-ups; 5e is more urgent because
+it unblocks workstation-class users *now*, whereas 5d only matters
+for cluster-class n.
+
+---
+
 ## Phase 5d — direct binary BCF writes (path to n=1M+)
 
 **Goal:** get past the writer-side bottleneck that emerges once
