@@ -705,52 +705,116 @@ rng-consumption note.
 
 ### Tasks (when implementation starts)
 
-- [ ] Add `--chr-chunk-mb` CLI flag (default `0` = unchunked,
-  preserves today's behaviour for users with the RAM headroom).
-- [ ] Refactor `coalescent.simulate_chromosome` (and its admixture
-  twin) to optionally split into sub-chunks. Each sub-chunk runs
-  the existing simulation pipeline against a contig slice.
-- [ ] Per-chunk seeds derive deterministically from the chromosome's
-  seed + chunk index, so `--seed` reproducibility holds.
-- [ ] Each chunk's variants flow into the per-chrom BCF with
-  positions adjusted by the chunk's start offset. Tree sequences
-  are freed before the next chunk's simulation starts.
+- [ ] Add `--chr-chunk-mb N` CLI flag. Default `0` = auto-pick
+  from available RAM at run start; explicit `N > 0` overrides.
+  Chunk-size selection logged so the user sees what was picked.
+  Add `psutil>=5.9` to `synthetic_people/requirements.txt` for
+  the `virtual_memory()` query.
+- [ ] **Auto-pick logic** in `cli.py`. Estimate per-chunk peak
+  working memory as a function of `(n_people, demo_model,
+  chunk_size_bp)` — calibrate from a small benchmarking pass on
+  a known config, store coefficients in
+  `coalescent.py:CHUNK_RAM_MODEL` so the formula is testable in
+  isolation. Pick the largest chunk size whose estimate fits in
+  ≤ 50% of `psutil.virtual_memory().available`. Cap at the
+  configured `--chr-length-mb` (no point chunking smaller than
+  the chromosome itself).
+- [ ] **Chunk overlap** with default ~5-10% of chunk size. Each
+  chunk simulates `chunk_size + overlap_margin` bp; variants in
+  the overlap region of chunk K and chunk K+1 are written only
+  once (taken from chunk K) so the per-chrom BCF stays
+  duplicate-free. Overlap is documented as boundary smoothing,
+  not true LD recovery.
+- [ ] **Refactor `coalescent.simulate_chromosome`** (and its
+  admixture twin) to optionally split into sub-chunks. Each
+  sub-chunk runs the existing simulation pipeline against a
+  `species.get_contig(chrom, right=chunk_size_bp + overlap)`
+  contig (independent simulation, chunk-specific seed). Variants
+  are emitted with positions offset by `chunk_index ×
+  chunk_size`.
+- [ ] **Per-chunk seeds** derive deterministically from the
+  chromosome's seed + chunk index, so `--seed` reproducibility
+  holds across both chunked and unchunked invocations (with the
+  documented caveat that chunked vs unchunked output isn't
+  byte-identical at the same `--seed` because the chunk seeds
+  consume rng differently).
+- [ ] **Free per-chunk tree sequence** before the next chunk's
+  simulation starts. Per-chrom BCF writer accumulates chunks in
+  genome order; tree sequences are not retained.
 - [ ] **Tests.**
-  - Chunked vs unchunked at small n produces equivalent per-record
-    summary statistics (counts, Ti/Tv, AF distribution) within
-    stochastic noise.
-  - Memory bound: regression test runs `--n 1000 --chr-length-mb 70
-    --chr-chunk-mb 10` and asserts peak RSS scales with one chunk's
-    tree sequence (a few GB, not the unchunked 8-16 GB).
+  - Auto-pick exercise: stub `psutil.virtual_memory().available`
+    to known sizes (8/16/32/64 GB) at n=3000 and assert the
+    auto-picked chunk size matches expectation.
+  - Override exercise: `--chr-chunk-mb 10` always picks 10
+    regardless of available RAM.
+  - Chunked vs unchunked at small n produces equivalent
+    per-record summary statistics (counts, Ti/Tv, AF
+    distribution) within stochastic noise.
+  - Overlap dedup: simulate `--chr-length-mb 20 --chr-chunk-mb 10`
+    with overlap, assert no duplicate positions in the per-chrom
+    BCF.
+  - Memory bound: regression test runs `--n 1000 --chr-length-mb
+    70 --chr-chunk-mb 10` and asserts peak RSS scales with one
+    chunk's tree sequence (a few GB, not the unchunked 8-16 GB).
   - Chunk-boundary determinism: same seed + same chunk size →
     byte-identical BCFs across runs.
 - [ ] **Docs.** README + TUTORIAL: explain `--chr-chunk-mb`
-  semantics, document the cross-chunk LD caveat, recommend chunk
-  sizes per host RAM budget.
+  semantics (auto-pick default, explicit override, overlap
+  behaviour), document the cross-chunk LD caveat, link the
+  auto-pick formula to the tuning section.
 
-### Open questions for review
+### Resolved decisions
 
-1. **Default chunk size.** `0` (unchunked, today's behaviour) is
-   the safest default — users opt in via `--chr-chunk-mb 10` when
-   they hit OOM. An auto-pick based on n × demo_model + available
-   RAM is friendlier but adds complexity; lean toward explicit-
-   opt-in for the first cut.
-2. **Chunk overlap.** Simulate adjacent chunks with overlapping
-   margins to recover some cross-chunk LD? Adds 10-20% redundant
-   simulation but recovers LD across boundaries up to overlap
-   length. Worth it for downstream LD-aware analyses; out of scope
-   for the first 5f PR.
-3. **stdpopsim contig slicing API.** `species.get_contig(chrom,
-   right=slice_end)` is documented, but `left=` may or may not be
-   supported; check at implementation time. If `left` is missing,
-   we either simulate `[0, chunk_end]` and discard `[0,
-   chunk_start]` (wastes work) or use msprime's lower-level API
-   directly.
-4. **Sizing.** What's the host RAM the user is running on? At
-   16 GB, even after 5f a chunk size ≤5 Mb is needed at n=3000 ×
-   OOA_3G09; at 32 GB, 10 Mb chunks should fit comfortably.
-   Knowing the target host helps pick a sensible default chunk
-   size for the docs / TUTORIAL recipe.
+1. **Default chunk size: auto-pick based on host hardware.**
+   `--chr-chunk-mb 0` (the default) detects available RAM at
+   startup via `psutil.virtual_memory().available`, estimates
+   per-chunk working memory from `(n_people, demo_model,
+   chunk_size)`, and picks the largest chunk size that fits the
+   available budget with comfortable margin (target: peak working
+   set ≤ 50% of available RAM, leaving room for parent process,
+   overlay loaders, ClinVar pool, OS cache, and the
+   simulation-startup spike). `--chr-chunk-mb N` (with N > 0) is
+   the explicit override for users who want to pin a specific
+   chunk size — useful for reproducibility across heterogeneous
+   hosts, or to force a smaller chunk for safety. Chunk-size
+   selection is logged so the user sees what was picked and why
+   (`auto-selected chunk size 5 Mb based on 14 GB available RAM
+   at n=3000`).
+2. **Chunk overlap: yes, implemented.** Adjacent chunks simulate
+   with a configurable overlap margin (default ~5-10% of chunk
+   size). The overlap regions are discarded at write time —
+   variants in the overlap of chunk K and chunk K+1 are written
+   only once, taken from chunk K. This doesn't fully recover
+   cross-chunk LD (each chunk is still an independent simulation),
+   but it gives the central region of each chunk a less abrupt
+   boundary effect: LD decays naturally inside each chunk's
+   simulated region rather than terminating sharply at the chunk
+   boundary. Documented in 5f's caveat as "boundary smoothing"
+   rather than "true LD recovery". Full cross-chunk LD recovery
+   would require msprime's tree-sequence continuation API and is
+   left to a future phase.
+3. **stdpopsim contig slicing: use `right=`.** Each chunk
+   simulates an *independent* small contig (length =
+   chunk_size + overlap_margin) using its own seed; chunk K's
+   variants then have positions offset by `K × chunk_size`
+   when written to the per-chrom BCF. We don't try to "extract
+   chunk K of chr1" using `right=chunk_end` (which would re-
+   simulate the prefix at every chunk and balloon work
+   quadratically). Instead each chunk is biologically equivalent
+   to "the first chunk_size bp of chr1", with chunk-specific
+   seeds making them independent. For the user-facing analyses
+   we care about (Ti/Tv, AF spectrum, per-person genotypes,
+   ClinVar overlay placement, short-range LD inside each chunk)
+   this is identical; for long-range LD across chunks it isn't,
+   which is the documented caveat.
+4. **Sizing: detect host RAM, no hardcoded numbers.** The
+   auto-pick formula uses `psutil.virtual_memory().available`
+   at run start. Plan and TUTORIAL document the formula as
+   "chunk size scales linearly with available RAM and inversely
+   with cohort size; auto-picked chunks aim for peak working set
+   ≤ 50% of free RAM". Users can override with
+   `--chr-chunk-mb N` if their environment has surprising memory
+   pressure (e.g. running alongside other big processes).
 
 ### Relationship to Phase 5e
 
