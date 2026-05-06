@@ -32,6 +32,35 @@ land it, then move to the next phase. **Do not bundle phases.**
 - **Target host: single machine.** `ProcessPoolExecutor` with the
   Linux fork start method is the right primitive — no need for a
   chunked work-queue or any inter-host coordination layer.
+- **Stretch target: `n = 100 000+`.** A real-world request that the
+  current in-RAM design cannot support: at `--n 30 --chromosomes 1-22
+  --chr-length-mb 70` (≈ 2.3M cohort sites) the per-person fork pool
+  already gets OOM-killed because cohort_sites alone consumes ~4-5 GB
+  before fork. Phase 3's dense numpy matrix is one order of magnitude
+  better but still tops out around `n ≈ 5 000` (a `n_sites × 2*n`
+  uint8 matrix at `n=100k` is ≈ 460 GB). Reaching 100k requires
+  *disk-backed intermediates* — Phases 5 and 6 below.
+
+## Strategy summary
+
+The phases compose, not compete:
+
+| Phase | What | Scale unlock | Primary cost |
+|---|---|---|---|
+| 1 ✓ | Parallel chrom + per-person | Faster, not larger | None |
+| 2 ✓ | Overlap I/O loaders with simulation | Faster, not larger | None |
+| 3 (partial) | Dense numpy genotype matrix | `n ≈ 5 000` | New in-RAM shape |
+| 4 | Hot-path cleanups | Faster | None |
+| **5** | **Disk-backed cohort BCF** | **`n = 100k+`** | **+disk I/O at phase boundaries** |
+| **6** | **SQLite for side-state (truth / ancestry / manifest)** | Filesystem at 100k | +schema |
+
+Phase 3's `gts: list[str]` baseline measurement is recorded and still
+useful (it confirms the underlying RAM problem is real). The dense
+numpy refactor itself is **superseded by Phase 5** for the 100k goal —
+once cohort state lives on disk in BCF form, the in-memory data shape
+matters less. Two tasks from Phase 3 *survive* into Phase 5 and become
+more useful there: the `person_records_from_cohort` generator pattern
+and the `carriers[i]` pre-bucketing.
 
 ---
 
@@ -117,6 +146,18 @@ RAM at large `n × n_sites`. Big peak-RAM drop, also speeds up
 downstream loops.
 
 **Branch:** `perf/phase3-genotype-matrix`
+
+> **Status — partly superseded by Phase 5.** The measure-first task is
+> done and validated the underlying problem (gts share is 60–87% of
+> peak RSS at `n = 200 / 500 / 1000`). The *dense numpy refactor*
+> below buys roughly one order of magnitude over `list[str]`, taking
+> the in-RAM cap from `n ≈ 500` to `n ≈ 5 000` — useful but not enough
+> for the 100k stretch target. Phase 5 (disk-backed cohort BCF)
+> reaches 100k+ directly. If the priority is scale, **skip the dense
+> refactor and go to Phase 5**. If the priority is still-in-RAM speed
+> for sub-1000 cohorts, the dense refactor remains valid; the
+> generator and `carriers[i]` tasks below survive into Phase 5
+> regardless.
 
 > **Measure before refactoring.** CPython interns short repetitive
 > strings (`"0|0"`, `"0|1"`, etc.), so the projected ~1.25 GB number
@@ -304,6 +345,237 @@ them.
 - [ ] **Tests** — confirm site-dedupe parity with a fixed seed; spot-
   check `alt_dosages` on the new path.
 - [ ] **Docs** — none needed unless behaviour changes.
+
+---
+
+## Phase 5 — disk-backed cohort BCF (path to 100k+)
+
+**Goal:** the cohort genotype state never has to fit in RAM. Simulate
+chromosome-by-chromosome straight onto disk as BCF; per-person VCFs
+become an opt-in derivation via `bcftools view -s SAMPLE` from the
+cohort BCF. This is the architectural shift that unblocks the 100k
+stretch target — the in-memory phases stop scaling around `n ≈ 5 000`
+even with Phase 3's dense matrix.
+
+**Branch:** `perf/phase5-cohort-bcf`
+
+### Why BCF (not SQLite, not Parquet)
+
+`htslib` is already a hard dep, BCF is the binary VCF spec, `bgzip +
+tabix` gives indexed concurrent reads, and `bcftools view -s SAMPLE`
+extracts one person in one command — that *is* the per-person
+derivation step. SQLite for the same data would require designing a
+sites/samples/genotypes schema that re-implements what BCF already
+does at roughly 10–100× the I/O cost per query. SQLite is still the
+right home for the *side-state* that isn't shaped like VCF — see
+Phase 6.
+
+### What we lose vs. an in-RAM cohort
+
+- **Disk-I/O at every phase boundary.** Today everything stays in
+  Python objects from `simulate_cohort` through to per-person writers.
+  Phase 5 introduces a serialise / deserialise round-trip per
+  chromosome. For sub-100 cohorts this is measurably slower; for 100k
+  it's the only way the run completes at all.
+- **Less freedom to mutate cohort state in-place.** Today's overlay
+  injection (`cli.py:443-504`) walks the in-RAM list and rewrites
+  fields by index. Once the canonical state is on disk, overlays
+  must apply *before* writing each chromosome's BCF (one-pass), or
+  via a separate "rewrite-the-BCF" pass. The one-pass model is the
+  recommended shape — see the chromosome streaming task below.
+- **Resume semantics need a contract.** If we let an existing
+  `cohort.chr*.bcf` skip simulation, the seed + contig + n + demo
+  model + length must all match. A small JSON sidecar
+  (`cohort.meta.json`) listing those parameters lets us reject a
+  cohort BCF that doesn't belong to this run.
+
+### Tasks
+
+- [ ] **Pick the on-disk layout.** One of:
+  - `out/cohort/cohort.bcf` — single multi-sample file, all
+    chromosomes. Simpler resume contract; one tabix index.
+  - `out/cohort/cohort.chr<N>.bcf` — per-chromosome split. Pairs
+    naturally with the chromosome-streaming simulator and matches the
+    1000G Phase 3 layout downstream tools already expect.
+  - **Recommend the per-chromosome split** for parity with 1000G and
+    for trivially-parallel per-person derivation.
+- [ ] **Stream chromosome-by-chromosome in `simulate_cohort`.** No
+  global `cohort_sites` list. For each chromosome: simulate → apply
+  overlays in-RAM (one chromosome's sites is small) → write BCF →
+  free → next chromosome. Determinism preserved by the existing
+  per-chromosome seed derivation from Phase 1.
+- [ ] **Add a BCF writer.** Two viable paths:
+  - `pysam` (already pulled in transitively via msprime / tskit) —
+    direct, fast, no subprocess overhead.
+  - `subprocess.Popen(["bcftools", "view", "-O", "b"], stdin=PIPE)`
+    streaming a text VCF in. No new Python dep, slightly slower.
+  - **Recommend pysam if the dep tree confirms it's already
+    importable.** Falls back to the bcftools-pipe form if not.
+- [ ] **Write a resume contract.** `out/cohort/cohort.meta.json`
+  records `seed`, `chromosomes`, `n_people`, `demo_model`,
+  `population`, `chr_length_mb`, plus a list of which chromosome
+  BCFs are complete. On resume, completed chromosomes skip
+  simulation; mismatched parameters force re-simulation with a clear
+  message. `--no-resume` overrides for explicit re-runs.
+- [ ] **Per-person derivation step.** New `derive_per_person` action
+  that runs `bcftools view -s SAMPLE_ID -Oz` per sample against the
+  cohort BCF. Trivially parallel across `--workers`. Add a `--mode`
+  selector:
+  - `--mode per-person` — emit per-person VCFs (today's default for
+    small cohorts).
+  - `--mode cohort` — ship only the cohort BCF (sane default for
+    large cohorts; per-person can still be derived later).
+  - `--mode both` — write both. Default depends on `--n`: per-person
+    for `n ≤ 1 000`, cohort-only above. Threshold tunable via
+    `--per-person-threshold`.
+- [ ] **Pre-bucket per-person carriers** (survives from Phase 3).
+  When deriving per-person VCFs, pre-build `carriers[i] =
+  list_of_site_indices` so each person's walk is O(records this
+  person actually carries) instead of O(cohort sites). On the
+  cohort-BCF path the equivalent is `bcftools view -s SAMPLE -e
+  'GT="0/0" || GT="0|0" || GT="./."'`, which is what bcftools does
+  natively and what users would expect.
+- [ ] **Manifest extension.** Add `cohort_bcf` (path or list of paths
+  per chromosome) and `mode` (`per-person` / `cohort` / `both`)
+  fields. Per-person path entries only present if derivation ran.
+- [ ] **Re-measure.** Run `scripts/profile_memory.py` (or a Phase 5
+  equivalent) at `n = 100, 1 000, 10 000, 100 000` with the new path.
+  Record the realised peak RSS and total wall time alongside the
+  Phase 3 baseline so the cost/benefit is captured. Expected
+  outcome: peak RSS bounded by one chromosome's working set
+  (single-digit GB at any cohort size), total wall time roughly
+  linear in `n × n_sites` because per-person derivation is the new
+  dominant cost.
+- [ ] **Tests.**
+  - Round-trip: `simulate_cohort` writes a BCF; `bcftools view -h`
+    parses cleanly; record count matches the in-RAM number we'd
+    have produced.
+  - Determinism: same seed + same flags → byte-identical cohort BCF
+    (modulo the timestamp in the BCF header — strip before
+    comparing).
+  - Per-person derivation: `bcftools view -s SAMPLE` from the cohort
+    BCF produces the same record set as the Phase 1-2 in-RAM path
+    at the same seed. (May not be byte-identical because BCF→VCF
+    can normalise INFO field order; assert per-record equivalence
+    instead.)
+  - Resume: run, kill mid-cohort, re-run, confirm the second run
+    skips already-completed chromosomes and produces the same final
+    output.
+  - `--mode cohort` skips per-person derivation; `--mode both`
+    produces both deliverables.
+- [ ] **Docs.** README Performance section, TUTORIAL §9 ("Performance
+  and scaling"), IMPLEMENTATION_PLAN architecture section. Call out
+  the resume contract, the `--mode` flag, and the per-person-threshold
+  default. Update the "Output layout" tree in README to show the new
+  `cohort/` directory.
+
+### Open questions for review
+
+- Should overlays still inject after-simulation, or fold into the
+  per-chromosome streaming loop? Folding in is cleaner but means the
+  ClinVar / rsID / COSMIC pools must all be loaded before the first
+  chromosome simulates (they already are, via Phase 2's prefetch).
+- Per-chromosome BCFs vs. one-big-BCF: are there downstream tools that
+  prefer one shape? 1000G ships per-chromosome; gnomAD ships per-
+  chromosome. Recommend per-chromosome.
+- Threshold for default `--mode`: `n=1 000` is a guess; revisit once
+  per-person derivation timings are measured.
+
+---
+
+## Phase 6 — SQLite for side-state at scale
+
+**Goal:** consolidate the per-person side files
+(`out/truth/person_NNNN.golden.bed`,
+`out/truth/person_NNNN.noise.bed`, `out/ancestry/person_NNNN.bed`,
+`out/manifest.json` with N entries) into a single cohort SQLite
+database. At `n = 100 000`, the per-person-files layout becomes a
+filesystem-stress problem (300k+ small files in a single directory)
+that's slow to enumerate, slow to back up, and awkward to query.
+SQLite handles a few hundred MB of structured per-sample rows
+trivially and supports concurrent WAL-mode `SELECT`s for any
+downstream "grade caller per-sample" workflow.
+
+**Branch:** `perf/phase6-sqlite-sidestate`
+
+### Why SQLite (not Parquet, not JSONL)
+
+- WAL mode supports concurrent readers without a server.
+- Schema is small and stable (samples / events / segments / manifest
+  KV). Parquet is overkill and forces column-store thinking on
+  small heterogeneous payloads.
+- `sqlite3` is in the stdlib — zero new deps.
+- Easy ad-hoc inspection during runs (`sqlite3 cohort.db "SELECT ..."`).
+- Per-person BED derivation stays a one-liner via `bcftools`-friendly
+  bedfile output: `dump_truth_bed(sample_id, db) → person.bed`.
+
+### Tasks
+
+- [ ] **Schema.** One DB at `out/cohort.db` with:
+  ```sql
+  CREATE TABLE samples (
+    sample_id INTEGER PRIMARY KEY,
+    sample_name TEXT NOT NULL UNIQUE,
+    ancestry_summary_json TEXT
+  );
+  CREATE TABLE truth_events (
+    sample_id INTEGER NOT NULL REFERENCES samples(sample_id),
+    contig TEXT NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    kind TEXT NOT NULL,        -- HIGHLIGHTED / CLINVAR / COSMIC / SV / RSID / FLIP / DROPOUT
+    payload_json TEXT NOT NULL
+  );
+  CREATE INDEX truth_events_sample_pos
+    ON truth_events(sample_id, contig, start);
+  CREATE TABLE ancestry_segments (
+    sample_id INTEGER NOT NULL REFERENCES samples(sample_id),
+    contig TEXT NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    hap1_pop TEXT,
+    hap2_pop TEXT
+  );
+  CREATE INDEX ancestry_segments_sample_pos
+    ON ancestry_segments(sample_id, contig, start);
+  CREATE TABLE manifest_kv (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL
+  );
+  ```
+- [ ] **Refactor `truth.py`.** Replace `TruthBedWriter` with a
+  `TruthDB` writer that batches inserts in-memory and flushes per
+  chromosome (matching Phase 5's chromosome-streaming model). Keep
+  `dump_truth_bed(db, sample_id, out_path)` as the back-compat
+  derivation. Default at small `n` can stay BED-files-per-person; at
+  large `n` the DB is the canonical store and BEDs derive on demand.
+- [ ] **Refactor admixture-mode ancestry writer** to write to
+  `ancestry_segments` instead of per-person BED files. Same
+  derivation helper.
+- [ ] **Manifest.** Top-level fields move into `manifest_kv`. The
+  `out/manifest.json` file remains for back-compat (small cohorts) but
+  is generated from the DB at run end.
+- [ ] **Variant-scan integration (optional).** Extend
+  `nextflow_pipeline/bin/scan_variant.py` so it can read truth events
+  for a sample directly from `cohort.db` instead of opening a per-
+  person BED. Useful for caller-grading workflows at scale.
+- [ ] **Tests.** Round-trip a small synthetic cohort through SQLite
+  and assert `dump_truth_bed` output matches what the M11 BED writer
+  produced directly. Concurrent-read test: 8 parallel processes
+  query different sample IDs, assert no `database is locked` errors
+  in WAL mode.
+- [ ] **Docs.** TUTORIAL §9 (when each path activates),
+  IMPLEMENTATION_PLAN architecture diagram, README Output layout.
+
+### Open questions for review
+
+- Should the DB be the primary deliverable or a complement to BED
+  files? Recommend: **DB is canonical**, BED derivation is on-demand.
+  Users who want the old layout get it via a `--dump-truth-beds`
+  flag at run end.
+- Do we ship SQL helper views for common queries (e.g.
+  `golden_per_sample_chrom`)? Probably yes, in a separate
+  `synthetic_people/scripts/cohort_db.sql` reference file.
 
 ---
 
