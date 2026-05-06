@@ -357,7 +357,20 @@ cohort BCF. This is the architectural shift that unblocks the 100k
 stretch target — the in-memory phases stop scaling around `n ≈ 5 000`
 even with Phase 3's dense matrix.
 
-**Branch:** `perf/phase5-cohort-bcf`
+The phase ships in two PRs:
+
+- **Phase 5a — `perf/phase5-cohort-bcf`**: BCF writer module +
+  `--mode {per-person, cohort, both}` flag. The cohort BCF gets
+  written from the in-memory cohort_sites at the end of the overlay
+  phase; `--mode cohort` skips the per-person fan-out. The streaming
+  refactor and per-person-from-BCF derivation are deferred to 5b so
+  this PR stays reviewable.
+- **Phase 5b — `perf/phase5b-streaming` (planned)**: chromosome-by-
+  chromosome streaming refactor (no in-memory cohort_sites accumulator),
+  per-person derivation via `bcftools view -s`, resume contract via
+  `cohort.meta.json`. Without 5b, 5a still bypasses the per-person
+  fork-pool RAM amplification (`--mode cohort` skips fan-out
+  entirely), which is a meaningful scale unlock on its own.
 
 ### Why BCF (not SQLite, not Parquet)
 
@@ -389,28 +402,51 @@ Phase 6.
   (`cohort.meta.json`) listing those parameters lets us reject a
   cohort BCF that doesn't belong to this run.
 
-### Tasks
+### Phase 5a tasks (BCF deliverable + `--mode` flag)
 
-- [ ] **Pick the on-disk layout.** One of:
-  - `out/cohort/cohort.bcf` — single multi-sample file, all
-    chromosomes. Simpler resume contract; one tabix index.
-  - `out/cohort/cohort.chr<N>.bcf` — per-chromosome split. Pairs
-    naturally with the chromosome-streaming simulator and matches the
-    1000G Phase 3 layout downstream tools already expect.
-  - **Recommend the per-chromosome split** for parity with 1000G and
-    for trivially-parallel per-person derivation.
+- [x] **Pick the on-disk layout.** Resolved: single
+  `out/cohort/cohort.bcf` with a CSI index. Per-chromosome split
+  deferred to 5b once the streaming refactor lands and per-chromosome
+  files become a natural unit; for 5a a single file is simpler and
+  matches what `--mode cohort` produces in one pass.
+- [x] **Add a BCF writer.** Resolved: `subprocess.Popen(["bcftools",
+  "view", "-O", "b", "-"], stdin=PIPE)`. pysam isn't on the
+  dependency tree — msprime / tskit / stdpopsim don't pull it in,
+  and adding it is a meaningful install-time cost (its own htslib
+  build with C extensions). `syntheticgen/bcf_writer.py` follows the
+  same Popen pattern `writer.py` uses for `bgzip -c`.
+- [x] **`--mode {per-person, cohort, both}` flag.** Default
+  `per-person` (zero behaviour change for existing users). `cohort`
+  writes the BCF and skips per-person fan-out; `both` writes both
+  deliverables.
+- [x] **Progress logging on long phases.** Throttled (~5 s cadence)
+  heartbeat lines during the cohort BCF write loop and the per-person
+  fan-out, so a multi-hour 100k-sample run has visible progress.
+- [x] **Tests** — `tests/test_bcf_writer.py` (BCF round-trip,
+  per-sample extraction, header shape, arg validation) and
+  `tests/test_cli_modes.py` (each of the three modes lands the right
+  artefacts and manifest fields). Both gate on bcftools/tabix/bgzip
+  on PATH; the cli-mode tests additionally gate on msprime + stdpopsim.
+- [x] **Docs** — README §Performance describes the flag and the
+  manifest-output table; TUTORIAL §9.3 walks through the three modes
+  and the `bcftools view -s` per-person derivation pattern; §9.4
+  documents the progress-logging cadence.
+
+### Phase 5b tasks (streaming refactor + per-person derivation)
+
 - [ ] **Stream chromosome-by-chromosome in `simulate_cohort`.** No
   global `cohort_sites` list. For each chromosome: simulate → apply
   overlays in-RAM (one chromosome's sites is small) → write BCF →
   free → next chromosome. Determinism preserved by the existing
   per-chromosome seed derivation from Phase 1.
-- [ ] **Add a BCF writer.** Two viable paths:
-  - `pysam` (already pulled in transitively via msprime / tskit) —
-    direct, fast, no subprocess overhead.
-  - `subprocess.Popen(["bcftools", "view", "-O", "b"], stdin=PIPE)`
-    streaming a text VCF in. No new Python dep, slightly slower.
-  - **Recommend pysam if the dep tree confirms it's already
-    importable.** Falls back to the bcftools-pipe form if not.
+- [ ] **Per-chromosome BCF layout** when streaming —
+  `out/cohort/cohort.chr<N>.bcf` files alongside or replacing the
+  single-file 5a layout. Pairs naturally with 1000G's per-chromosome
+  shape.
+- [ ] **Per-person derivation from cohort BCF.** Replace today's
+  in-memory per-person fan-out (which uses `cohort_sites` directly)
+  with `bcftools view -s SAMPLE_ID -Oz` against the cohort BCF.
+  Trivially parallel across `--workers`.
 - [ ] **Write a resume contract.** `out/cohort/cohort.meta.json`
   records `seed`, `chromosomes`, `n_people`, `demo_model`,
   `population`, `chr_length_mb`, plus a list of which chromosome
