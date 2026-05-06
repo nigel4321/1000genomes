@@ -147,17 +147,17 @@ downstream loops.
 
 **Branch:** `perf/phase3-genotype-matrix`
 
-> **Status — partly superseded by Phase 5.** The measure-first task is
-> done and validated the underlying problem (gts share is 60–87% of
-> peak RSS at `n = 200 / 500 / 1000`). The *dense numpy refactor*
-> below buys roughly one order of magnitude over `list[str]`, taking
-> the in-RAM cap from `n ≈ 500` to `n ≈ 5 000` — useful but not enough
-> for the 100k stretch target. Phase 5 (disk-backed cohort BCF)
-> reaches 100k+ directly. If the priority is scale, **skip the dense
-> refactor and go to Phase 5**. If the priority is still-in-RAM speed
-> for sub-1000 cohorts, the dense refactor remains valid; the
-> generator and `carriers[i]` tasks below survive into Phase 5
-> regardless.
+> **Status — skipped in favour of Phase 5.** The measure-first task
+> is done and validated the underlying problem (gts share is 60–87%
+> of peak RSS at `n = 200 / 500 / 1000`). The *dense numpy refactor*
+> below was confirmed during the Phase 5 strategy review to **not be
+> implemented** — Phase 5's disk-backed cohort BCF reaches 100k+
+> directly, and a transitional in-RAM dense matrix would mean two big
+> data-shape changes in a row. The `person_records_from_cohort`
+> generator and `carriers[i]` pre-bucketing tasks listed below
+> survive into Phase 5 where they map naturally onto the chromosome-
+> streaming model; the dense-matrix tasks are kept here for the
+> historical record only.
 
 > **Measure before refactoring.** CPython interns short repetitive
 > strings (`"0|0"`, `"0|1"`, etc.), so the projected ~1.25 GB number
@@ -425,9 +425,12 @@ Phase 6.
     small cohorts).
   - `--mode cohort` — ship only the cohort BCF (sane default for
     large cohorts; per-person can still be derived later).
-  - `--mode both` — write both. Default depends on `--n`: per-person
-    for `n ≤ 1 000`, cohort-only above. Threshold tunable via
-    `--per-person-threshold`.
+  - `--mode both` — write both.
+  - **Default: `per-person`** (locked in during plan review). No
+    automatic threshold switch — users running large cohorts pass
+    `--mode cohort` explicitly, which keeps behaviour predictable
+    and avoids surprise about which deliverables a given run
+    produced.
 - [ ] **Pre-bucket per-person carriers** (survives from Phase 3).
   When deriving per-person VCFs, pre-build `carriers[i] =
   list_of_site_indices` so each person's walk is O(records this
@@ -478,8 +481,9 @@ Phase 6.
 - Per-chromosome BCFs vs. one-big-BCF: are there downstream tools that
   prefer one shape? 1000G ships per-chromosome; gnomAD ships per-
   chromosome. Recommend per-chromosome.
-- Threshold for default `--mode`: `n=1 000` is a guess; revisit once
-  per-person derivation timings are measured.
+- ~~Threshold for default `--mode`~~ resolved: default is
+  `per-person` with no threshold; large-cohort users opt in via
+  `--mode cohort`.
 
 ---
 
@@ -543,18 +547,17 @@ downstream "grade caller per-sample" workflow.
     value_json TEXT NOT NULL
   );
   ```
-- [ ] **Refactor `truth.py`.** Replace `TruthBedWriter` with a
-  `TruthDB` writer that batches inserts in-memory and flushes per
-  chromosome (matching Phase 5's chromosome-streaming model). Keep
-  `dump_truth_bed(db, sample_id, out_path)` as the back-compat
-  derivation. Default at small `n` can stay BED-files-per-person; at
-  large `n` the DB is the canonical store and BEDs derive on demand.
-- [ ] **Refactor admixture-mode ancestry writer** to write to
-  `ancestry_segments` instead of per-person BED files. Same
-  derivation helper.
-- [ ] **Manifest.** Top-level fields move into `manifest_kv`. The
-  `out/manifest.json` file remains for back-compat (small cohorts) but
-  is generated from the DB at run end.
+- [ ] **Extend `truth.py` with a parallel DB writer.** Keep
+  `TruthBedWriter` as the canonical path; add a `TruthDBWriter` that
+  accepts the same events and inserts into `truth_events`. Run both
+  in tandem when `--cohort-db` is set. Batches inserts in-memory and
+  flushes per chromosome (matching Phase 5's chromosome-streaming
+  model).
+- [ ] **Extend admixture ancestry writer similarly.** BED files stay;
+  the DB gets a parallel feed gated by `--cohort-db`.
+- [ ] **Manifest.** Top-level fields stay in `out/manifest.json`. The
+  DB's `manifest_kv` is a mirror for SQL-friendly access, populated
+  at run end from the same data.
 - [ ] **Variant-scan integration (optional).** Extend
   `nextflow_pipeline/bin/scan_variant.py` so it can read truth events
   for a sample directly from `cohort.db` instead of opening a per-
@@ -569,10 +572,13 @@ downstream "grade caller per-sample" workflow.
 
 ### Open questions for review
 
-- Should the DB be the primary deliverable or a complement to BED
-  files? Recommend: **DB is canonical**, BED derivation is on-demand.
-  Users who want the old layout get it via a `--dump-truth-beds`
-  flag at run end.
+- ~~DB primary or complement to BED files~~ resolved: **DB is a
+  complement, not canonical** (locked in during plan review). BED
+  files remain the default deliverable; the DB is an additional
+  output that downstream tooling can opt into. Per-person BEDs at
+  100k samples remain a filesystem-stress problem, but that's a
+  scale tradeoff users opt into rather than a default behaviour
+  change.
 - Do we ship SQL helper views for common queries (e.g.
   `golden_per_sample_chrom`)? Probably yes, in a separate
   `synthetic_people/scripts/cohort_db.sql` reference file.
