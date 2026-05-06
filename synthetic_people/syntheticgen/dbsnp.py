@@ -74,7 +74,17 @@ def load_rsid_pool(vcf_path: Path,
                 if len(ref) > 50:
                     continue
                 for a in alt.split(","):
-                    if a.startswith("<") or len(a) > 50:
+                    # Skip:
+                    # - empty / "." ALT — VCF spec forbids GT references
+                    #   to a non-existent allele, but if we inject such
+                    #   a record while keeping the cohort GT block we
+                    #   land "1|0" calls against ALT="." and bcftools
+                    #   stats on the resulting per-person VCF crashes
+                    #   with "Requested allele outside valid range".
+                    # - symbolic ALT — handled by the SV path.
+                    # - long indels — keep records writeable through
+                    #   the standard biallelic record writer.
+                    if not a or a == "." or a.startswith("<") or len(a) > 50:
                         continue
                     out.append({
                         "chrom": c,

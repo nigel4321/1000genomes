@@ -119,7 +119,12 @@ def load_highlighted_candidates(clinvar_vcf: Path,
                 continue
             # Highlighted variants stay single-alt: the "one clinically-
             # highlighted variant per person" concept is inherently one alt.
-            if "," in alt or alt.startswith("<") or \
+            #
+            # Empty / "." ALT records are also dropped — injecting one
+            # while keeping the cohort GT block would land "1|0" against
+            # ALT=".", which is invalid VCF and crashes downstream
+            # bcftools stats with "Requested allele outside valid range".
+            if "," in alt or not alt or alt == "." or alt.startswith("<") or \
                     len(ref) > 50 or len(alt) > 50:
                 continue
             out.append({
@@ -188,7 +193,9 @@ def load_clinvar_index(clinvar_vcf: Path,
                 # Multi-allelic sites: emit one row per alt so each is
                 # individually injectable as a biallelic record.
                 for a in alt.split(","):
-                    if a.startswith("<") or len(a) > 50:
+                    # See `load_candidates` for the rationale on the
+                    # empty / "." ALT skip.
+                    if not a or a == "." or a.startswith("<") or len(a) > 50:
                         continue
                     out.append({
                         "chrom": c,
