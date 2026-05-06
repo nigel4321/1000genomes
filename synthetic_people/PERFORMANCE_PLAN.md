@@ -618,6 +618,162 @@ bottleneck at 1M is the writer side — see Phase 5d below.
 
 ---
 
+## Phase 5e — within-chromosome parallel extraction over a shared tree sequence
+
+**Status:** planned, not started. Plan only — implementation gated on
+review.
+
+**Goal:** bound peak RAM at one msprime tree sequence per run
+regardless of `--workers`. After Phase 5c made cohort-sites RAM
+negligible, msprime's tree sequence is the central remaining RAM
+cost at any non-trivial cohort size — and today's
+"one-worker-per-chromosome" parallelism multiplies it by the worker
+count, OOMing on workstation-class hardware at cohort sizes msprime
+itself could simulate fine.
+
+**Branch (when implemented):** `perf/phase5e-shared-tree-extraction`
+
+### Why each worker holds its own tree today
+
+The parallelism is sliced *across chromosomes*, not within one.
+Worker 1 builds chr1's full tree sequence (all n samples, full
+chromosome length); worker 2 builds chr2's full tree (also n
+samples). Each worker is doing different work — there's no
+redundancy — but each holds its own multi-GB tree sequence
+concurrently, so peak system RAM is:
+
+```
+peak system RAM ≈ workers × tree_sequence_size + ~1-2 GB process overhead
+```
+
+For `n=3000 × 70 Mb`, tree-sequence size is ~3-5 GB; four parallel
+workers OOM a 16 GB host. This was the user-reported failure at
+`--n 3000 --chromosomes 1-22 --chr-length-mb 70` after Phase 5c
+landed.
+
+### Proposed structure
+
+1. Parent process simulates **one** chromosome's tree sequence (n
+   samples, full chromosome length) — msprime is single-threaded
+   internally, so running it serially in the parent matches today's
+   per-chromosome cost.
+2. Parent forks N workers via Linux's copy-on-write semantics.
+   Workers inherit the parent's tree sequence in shared memory —
+   no per-worker copy.
+3. Each worker handles a different sample slice (samples
+   `0..n/W`, `n/W..2n/W`, …), iterating variants for its slice and
+   writing its portion of the chromosome's records to a per-worker
+   intermediate.
+4. After workers finish, merge their outputs into the per-chrom BCF
+   in genome order (`bcftools concat` or comparable join).
+5. Parent frees the tree sequence; loop to next chromosome.
+
+### Why it works
+
+tskit's tree sequence is mostly C-level allocations — raw tables
+(`NodeTable`, `EdgeTable`, `MutationTable`, `SiteTable`) and numpy
+buffers. Fork-COW shares these cleanly because workers read but
+don't write. Per-worker incremental RAM is the small Python
+overhead plus per-variant wrapper objects (which dirty COW pages
+but are bounded). New memory model:
+
+```
+peak system RAM ≈ 1 × tree_sequence_size
+                + workers × ~100 MB
+                + ~1-2 GB process overhead
+```
+
+At `n=3000 × 70 Mb` that's ~3-5 GB regardless of `--workers`, vs
+~12-20 GB pre-5e.
+
+### What we lose
+
+Simulation goes serial across chromosomes — only one tree sequence
+is ever being built at a time. Today's parallel-chromosome model
+finishes faster *when RAM allows it* because msprime simulation is
+the dominant per-chromosome cost (~5× the extraction phase). Wall
+time tradeoff:
+
+| Path | Wall time | RAM |
+|---|---|---|
+| Pre-5e parallel chromosomes (when RAM allows) | fastest | OOMs at n=3000+ on 16-32 GB hosts |
+| Phase 5e (this) | ~3-5× slower than parallel-chromosome ideal | bounded at 1 × tree sequence |
+| `--workers 1` (current OOM workaround) | ~22× slower than parallel-chromosome ideal | 1 × tree sequence |
+
+5e is significantly faster than `--workers 1` (parallel extraction
+inside one chromosome at a time) and bounded-RAM, at the cost of
+being slower than parallel-chromosome when the host has the RAM.
+There's no good way to recover the parallel-chromosome speed
+without paying its RAM cost; that path stays available behind a
+flag if a user has the RAM and wants the wall-time win.
+
+### Tasks (when implementation starts)
+
+- [ ] **Refactor `coalescent.simulate_cohort_iter`** along the
+  structure above — simulate in parent, fork extractor pool, merge
+  per-worker outputs into the per-chrom BCF.
+- [ ] **`admixture.simulate_cohort` mirror.** The admixture path
+  uses `BinaryMutationModel` and emits per-person ancestry segments
+  alongside cohort sites; local-ancestry tracking interacts with
+  the tree sequence walk, so the refactor is more delicate but
+  follows the same principle.
+- [ ] **Tests.**
+  - Determinism: same seed → same per-chrom BCF byte-for-byte
+    regardless of `--workers`. Sample slices split deterministically;
+    merge order is fixed.
+  - Memory bound: regression test that runs at moderate n and
+    asserts peak RSS scales with one tree sequence (not workers ×
+    tree sequence).
+  - End-to-end: the user's failing command (`--n 3000 --chromosomes
+    1-22 --chr-length-mb 70`) completes on a 32 GB host.
+- [ ] **Re-measure** at the configurations 5c was measured against
+  (`n=500 / 3000 / 10 000`) so the comparison is direct.
+- [ ] **Docs** — README + TUTORIAL: clarify that `--workers` now
+  controls within-chromosome parallelism (sample-slice extraction),
+  not across-chromosome simulation; chromosomes simulate one at a
+  time. Note that hosts with enough RAM for parallel chromosome
+  simulation can opt into the old behaviour via a separate flag
+  if we keep it.
+
+### What this means for `--workers`
+
+After 5e, `--workers` semantics change from "parallel chromosomes"
+to "parallel sample-slice extractors within one chromosome at a
+time". For a fixed `--n`, doubling workers no longer doubles peak
+RAM — it just speeds up the (already-cheap) extraction phase. The
+auto-derate-workers idea that surfaced as a stopgap during the 5c
+discussion falls away because RAM stops scaling with `--workers`.
+
+### Open questions for review
+
+- **Per-worker output format.** Per-worker text-VCF chunks merged
+  via `bcftools concat`, or per-worker pickle of records merged in
+  the parent? Concat is simpler and matches the existing BCF
+  writer; pickle keeps everything in Python and avoids the extra
+  disk write. Lean toward concat for parity with 5b's pipeline.
+- **Sample-slice vs position-slice.** Sample-slice gives equal
+  work per worker assuming roughly uniform allele frequencies;
+  position-slice gives genome-ordered output but unequal work.
+  Recommend sample-slice because msprime's variant iteration is
+  deterministic and equal slices fall out cleanly from the tree
+  sequence's sample list. Sample-slice also fits admixture's
+  per-person ancestry segments naturally (each worker emits its own
+  slice's ancestry).
+- **Keep parallel-chromosome path as opt-in?** Users with 64+ GB
+  hosts and large chromosome counts get the old wall-time win for
+  free today. Consider a `--parallel-chromosomes` flag that retains
+  the pre-5e behaviour for those users; default off.
+
+### Relationship to Phase 5d
+
+Orthogonal axis. 5d (pysam-based direct binary BCF write) addresses
+the *writer* throughput at n=1M+. 5e addresses the *simulation*
+RAM at n=3000+. Both real follow-ups; 5e is more urgent because
+it unblocks workstation-class users *now*, whereas 5d only matters
+for cluster-class n.
+
+---
+
 ## Phase 5d — direct binary BCF writes (path to n=1M+)
 
 **Goal:** get past the writer-side bottleneck that emerges once
