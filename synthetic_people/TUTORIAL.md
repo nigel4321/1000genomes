@@ -800,9 +800,12 @@ bcftools view -s HG12345 -Oz \
 tabix -p vcf out/person_HG12345.vcf.gz
 ```
 
-The manifest's `output_mode` field records which mode produced the
-run — useful for downstream tooling that needs to know whether to
-look for `people[]` or `cohort_bcf` / `samples[]`.
+The manifest's `shape` field records which `--mode` produced the
+run. `samples[]` is always present at the top level (any mode) so
+listing the cohort doesn't need a per-mode code path; `people[]`
+appears in `per-person` and `both`; `cohort_bcfs[]` appears in
+`cohort` and `both` (a list — singleton in 5a, populated with
+per-chromosome paths once Phase 5b lands).
 
 ### 9.4 Progress logging on long runs
 

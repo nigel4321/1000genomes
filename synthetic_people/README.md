@@ -348,7 +348,7 @@ out/
 ├── cohort/              # (--mode cohort | both): single multi-sample BCF
 │   ├── cohort.bcf       #   genotype matrix for the whole cohort
 │   └── cohort.bcf.csi   #   htslib-native index — `bcftools view -s …` ready
-├── manifest.json        # output_mode, per-person summary, cohort_bcf path
+├── manifest.json        # shape, samples[], per-person summary, cohort_bcfs path list
 ├── ancestry/            # admixture mode only: per-person local-ancestry BEDs
 │   ├── person_0001.bed
 │   └── ...
@@ -371,9 +371,14 @@ Which artefacts land depends on `--mode`:
 
 | `--mode` | per-person VCFs | `cohort/cohort.bcf` | manifest fields |
 |---|---|---|---|
-| `per-person` (default) | yes | — | `output_mode=per-person`, `people[]` |
-| `cohort` | — | yes | `output_mode=cohort`, `cohort_bcf`, `samples[]`, no `people[]` |
-| `both` | yes | yes | `output_mode=both`, `cohort_bcf`, `people[]` |
+| `per-person` (default) | yes | — | `shape=per-person`, `samples[]`, `people[]` |
+| `cohort` | — | yes | `shape=cohort`, `samples[]`, `cohort_bcfs[]`, no `people[]` |
+| `both` | yes | yes | `shape=both`, `samples[]`, `cohort_bcfs[]`, `people[]` |
+
+The top-level `samples[]` list always lands so a downstream tool
+wanting "every sample ID" reads one field regardless of `--mode`.
+`cohort_bcfs` is a list (singleton in 5a) so the consumer code path
+doesn't change when Phase 5b lands per-chromosome BCFs.
 
 To derive a per-person VCF from a cohort BCF later (e.g. when `--mode
 cohort` was used to keep memory bounded on a 100k-person run):

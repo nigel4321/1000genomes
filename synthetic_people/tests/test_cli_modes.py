@@ -13,7 +13,7 @@ What we're guarding against:
 
 - ``--mode per-person`` (the default) must remain byte-equivalent to
   today: no cohort/ directory should appear, manifest should not
-  carry a ``cohort_bcf`` field. A regression here would surprise
+  carry a ``cohort_bcfs`` field. A regression here would surprise
   every existing user.
 - ``--mode cohort`` must skip per-person fan-out entirely and emit a
   cohort BCF whose per-sample columns match the cohort the
@@ -102,13 +102,19 @@ class CliModePerPersonTest(unittest.TestCase):
         self.assertFalse(cohort_dir.exists(),
                          f"unexpected cohort dir at {cohort_dir}")
 
-    def test_manifest_marks_output_mode(self):
+    def test_manifest_marks_shape(self):
         manifest = json.loads(
             (self.tmpdir / "manifest.json").read_text())
-        self.assertEqual(manifest.get("output_mode"), "per-person")
-        self.assertNotIn("cohort_bcf", manifest)
+        self.assertEqual(manifest.get("shape"), "per-person")
+        self.assertNotIn("cohort_bcfs", manifest)
         # `people` list still populated as before.
         self.assertEqual(len(manifest["people"]), 3)
+        # Top-level `samples` list now lands in every mode so callers
+        # get one code path for "list of sample IDs" lookup.
+        self.assertEqual(
+            manifest["samples"],
+            [p["sample_id"] for p in manifest["people"]],
+        )
 
 
 @unittest.skipUnless(
@@ -149,8 +155,13 @@ class CliModeCohortTest(unittest.TestCase):
     def test_manifest_marks_cohort_mode(self):
         manifest = json.loads(
             (self.tmpdir / "manifest.json").read_text())
-        self.assertEqual(manifest.get("output_mode"), "cohort")
-        self.assertEqual(manifest.get("cohort_bcf"), "cohort/cohort.bcf")
+        self.assertEqual(manifest.get("shape"), "cohort")
+        # `cohort_bcfs` is a list (forward-compatible with Phase 5b's
+        # per-chromosome BCF split — list of one in 5a, list of N in
+        # 5b without changing consumer code).
+        self.assertEqual(
+            manifest.get("cohort_bcfs"), ["cohort/cohort.bcf"],
+        )
         # No per-person list in cohort mode.
         self.assertNotIn("people", manifest)
         # Sample IDs are recorded so a downstream `bcftools view -s`
@@ -173,7 +184,7 @@ class CliModeCohortTest(unittest.TestCase):
     "needs bcftools/tabix/bgzip + msprime + stdpopsim",
 )
 class CliModeBothTest(unittest.TestCase):
-    """Both deliverables. Manifest carries cohort_bcf + people list;
+    """Both deliverables. Manifest carries cohort_bcfs + people list;
     the BCF and per-person VCFs were generated from the same cohort
     so their sample IDs and record counts line up."""
 
@@ -198,9 +209,16 @@ class CliModeBothTest(unittest.TestCase):
     def test_manifest_carries_both(self):
         manifest = json.loads(
             (self.tmpdir / "manifest.json").read_text())
-        self.assertEqual(manifest.get("output_mode"), "both")
-        self.assertEqual(manifest.get("cohort_bcf"), "cohort/cohort.bcf")
+        self.assertEqual(manifest.get("shape"), "both")
+        self.assertEqual(
+            manifest.get("cohort_bcfs"), ["cohort/cohort.bcf"],
+        )
         self.assertEqual(len(manifest["people"]), 3)
+        # Top-level samples mirrors the per-person list's IDs in order.
+        self.assertEqual(
+            manifest["samples"],
+            [p["sample_id"] for p in manifest["people"]],
+        )
 
     def test_bcf_samples_match_per_person_files(self):
         bcf = self.tmpdir / "cohort" / "cohort.bcf"

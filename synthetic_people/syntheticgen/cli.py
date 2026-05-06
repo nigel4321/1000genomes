@@ -839,12 +839,13 @@ def main(argv: list[str] | None = None) -> int:
             "build": args.build,
             "n_people": args.n,
             "mode": manifest_mode,
-            "output_mode": "cohort",
+            "shape": "cohort",
             "chromosomes": chromosomes,
             "seed": args.seed,
             "samples": sample_ids,
-            "cohort_bcf": str(
-                cohort_bcf_path.relative_to(args.output_dir)),
+            "cohort_bcfs": [
+                str(cohort_bcf_path.relative_to(args.output_dir))
+            ],
         }
         if args.admixture:
             manifest["ancestry_proportions"] = {
@@ -990,14 +991,21 @@ def main(argv: list[str] | None = None) -> int:
         "build": args.build,
         "n_people": args.n,
         "mode": mode,
-        "output_mode": args.mode,
+        "shape": args.mode,
         "chromosomes": chromosomes,
         "seed": args.seed,
+        # Always emit the flat list of sample IDs at the top level so a
+        # downstream tool wanting "give me every sample" doesn't need a
+        # different code path per --mode value (cohort returns
+        # `samples`; per-person/both used to require iterating
+        # `people[*].sample_id`).
+        "samples": sample_ids,
         "people": manifest_people,
     }
     if cohort_bcf_path is not None:
-        manifest["cohort_bcf"] = str(
-            cohort_bcf_path.relative_to(args.output_dir))
+        manifest["cohort_bcfs"] = [
+            str(cohort_bcf_path.relative_to(args.output_dir))
+        ]
     if args.admixture:
         manifest["ancestry_proportions"] = {
             "EUR": args.eur_frac,

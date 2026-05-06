@@ -432,6 +432,16 @@ Phase 6.
   and the `bcftools view -s` per-person derivation pattern; §9.4
   documents the progress-logging cadence.
 
+### Phase 5a-completed manifest task
+
+- [x] **Manifest extension.** `shape` (`per-person` / `cohort` /
+  `both`) records which `--mode` produced the run; top-level
+  `samples[]` always present so callers don't need a per-mode path
+  for "list every sample"; `cohort_bcfs` is a list (singleton in 5a;
+  populated with per-chromosome paths once 5b's streaming refactor
+  lands). Per-person `people[]` entries only emitted when the
+  per-person fan-out ran.
+
 ### Phase 5b tasks (streaming refactor + per-person derivation)
 
 - [ ] **Stream chromosome-by-chromosome in `simulate_cohort`.** No
@@ -442,41 +452,22 @@ Phase 6.
 - [ ] **Per-chromosome BCF layout** when streaming —
   `out/cohort/cohort.chr<N>.bcf` files alongside or replacing the
   single-file 5a layout. Pairs naturally with 1000G's per-chromosome
-  shape.
+  shape. Surfaces in the manifest as `cohort_bcfs[]` populated with
+  one entry per chromosome (the list shape is already in place from
+  5a).
 - [ ] **Per-person derivation from cohort BCF.** Replace today's
   in-memory per-person fan-out (which uses `cohort_sites` directly)
   with `bcftools view -s SAMPLE_ID -Oz` against the cohort BCF.
-  Trivially parallel across `--workers`.
+  Trivially parallel across `--workers`. The cohort-BCF equivalent
+  of Phase 3's pre-bucketed `carriers[i]` is `bcftools view -s
+  SAMPLE -e 'GT="0/0" || GT="0|0" || GT="./."'`, which bcftools
+  does natively and is what users expect.
 - [ ] **Write a resume contract.** `out/cohort/cohort.meta.json`
   records `seed`, `chromosomes`, `n_people`, `demo_model`,
   `population`, `chr_length_mb`, plus a list of which chromosome
   BCFs are complete. On resume, completed chromosomes skip
   simulation; mismatched parameters force re-simulation with a clear
   message. `--no-resume` overrides for explicit re-runs.
-- [ ] **Per-person derivation step.** New `derive_per_person` action
-  that runs `bcftools view -s SAMPLE_ID -Oz` per sample against the
-  cohort BCF. Trivially parallel across `--workers`. Add a `--mode`
-  selector:
-  - `--mode per-person` — emit per-person VCFs (today's default for
-    small cohorts).
-  - `--mode cohort` — ship only the cohort BCF (sane default for
-    large cohorts; per-person can still be derived later).
-  - `--mode both` — write both.
-  - **Default: `per-person`** (locked in during plan review). No
-    automatic threshold switch — users running large cohorts pass
-    `--mode cohort` explicitly, which keeps behaviour predictable
-    and avoids surprise about which deliverables a given run
-    produced.
-- [ ] **Pre-bucket per-person carriers** (survives from Phase 3).
-  When deriving per-person VCFs, pre-build `carriers[i] =
-  list_of_site_indices` so each person's walk is O(records this
-  person actually carries) instead of O(cohort sites). On the
-  cohort-BCF path the equivalent is `bcftools view -s SAMPLE -e
-  'GT="0/0" || GT="0|0" || GT="./."'`, which is what bcftools does
-  natively and what users would expect.
-- [ ] **Manifest extension.** Add `cohort_bcf` (path or list of paths
-  per chromosome) and `mode` (`per-person` / `cohort` / `both`)
-  fields. Per-person path entries only present if derivation ran.
 - [ ] **Re-measure.** Run `scripts/profile_memory.py` (or a Phase 5
   equivalent) at `n = 100, 1 000, 10 000, 100 000` with the new path.
   Record the realised peak RSS and total wall time alongside the
@@ -486,27 +477,23 @@ Phase 6.
   linear in `n × n_sites` because per-person derivation is the new
   dominant cost.
 - [ ] **Tests.**
-  - Round-trip: `simulate_cohort` writes a BCF; `bcftools view -h`
-    parses cleanly; record count matches the in-RAM number we'd
-    have produced.
+  - Round-trip: streamed `simulate_cohort` writes per-chromosome
+    BCFs that `bcftools view -h` parses cleanly with site counts
+    matching the in-RAM 5a path.
   - Determinism: same seed + same flags → byte-identical cohort BCF
-    (modulo the timestamp in the BCF header — strip before
+    set (modulo the timestamp in the BCF header — strip before
     comparing).
   - Per-person derivation: `bcftools view -s SAMPLE` from the cohort
-    BCF produces the same record set as the Phase 1-2 in-RAM path
-    at the same seed. (May not be byte-identical because BCF→VCF
-    can normalise INFO field order; assert per-record equivalence
-    instead.)
+    BCF produces the same record set as the Phase 5a in-memory
+    fan-out at the same seed. (May not be byte-identical because
+    BCF→VCF can normalise INFO field order; assert per-record
+    equivalence instead.)
   - Resume: run, kill mid-cohort, re-run, confirm the second run
     skips already-completed chromosomes and produces the same final
     output.
-  - `--mode cohort` skips per-person derivation; `--mode both`
-    produces both deliverables.
-- [ ] **Docs.** README Performance section, TUTORIAL §9 ("Performance
-  and scaling"), IMPLEMENTATION_PLAN architecture section. Call out
-  the resume contract, the `--mode` flag, and the per-person-threshold
-  default. Update the "Output layout" tree in README to show the new
-  `cohort/` directory.
+- [ ] **Docs.** Update README Performance / Output layout, TUTORIAL
+  §9.3, IMPLEMENTATION_PLAN architecture section to reflect the
+  per-chromosome BCF layout and the resume contract.
 
 ### Open questions for review
 
