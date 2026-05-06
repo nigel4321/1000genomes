@@ -117,6 +117,31 @@ class PipelineE2ETest(unittest.TestCase):
             self.assertEqual(len(bcft), 2,
                              f"expected 2 samples in bcftools_stats, got {bcft}")
 
+        # PCA: per-VCF JSON should land in results/pca/. The fixture
+        # cohort here is intentionally tiny (3-variant chr15, 1-variant
+        # chr22), well below plot_pca.py's default min-variants gate, so
+        # both files legitimately produce a "too few variants" skip
+        # rather than a real PCA. The point of this assertion is that the
+        # stage *ran* and produced valid JSON — the happy path is
+        # covered exhaustively by tests/test_plot_pca.py with a richer
+        # synthetic cohort.
+        pca_dir = os.path.join(self.outdir, "pca")
+        self.assertTrue(os.path.isdir(pca_dir),
+                        f"missing PCA dir: {pca_dir}")
+        pca_jsons = sorted(
+            f for f in os.listdir(pca_dir) if f.endswith(".pca.json"))
+        self.assertEqual(len(pca_jsons), 2,
+                         f"expected 2 PCA jsons, got {pca_jsons}")
+        for j in pca_jsons:
+            with open(os.path.join(pca_dir, j)) as fh:
+                summary = json.load(fh)
+            # Either a real PCA result or an explicit skip marker — both
+            # are valid runtime outcomes; anything else is a regression.
+            self.assertTrue(
+                "skipped" in summary or "explained_variance_pct" in summary,
+                f"PCA json neither skipped nor populated: {j} → {summary}",
+            )
+
         with open(os.path.join(self.outdir, "qc_report.md")) as fh:
             qc_md = fh.read()
         # Both synthetic files should pass QC cleanly.
