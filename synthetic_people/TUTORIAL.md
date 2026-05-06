@@ -807,7 +807,7 @@ look for `people[]` or `cohort_bcf` / `samples[]`.
 ### 9.4 Progress logging on long runs
 
 The cohort BCF write loop and the per-person fan-out both emit
-throttled (~5 s cadence) heartbeat lines so a multi-hour run has
+throttled (~20 s cadence) heartbeat lines so a multi-hour run has
 visible progress without flooding stderr. You'll see things like:
 
 ```
@@ -815,7 +815,7 @@ visible progress without flooding stderr. You'll see things like:
   person VCFs: 1,234/100,000 written (5/s, elapsed 240s, eta 19000s)
 ```
 
-Small cohorts that finish in under five seconds skip the
+Small cohorts that finish in under twenty seconds skip the
 intermediate logs and just print the final summary.
 
 ---

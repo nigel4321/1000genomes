@@ -299,7 +299,7 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   for large `--n` because it avoids the per-person fork-pool memory
   amplification; per-person stays the default so existing users see
   no behaviour change unless they opt in.
-- Long-running runs print throttled progress lines (~5 s cadence)
+- Long-running runs print throttled progress lines (~20 s cadence)
   during the cohort BCF write and the per-person fan-out — `cohort
   BCF: 12,345/100,000 sites (4,500/s)` and `person VCFs: 1,234/100,000
   written (5/s, elapsed 240s, eta 19000s)` — so a multi-hour 100k run

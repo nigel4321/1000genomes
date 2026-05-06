@@ -802,11 +802,11 @@ def main(argv: list[str] | None = None) -> int:
                 per_chrom_count[s["chrom"]] = \
                     per_chrom_count.get(s["chrom"], 0) + 1
                 now = time.monotonic()
-                # Throttled progress: every ~5 s on long runs, plus a
+                # Throttled progress: every ~20 s on long runs, plus a
                 # final summary at end. Tells the user "still alive,
                 # making progress" without spamming the log on small
                 # cohorts that finish in milliseconds.
-                if now - last_log > 5.0:
+                if now - last_log > 20.0:
                     written = sum(per_chrom_count.values())
                     rate = written / (now - bcf_t0) if now > bcf_t0 else 0
                     print(
@@ -926,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
     use_pool = workers > 1 and args.n > 1
     fanout_t0 = time.monotonic()
     last_progress_log = fanout_t0
-    progress_log_interval = 5.0   # seconds — same cadence as cohort BCF
+    progress_log_interval = 20.0   # seconds — same cadence as cohort BCF
 
     def _maybe_log_progress(done: int) -> None:
         nonlocal last_progress_log
