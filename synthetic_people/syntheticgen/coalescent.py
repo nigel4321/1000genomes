@@ -35,19 +35,48 @@ DEFAULT_CHR_LENGTH_MB = 5.0    # simulated span per chromosome (0 = full)
 # Phase 5f — chunked simulation memory model
 # ---------------------------------------------------------------------------
 # Auto-pick a per-chunk simulation length such that msprime's working
-# memory fits the host. Calibrated empirically: at n=3000 × 70 Mb ×
-# OutOfAfrica_3G09, a single full-chromosome sim's working set was
-# ~12-16 GB on the user's failing run. That works out to about
-# 80 KiB of working memory per (sample × Mb). Constant-Ne msprime
-# (`--demo-model none`) is roughly 5× cheaper because there are no
-# bottleneck spikes in the active-lineage count.
+# memory fits the host. Calibrated against the user-provided
+# ``--profile-memory`` trace from a 16 GB host running the failing
+# config (``--n 3000 --chromosomes 1-22 --chr-length-mb 70``,
+# OutOfAfrica_3G09, 4 auto-workers). The trace showed children RSS
+# climbing to ~16 GB total (4 workers × ~4 GB each) at the
+# auto-picked chunk size of 8.7 Mb. That gives ~153 KiB of working
+# memory per (sample × Mb) at OOA scale — twice my original
+# 80 KiB calibration which was extrapolated from a single
+# full-chromosome OOM observation rather than from a ratio'd
+# measurement at a known chunk size. The previous coefficient
+# under-picked, the host hit its RAM ceiling, and workers
+# swap-thrashed for 46 minutes without progressing. Round 153 up to
+# 160 KiB for a safety margin against demographic models heavier
+# than OOA_3G09.
+#
+# Constant-Ne msprime (`--demo-model none`) is still roughly 5×
+# cheaper because there are no bottleneck spikes in the active-
+# lineage count; the constant scales proportionally.
 #
 # These constants are intentionally pessimistic — better to pick a
 # slightly smaller chunk than the host strictly needs and waste a bit
 # of throughput than to OOM mid-simulation. Users with surprising
 # working memory can override via `--chr-chunk-mb N`.
-CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA = 80 * 1024
-CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_CONSTANT_NE = 16 * 1024
+CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA = 160 * 1024
+CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_CONSTANT_NE = 32 * 1024
+
+# Default safety target for the auto-pick. The previous 50% was the
+# total budget across all workers and the parent process; the trace
+# showed that at 50% the host's RAM ceiling was being hit when model
+# error stacked with parent overhead + ClinVar pool + bcftools
+# subprocesses. 25% leaves headroom for those plus any residual
+# model error.
+DEFAULT_AUTO_PICK_TARGET_FRACTION = 0.25
+
+# When a user requests ``--workers W`` (or it auto-resolves to
+# cpu_count), the auto-pick may have to shrink chunks below a useful
+# size to fit the budget. Below this floor, msprime's per-chunk
+# startup cost starts to dominate the per-chunk simulation time, and
+# the boundary-smoothing benefit erodes. If chunk size would drop
+# below this threshold, we'd rather drop a worker than pick smaller
+# chunks. The auto-derate path checks this.
+CHUNK_AUTO_DERATE_FLOOR_MB = 2.0
 
 # Each chunk simulates a small overlap margin past its declared end so
 # the central region's coalescent context isn't truncated abruptly at
@@ -80,11 +109,13 @@ def estimate_chunk_ram_bytes(n_people: int, chunk_size_mb: float,
     return int(rate * n_people * chunk_size_mb)
 
 
-def auto_pick_chunk_size_mb(n_people: int, length_mb: float,
-                            demo_model: str | None,
-                            available_bytes: int,
-                            workers: int = 1,
-                            target_fraction: float = 0.5) -> float:
+def auto_pick_chunk_size_mb(
+    n_people: int, length_mb: float,
+    demo_model: str | None,
+    available_bytes: int,
+    workers: int = 1,
+    target_fraction: float = DEFAULT_AUTO_PICK_TARGET_FRACTION,
+) -> float:
     """Pick the largest chunk size whose estimated working set fits
     in ``target_fraction × available_bytes / workers``.
 
@@ -110,6 +141,52 @@ def auto_pick_chunk_size_mb(n_people: int, length_mb: float,
     factor = per_worker_target / full_estimate
     chunk_mb = max(1.0, length_mb * factor)
     return chunk_mb
+
+
+def auto_derate_workers(
+    n_people: int, length_mb: float,
+    demo_model: str | None,
+    available_bytes: int,
+    requested_workers: int,
+    target_fraction: float = DEFAULT_AUTO_PICK_TARGET_FRACTION,
+    floor_chunk_mb: float = CHUNK_AUTO_DERATE_FLOOR_MB,
+) -> int:
+    """Possibly downgrade ``requested_workers`` so the auto-picked
+    chunk size stays at or above ``floor_chunk_mb``.
+
+    The user-reported failure mode was 4 parallel workers each
+    holding a ~4 GB tree sequence at the auto-picked chunk size,
+    saturating the host's 16 GB RAM and stalling in swap. Symmetric
+    fix: when a chunk size drops below the floor, reduce workers
+    instead of accepting tiny chunks. Tiny chunks pay msprime's
+    per-chunk startup cost too often and erode the 5f boundary-
+    smoothing benefit; reducing workers preserves chunk size at the
+    cost of less parallelism (which is the right trade-off when
+    RAM is the bound, not CPU).
+
+    Caps at the requested worker count and a floor of 1 — this
+    function never *increases* parallelism. Callers that pass
+    ``requested_workers=1`` get 1 back unconditionally.
+    """
+    if requested_workers <= 1:
+        return 1
+    # Walk down from the requested count; pick the largest worker
+    # count where the per-worker chunk size auto-picks at or above
+    # the floor. The walk is short (≤ cpu_count) so a linear scan
+    # is fine.
+    for w in range(requested_workers, 0, -1):
+        chunk_mb = auto_pick_chunk_size_mb(
+            n_people, length_mb, demo_model, available_bytes, w,
+            target_fraction,
+        )
+        if chunk_mb >= floor_chunk_mb:
+            return w
+    # Even at workers=1 the chunk would be sub-floor. Honour the
+    # request anyway — at workers=1 a smaller chunk is the only way
+    # to make progress without a host RAM upgrade. The CLI prints a
+    # warning at flag-resolution time so the user knows what hit
+    # them.
+    return 1
 
 
 def _require_deps():

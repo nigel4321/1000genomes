@@ -27,11 +27,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen.coalescent import (
+    CHUNK_AUTO_DERATE_FLOOR_MB,
     CHUNK_OVERLAP_FRACTION,
     CHUNK_OVERLAP_MAX_BP,
     CHUNK_OVERLAP_MIN_BP,
     CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_CONSTANT_NE,
     CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA,
+    DEFAULT_AUTO_PICK_TARGET_FRACTION,
+    auto_derate_workers,
     auto_pick_chunk_size_mb,
     estimate_chunk_ram_bytes,
 )
@@ -210,6 +213,119 @@ class ChunkedSimulationParityTest(unittest.TestCase):
         )
         positions = [s["pos"] for s in sites]
         self.assertEqual(len(positions), len(set(positions)))
+
+
+class AutoDerateWorkersTest(unittest.TestCase):
+    """Worker auto-derate landed after the user's 16 GB host stalled
+    with 4 parallel workers each holding a 4 GB tree sequence — the
+    auto-pick had picked an 8.7 Mb chunk to fit 4 workers in 25% of
+    available RAM, but the calibration was 2× off and total RAM
+    actually saturated. The fix: when the auto-pick math is forced
+    to drop below ~2 Mb per chunk to keep all workers in budget,
+    drop a worker instead. Below 2 Mb the per-chunk msprime startup
+    cost dominates the per-chunk simulation cost, and the boundary-
+    smoothing benefit erodes — so the trade-off is *much* better
+    spent on fewer parallel workers than tinier chunks.
+    """
+
+    def test_at_high_ram_workers_unchanged(self):
+        # n=10 × 5 Mb × OOA at 64 GB / 4 workers fits trivially —
+        # all 4 workers can hold their tree sequence in budget, no
+        # derate needed.
+        derated = auto_derate_workers(
+            n_people=10, length_mb=5.0,
+            demo_model="OutOfAfrica_3G09",
+            available_bytes=64 * 1024**3, requested_workers=4,
+        )
+        self.assertEqual(derated, 4)
+
+    def test_users_failing_case_derates(self):
+        # 16 GB host, n=3000, 70 Mb chrom, OOA, 4 workers requested.
+        # With the recalibrated 160 KB / (sample × Mb) and 25%
+        # target, 4 workers each get a 1 GB budget — chunk size
+        # auto-picks at ~2.2 Mb. With 8 workers each gets 0.5 GB,
+        # forcing chunks below 1.1 Mb (under the 2 Mb floor).
+        # The function must derate to keep us at the floor.
+        derated = auto_derate_workers(
+            n_people=3000, length_mb=70.0,
+            demo_model="OutOfAfrica_3G09",
+            available_bytes=16 * 1024**3, requested_workers=8,
+        )
+        self.assertLess(derated, 8)
+        # And a sanity check that the auto-picked chunk size at
+        # the derated worker count IS at or above the floor.
+        chunk_mb = auto_pick_chunk_size_mb(
+            3000, 70.0, "OutOfAfrica_3G09",
+            available_bytes=16 * 1024**3, workers=derated,
+        )
+        self.assertGreaterEqual(chunk_mb, CHUNK_AUTO_DERATE_FLOOR_MB)
+
+    def test_workers_one_returns_one(self):
+        # The function never *increases* parallelism. workers=1 in →
+        # workers=1 out, regardless of host RAM.
+        for ram in (4 * 1024**3, 16 * 1024**3, 256 * 1024**3):
+            self.assertEqual(
+                auto_derate_workers(
+                    n_people=3000, length_mb=70.0,
+                    demo_model="OutOfAfrica_3G09",
+                    available_bytes=ram, requested_workers=1,
+                ),
+                1,
+            )
+
+    def test_extremely_constrained_host_returns_one(self):
+        # Even at workers=1 the chunk would be sub-floor (e.g. n=1M
+        # at 4 GB host). The function honours the request anyway —
+        # at workers=1 a smaller chunk is the only path forward.
+        # The CLI prints a warning at flag-resolution time so the
+        # user sees this case.
+        derated = auto_derate_workers(
+            n_people=1_000_000, length_mb=70.0,
+            demo_model="OutOfAfrica_3G09",
+            available_bytes=4 * 1024**3, requested_workers=4,
+        )
+        self.assertEqual(derated, 1)
+
+
+class CalibrationFromUserTraceTest(unittest.TestCase):
+    """Sanity tests pinning the recalibrated constants against the
+    user's profile-memory trace. The trace showed 4 workers × ~4 GB
+    per tree sequence at chunk_size=8.7 Mb, n=3000, OOA_3G09 —
+    yielding ~153 KiB/(sample × Mb). We pessimistically rounded up
+    to 160 KiB/(sample × Mb) and tightened the safety target to
+    25% of available RAM. These tests ensure those choices stick.
+    """
+
+    def test_ooa_coefficient_matches_user_trace(self):
+        # Per-(sample × Mb) cost should be 160 KiB.
+        self.assertEqual(
+            CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA, 160 * 1024)
+
+    def test_default_target_fraction_is_one_quarter(self):
+        self.assertEqual(DEFAULT_AUTO_PICK_TARGET_FRACTION, 0.25)
+
+    def test_users_failing_config_picks_a_safe_chunk_at_workers_1(self):
+        # n=3000, 70 Mb, OOA, 16 GB host, --workers 1. With the
+        # recalibrated coefficient + 25% target this should pick
+        # a chunk that fits in 4 GB (= 25% of 16 GB) — about 8.7 Mb,
+        # similar to what 5f's first calibration gave but now backed
+        # by a coefficient that matches reality.
+        chunk_mb = auto_pick_chunk_size_mb(
+            n_people=3000, length_mb=70.0,
+            demo_model="OutOfAfrica_3G09",
+            available_bytes=16 * 1024**3, workers=1,
+        )
+        # Estimate at the picked chunk size should fit in the
+        # 4 GB target.
+        target = 16 * 1024**3 // 4
+        self.assertLessEqual(
+            estimate_chunk_ram_bytes(3000, chunk_mb, "OutOfAfrica_3G09"),
+            target,
+        )
+        # And we expect a substantive chunk size (≥ 5 Mb) — the
+        # whole point of recalibration is to fit the failing config
+        # without dropping to micro-chunks.
+        self.assertGreaterEqual(chunk_mb, 5.0)
 
 
 class ChunkOverlapBoundsTest(unittest.TestCase):

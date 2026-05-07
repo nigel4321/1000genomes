@@ -904,7 +904,7 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--n-background` | [legacy] Shared background site count | `500` |
 | `--af-min` | [legacy] Minimum AF when loading the pool | `0.05` |
 | `--sfs-alpha` | [legacy] Power-law exponent for the SFS | `2.0` |
-| `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`), `1` = serial. Linux only. | `0` |
+| `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`, possibly auto-derated when chunk size would otherwise drop below ~2 Mb to fit), `1` = serial. Linux only. | `0` |
 | `--mode` | [perf] Output shape: `per-person` (default), `cohort` (skip per-person fan-out), or `both`. All three flow through the streamed cohort pipeline — derive per-person VCFs later via `bcftools view -s` against the per-chrom cohort BCFs. | `per-person` |
 | `--no-resume` | [perf] Ignore any existing `cohort.meta.json` + cohort BCFs and start a fresh simulation. Default behaviour resumes a prior run when its params match. | `False` |
 | `--chr-chunk-mb` | [perf] Split each chromosome's msprime simulation into independent sub-chunks of this size (Mb). `0` = auto-pick from `psutil.virtual_memory().available` and `--workers`. Cross-chunk LD is lost (chunks simulate independently); short-range LD within chunks is preserved. | `0` (auto) |

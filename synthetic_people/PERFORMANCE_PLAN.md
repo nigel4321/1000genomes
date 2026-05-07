@@ -823,6 +823,54 @@ top). 5e standalone helps only when one full-chromosome tree
 sequence fits in RAM — for the user's current workload it
 doesn't.
 
+### Phase 5f post-mortem — RAM-model recalibration after the user retest
+
+The first 5f deployment auto-picked an 8.7 Mb chunk size for
+``--n 3000 --chromosomes 1-22 --chr-length-mb 70`` on a 16 GB
+host with auto ``--workers 4``. The user's
+``--profile-memory`` trace showed:
+
+- Children RSS climbing linearly from 0 to **~16 GB** over 100 s
+  (4 workers × ~4 GB tree sequence each at the picked chunk
+  size).
+- The host's RAM ceiling hit at t≈120 s, kernel started
+  swap-thrashing.
+- **No ``chrom X sites yielded`` mark fired** in the entire
+  48-minute run — workers stalled before completing any
+  chromosome.
+
+The first 5f calibration of `80 KiB/(sample × Mb)` came from a
+single full-chromosome OOM observation; the new ratio'd
+measurement at a known chunk size shows the actual cost is
+**~153 KiB/(sample × Mb)** at OOA scale — almost exactly 2×
+under-estimate. Three follow-ups landed:
+
+- **Coefficient: 80 → 160 KiB/(sample × Mb)** for OOA-class
+  demography. Pessimistically rounded up from 153. Constant-Ne
+  scales proportionally (16 → 32 KiB).
+- **Auto-pick safety target: 50% → 25%** of available RAM.
+  Halves the chance that residual model error or unbudgeted
+  overhead (parent process, ClinVar pool, bcftools subprocesses)
+  pushes total over the host ceiling.
+- **`auto_derate_workers` helper.** When the auto-picked chunk
+  size would drop below ~2 Mb at the requested worker count,
+  reduce workers instead. Below 2 Mb the per-chunk msprime
+  startup cost dominates per-chunk simulation cost; better to
+  trade parallelism for chunk size when RAM is the bound, not
+  CPU. Only fires when ``--workers 0`` (auto) — explicit
+  ``--workers N`` is honoured.
+
+After the recalibration, the user's failing config at
+``--workers 1`` should pick a ~10 Mb chunk size with peak ≈ 4 GB,
+fitting comfortably in 16 GB. With auto ``--workers``, the
+derate caps parallelism so the multiplied total stays in budget.
+
+The post-mortem is also a reminder that the calibration constants
+should be re-validated whenever the demographic model catalogue
+changes: a heavier-than-OOA model would push the constant up;
+extreme-cohort runs (n>10k) might need their own coefficient if
+the lineage-tracking overhead scales super-linearly with n.
+
 ---
 
 ## Phase 5e — within-chromosome parallel extraction over a shared tree sequence
