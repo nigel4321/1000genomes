@@ -53,6 +53,7 @@ from .coalescent import (
     DEFAULT_MU,
     DEFAULT_POPULATION,
     DEFAULT_REC_RATE,
+    auto_derate_workers,
     auto_pick_chunk_size_mb,
     simulate_cohort,
     simulate_cohort_iter,
@@ -633,16 +634,38 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     demo_model = (None if args.demo_model.lower() == "none"
                   else args.demo_model)
 
-    # Phase 5f — auto-pick chunk size when not explicitly set. We
-    # query free RAM at run start and divide by `workers` so each
-    # parallel worker holds at most one chunk's tree sequence in its
-    # share of the budget. Explicit `--chr-chunk-mb N > 0` overrides
-    # the auto-pick.
+    # Phase 5f auto-pick (with the post-mortem refinements from the
+    # 16 GB-host failure trace): query free RAM at run start, then
+    # — when `--workers` is on auto — possibly derate the worker
+    # count so the per-worker chunk size stays at or above the
+    # configured floor. Without the derate, a high cpu_count host
+    # forces the auto-pick to shrink chunks below 1 Mb just to fit
+    # all workers in memory simultaneously, which trades useful
+    # parallelism for chunk-startup overhead.
     chunk_size_mb = args.chr_chunk_mb
     if chunk_size_mb <= 0 and not args.legacy_background:
         try:
             import psutil
             available = psutil.virtual_memory().available
+            # Auto-derate workers for this run if the user accepted
+            # the default cpu_count and the chunk that fits at that
+            # parallelism is sub-floor. An explicit --workers N
+            # bypasses the derate so the user's choice is honoured.
+            if args.workers == 0:
+                derated = auto_derate_workers(
+                    n_people=args.n, length_mb=args.chr_length_mb,
+                    demo_model=demo_model, available_bytes=available,
+                    requested_workers=workers,
+                )
+                if derated < workers:
+                    print(
+                        f"  --workers auto-derated from {workers} to "
+                        f"{derated} to keep per-chunk RAM under the "
+                        f"safety target on this host (available RAM "
+                        f"{available / (1024**3):.1f} GB, n={args.n})",
+                        file=sys.stderr,
+                    )
+                    workers = derated
             chunk_size_mb = auto_pick_chunk_size_mb(
                 n_people=args.n, length_mb=args.chr_length_mb,
                 demo_model=demo_model, available_bytes=available,
