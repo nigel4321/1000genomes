@@ -29,7 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen.bcf_writer import CohortBcfWriter
 from syntheticgen.cohort import person_records_from_cohort
-from syntheticgen.cohort_derivation import derive_person_records
+from syntheticgen.cohort_derivation import (
+    derive_person_records,
+    derive_persons_batch,
+)
 from syntheticgen.cohort_sites import carriers_from_dense_gts
 
 
@@ -170,6 +173,148 @@ class CohortDerivationErrorPathTest(unittest.TestCase):
     def test_missing_bcf_raises_runtime_error(self):
         with self.assertRaisesRegex(RuntimeError, "bcftools"):
             derive_person_records(["/nonexistent/cohort.chr22.bcf"], "S1")
+
+
+@unittest.skipUnless(_HAVE_BCFTOOLS, "bcftools not on PATH")
+class DerivePersonsBatchParityTest(unittest.TestCase):
+    """Phase 5g: the batched form must produce the same per-person
+    record lists as the per-person form. The batch path runs one
+    bcftools query per chrom for the whole batch instead of two
+    bcftools subprocesses per (person, chrom) pair."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = Path(tempfile.mkdtemp(prefix="cohort_batch_parity_"))
+        cls.samples = ["alice", "bob", "carol", "dave"]
+        # A mix of all-hom-ref, mixed, and all-carry sites so each
+        # sample exercises a different per-record path through the
+        # batched dispatcher.
+        # Alice (index 0) is hom-ref at every site so she exercises
+        # the empty-list path; the other three samples carry various
+        # mixes so per-record dispatch is well-covered.
+        cls.sites = [
+            _site(1000, "A", "G", ["0|0", "0|1", "1|1", "0|0"],
+                  site_id="rs1"),
+            _site(2000, "C", "T", ["0|0", "0|0", "0|1", "1|0"]),
+            _site(
+                3000, "G", "<DEL>",
+                ["0|0", "0|0", "0|1", "0|1"], site_id="rs2",
+                svtype="DEL", svlen=-500, end=3500, cipos=(-50, 50),
+                clnsig="Pathogenic", clndn="bar",
+            ),
+            _site(4000, "T", "A", ["0|0", "1|1", "0|0", "0|0"]),
+        ]
+        cls.bcf = cls.tmpdir / "cohort.chr22.bcf"
+        with CohortBcfWriter(cls.bcf, "GRCh38", cls.samples) as w:
+            w.write_sites(cls.sites)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_returns_dict_with_one_entry_per_sample(self):
+        out = derive_persons_batch([self.bcf], self.samples)
+        self.assertEqual(set(out.keys()), set(self.samples))
+
+    def test_each_sample_matches_per_person_derivation(self):
+        # Headline contract: per-sample record lists should match the
+        # per-person `derive_person_records` output exactly. If any
+        # field differs, downstream `write_person_vcf` would write a
+        # different per-person VCF, so this is the regression boundary.
+        batched = derive_persons_batch([self.bcf], self.samples)
+        for sid in self.samples:
+            single = derive_person_records([self.bcf], sid)
+            self.assertEqual(
+                len(batched[sid]), len(single),
+                msg=f"record count mismatch for {sid}: "
+                    f"batched={len(batched[sid])} "
+                    f"per-person={len(single)}",
+            )
+            for b, s in zip(batched[sid], single):
+                for key in ("chrom", "pos", "id", "ref", "alts", "gt"):
+                    self.assertEqual(
+                        b[key], s[key],
+                        msg=f"{sid} key={key} batched={b} per-person={s}")
+
+    def test_overlay_metadata_round_trips_in_batch(self):
+        batched = derive_persons_batch([self.bcf], self.samples)
+        # Carol carries the SV record at pos 3000 — every overlay
+        # field should make it through the batched parser the same
+        # way it makes it through the per-person parser.
+        carol_recs = batched["carol"]
+        sv_rec = next(r for r in carol_recs if r["pos"] == 3000)
+        self.assertEqual(sv_rec["svtype"], "DEL")
+        self.assertEqual(sv_rec["svlen"], -500)
+        self.assertEqual(sv_rec["end"], 3500)
+        self.assertEqual(sv_rec["cipos"], (-50, 50))
+        self.assertEqual(sv_rec["clnsig"], "Pathogenic")
+        self.assertEqual(sv_rec["clndn"], "bar")
+
+    def test_all_hom_ref_sample_returns_empty_list(self):
+        batched = derive_persons_batch([self.bcf], self.samples)
+        # Alice is hom-ref at every site — her batched list must be
+        # empty, mirroring the per-person path.
+        self.assertEqual(batched["alice"], [])
+
+    def test_subset_of_samples_works(self):
+        # A batch smaller than the cohort should still produce
+        # correct records for its members.
+        batched = derive_persons_batch([self.bcf], ["bob", "carol"])
+        self.assertEqual(set(batched.keys()), {"bob", "carol"})
+        for sid in ("bob", "carol"):
+            single = derive_person_records([self.bcf], sid)
+            self.assertEqual(len(batched[sid]), len(single))
+
+
+@unittest.skipUnless(_HAVE_BCFTOOLS, "bcftools not on PATH")
+class DerivePersonsBatchMultiChromTest(unittest.TestCase):
+    """Multi-chrom batch derivation preserves the same in-genome-order
+    behaviour as ``derive_person_records``."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = Path(tempfile.mkdtemp(prefix="cohort_batch_multi_"))
+        cls.samples = ["S1", "S2"]
+        cls.bcfs = []
+        for i, chrom in enumerate(("21", "22"), start=1):
+            sites = [_site(1000 * i, "A", "G",
+                           ["0|1", "0|0"],
+                           chrom=chrom, site_id=f"rs{chrom}")]
+            bcf = cls.tmpdir / f"cohort.chr{chrom}.bcf"
+            with CohortBcfWriter(bcf, "GRCh38", cls.samples) as w:
+                w.write_sites(sites)
+            cls.bcfs.append(bcf)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_records_in_chrom_order_per_sample(self):
+        batched = derive_persons_batch(self.bcfs, self.samples)
+        self.assertEqual(
+            [r["chrom"] for r in batched["S1"]], ["21", "22"])
+
+    def test_unrelated_sample_returns_empty_list(self):
+        batched = derive_persons_batch(self.bcfs, self.samples)
+        self.assertEqual(batched["S2"], [])
+
+
+@unittest.skipUnless(_HAVE_BCFTOOLS, "bcftools not on PATH")
+class DerivePersonsBatchEdgeCasesTest(unittest.TestCase):
+    """Defensive contract for empty / error inputs."""
+
+    def test_empty_sample_list_returns_empty_dict(self):
+        # Edge case the caller can hit when batching: a final batch
+        # might be empty if args.n is a multiple of batch_size and
+        # the loop iterates one extra step. The function must not
+        # crash on this.
+        out = derive_persons_batch([], [])
+        self.assertEqual(out, {})
+
+    def test_missing_bcf_raises_runtime_error(self):
+        with self.assertRaisesRegex(RuntimeError, "bcftools"):
+            derive_persons_batch(
+                ["/nonexistent/cohort.chr22.bcf"], ["S1"])
 
 
 if __name__ == "__main__":

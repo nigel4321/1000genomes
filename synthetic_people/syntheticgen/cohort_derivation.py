@@ -128,6 +128,139 @@ def _parse_record(line: str) -> dict | None:
     return rec
 
 
+def derive_persons_batch(cohort_bcf_paths: list,
+                         sample_ids: list) -> dict:
+    """Stream per-person records for a batch of sample_ids in one
+    bcftools subprocess per chromosome.
+
+    Phase 5g: replaces the per-person ``derive_person_records``
+    fan-out for callers that have all their target sample IDs up
+    front (the streamed cohort path). The single-person form pays
+    a full multi-sample BCF decode on every (person, chrom) pair —
+    on a measured run at ``n=3000 × 22 chroms`` that was 66,000
+    bcftools subprocesses each scanning a few hundred MB of cohort
+    BCF, taking ~45 s/person and projecting to ~38 hours.
+
+    The batched form runs::
+
+        bcftools query -s s1,s2,...,sB -f '%CHROM\\t%POS\\t%ID\\t%REF\\t%ALT\\t%INFO[\\t%GT]\\n'
+
+    once per chrom — the ``[\\t%GT]`` template expands to one
+    tab-separated GT per sample in ``-s`` order, so a single decode
+    pass yields all B columns. The parser dispatches each row's
+    GTs into ``per_person[sample_id]`` lists, dropping hom-ref
+    (``0|0`` / ``0/0``) the same way ``derive_person_records``
+    does (missing ``./.`` / ``.|.`` is kept). At ``B=20`` that
+    drops the per-chrom invocation count by ~20×; at ``B=100`` by
+    ~100×.
+
+    Returns ``{sample_id: list_of_record_dicts}`` for every sid in
+    ``sample_ids``. Each record dict has the same shape as
+    ``derive_person_records``'s output, so downstream callers
+    (``write_person_vcf``, etc.) consume either source identically.
+
+    Memory bound: the returned dict holds every record for every
+    listed sample for every chrom, simultaneously. Callers tuning
+    against host RAM should batch their sample list so that
+    ``B × E[per-person record list size]`` fits comfortably; at
+    ``n=3000`` × full-22-chrom the per-person list is a few hundred
+    MB to ~1 GB of parsed dicts, so ``B`` should typically stay
+    under ~50 on 32 GB hosts.
+    """
+    if not sample_ids:
+        return {}
+
+    per_person: dict = {sid: [] for sid in sample_ids}
+    sids_arg = ",".join(sample_ids)
+    fmt = ("%CHROM\t%POS\t%ID\t%REF\t%ALT\t%INFO"
+           + "[\t%GT]\n")
+    n = len(sample_ids)
+    expected_field_count = 6 + n
+
+    for bcf_path in cohort_bcf_paths:
+        cmd = ["bcftools", "query", "-s", sids_arg,
+               "-f", fmt, str(bcf_path)]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if not line:
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < expected_field_count:
+                # Malformed row (truncated, missing GT columns) —
+                # skip so a single bad record doesn't poison the
+                # entire batch.
+                continue
+            chrom = fields[0]
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            vid = fields[2] if fields[2] else "."
+            ref = fields[3]
+            alt = fields[4]
+            info = fields[5]
+            gts = fields[6:6 + n]
+
+            alts = alt.split(",") if alt and alt != "." else []
+            if not alts:
+                # Reference-only row — `bcftools query` doesn't filter
+                # GT="ref" the way the per-person pipeline does, so we
+                # check here instead. (It does happen for sites where
+                # every sample is hom-ref; we drop them outright.)
+                continue
+
+            info_extras = _parse_info(info)
+            # Build immutable shared template fields once per row;
+            # per-person dicts share the alts/afs lists. The
+            # downstream writer reads but never mutates them, so the
+            # sharing is safe — and at n=3000 it cuts row-template
+            # allocation cost dramatically.
+            afs = [None] * len(alts)
+
+            for sid, gt in zip(sample_ids, gts):
+                # `bcftools view -e 'GT="ref"'` matches 0/0 and 0|0
+                # only; missing genotypes (./. / .|.) survive. The
+                # per-person fan-out preserved that semantics, so
+                # mirror it here.
+                if not gt or gt == "0|0" or gt == "0/0":
+                    continue
+                rec = {
+                    "chrom": chrom,
+                    "pos": pos,
+                    "id": vid,
+                    "ref": ref,
+                    "alts": alts,
+                    "afs": afs,
+                    "gt": gt,
+                }
+                if info_extras:
+                    rec.update(info_extras)
+                per_person[sid].append(rec)
+
+        # Drain stderr and check returncode after stdout has been
+        # consumed; bcftools occasionally writes warnings even on
+        # success (mismatched mu in stdpopsim runs has surfaced in
+        # this codebase before), so we keep the buffer for the
+        # error path.
+        proc.stdout.close()
+        stderr_buf = ""
+        if proc.stderr is not None:
+            stderr_buf = proc.stderr.read()
+            proc.stderr.close()
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"bcftools query -s failed on {bcf_path} "
+                f"(batch size={n}, exit {proc.returncode}): "
+                f"{stderr_buf.strip()[:500] or '(no stderr)'}"
+            )
+
+    return per_person
+
+
 def derive_person_records(cohort_bcf_paths: list,
                           sample_id: str) -> list:
     """Stream per-person non-hom-ref records out of cohort BCFs.

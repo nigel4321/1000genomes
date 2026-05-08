@@ -72,7 +72,7 @@ from .sv import (
     generate_person_svs,
 )
 from .bcf_writer import CohortBcfWriter
-from .cohort_derivation import derive_person_records
+from .cohort_derivation import derive_person_records, derive_persons_batch
 from .memprofile import mark as memprofile_mark
 from .resume import ResumeMismatch, load_or_create_meta
 from .truth import TruthBedWriter
@@ -121,7 +121,16 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
 
     hi = dict(rng.choice(candidates))
     hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
-    if cohort_bcfs is not None:
+    # Phase 5g batched-extraction path: when the parent has pre-staged
+    # this batch's per-person record dicts in ``batch_backgrounds``,
+    # workers pick up their share via fork-inherited state and skip
+    # the per-person bcftools fan-out entirely. Falls back to the
+    # per-person ``derive_person_records`` path for callers that
+    # haven't been migrated (legacy admixture etc.).
+    batch_backgrounds = state.get("batch_backgrounds")
+    if batch_backgrounds is not None and sid in batch_backgrounds:
+        background = batch_backgrounds[sid]
+    elif cohort_bcfs is not None:
         background = derive_person_records(cohort_bcfs, sid)
     else:
         background = person_records_from_cohort(cohort_sites, i)
@@ -521,6 +530,18 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "regardless of --workers, but differs from a "
                         "pre-Phase-1 run at the same seed because the "
                         "rng consumption pattern changed.")
+    p.add_argument("--fanout-batch-size", type=int, default=50,
+                   help="[perf] On the streamed coalescent path, group "
+                        "this many sample IDs into one bcftools query "
+                        "per cohort BCF during the per-person fan-out. "
+                        "The legacy per-person path issued one bcftools "
+                        "subprocess per (person, chrom) pair (~66k for "
+                        "n=3000 × 22 chroms); batching cuts that by ~B× "
+                        "while bounding parent peak memory at "
+                        "B × per-person record list. Default 50 fits "
+                        "comfortably on 32 GB hosts at n=3000; raise it "
+                        "for hosts with more RAM, lower it if the "
+                        "fan-out OOMs.")
     p.add_argument("--profile-memory", type=Path, default=None,
                    metavar="TSV_PATH",
                    help="[diagnostic] Spawn a background thread that "
@@ -999,28 +1020,70 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         )
         last_progress_log = now
 
-    if use_pool:
+    # Phase 5g batched extraction. The legacy per-person path spawned
+    # ``bcftools view -s SID`` once per (person, chrom) — at
+    # ``n=3000 × 22 chroms`` that was 66,000 subprocesses each scanning
+    # a few hundred MB of cohort BCF, projecting to ~38 hours. Here we
+    # group sample IDs into batches and run one ``bcftools query`` per
+    # chrom that emits all batch members' GT columns in a single
+    # decode pass; the parent dispatches them into per-person record
+    # lists, then forks a worker pool for the per-person VCF writes.
+    # Batch size trades extraction-pass count against parent peak
+    # memory (each batch holds B × per-person records simultaneously
+    # before workers consume them).
+    batch_size = max(1, args.fanout_batch_size)
+    if batch_size < args.n:
+        n_batches = (args.n + batch_size - 1) // batch_size
+        print(
+            f"  fan-out: batched extraction (batch_size={batch_size}, "
+            f"{n_batches} batches, {fanout_workers} worker processes)",
+            file=sys.stderr,
+        )
+    elif use_pool:
         print(f"  fan-out: {fanout_workers} worker processes "
               f"(fork start method, --n={args.n})",
               file=sys.stderr)
-        ctx = mp.get_context("fork")
-        results: list = [None] * args.n
-        with ProcessPoolExecutor(max_workers=fanout_workers,
-                                 mp_context=ctx) as ex:
-            futures = [
-                ex.submit(_person_worker, i, sample_ids[i],
-                          person_seeds[i])
-                for i in range(args.n)
-            ]
-            for i, fut in enumerate(futures):
-                results[i] = fut.result()
+
+    results: list = [None] * args.n
+    ctx = mp.get_context("fork") if use_pool else None
+    for batch_start in range(0, args.n, batch_size):
+        batch_end = min(batch_start + batch_size, args.n)
+        batch_indices = range(batch_start, batch_end)
+        batch_sids = sample_ids[batch_start:batch_end]
+        # Stage A: one bcftools subprocess per chrom decodes the
+        # whole batch's columns at once. Records live on the parent
+        # heap and are inherited via copy-on-write fork into each
+        # worker that needs them.
+        batch_backgrounds = derive_persons_batch(
+            cohort_bcf_paths, batch_sids)
+        _PERSON_WORKER_STATE["batch_backgrounds"] = batch_backgrounds
+        # Stage B: workers consume per-person records and write per-
+        # person VCFs. A fresh pool per batch is needed so each
+        # batch's children fork-inherit the right
+        # ``batch_backgrounds`` snapshot — fork is millisecond-cheap,
+        # and the alternative (one long-lived pool + per-task pickle
+        # of the records) would dominate runtime at these list sizes.
+        if use_pool:
+            with ProcessPoolExecutor(max_workers=fanout_workers,
+                                     mp_context=ctx) as ex:
+                futures = [
+                    (i, ex.submit(_person_worker, i, sample_ids[i],
+                                  person_seeds[i]))
+                    for i in batch_indices
+                ]
+                for done_count, (i, fut) in enumerate(
+                        futures, start=batch_start + 1):
+                    results[i] = fut.result()
+                    _maybe_log_progress(done_count)
+        else:
+            for i in batch_indices:
+                results[i] = _person_worker(
+                    i, sample_ids[i], person_seeds[i])
                 _maybe_log_progress(i + 1)
-    else:
-        results = []
-        for i in range(args.n):
-            results.append(_person_worker(i, sample_ids[i],
-                                          person_seeds[i]))
-            _maybe_log_progress(i + 1)
+        # Drop the parent's reference so the next batch's allocations
+        # don't pile on top of the previous one.
+        _PERSON_WORKER_STATE["batch_backgrounds"] = None
+        del batch_backgrounds
 
     _PERSON_WORKER_STATE.clear()
     memprofile_mark("per-person fanout done")
