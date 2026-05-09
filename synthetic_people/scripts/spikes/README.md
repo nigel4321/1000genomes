@@ -26,17 +26,25 @@ learn early.
 
 | Spike | Status | What it tests | Cost |
 |---|---|---|---|
-| 1 | ✅ shipped | OS-level: `np.memmap` + `fork` + 8 workers shares physical RAM | ~120 LOC, ~1 hour |
-| 2 | planned | `pyarrow` IPC streaming write + zero-copy mmap read across workers | ~250 LOC, ~4 hours |
+| 1 | ✅ shipped, **PASS** (2026-05-09) | OS-level: `np.memmap` + `fork` + 8 workers shares physical RAM | ~120 LOC |
+| 2 | ✅ shipped | `pyarrow` IPC streaming write + zero-copy mmap read across workers | ~280 LOC |
 
 Run Spike 1 first. If it fails (workers don't share physical RAM),
 Spike 2 is moot — 5d's foundation is wrong and we rethink. If
-Spike 1 passes, schedule Spike 2 to validate the Arrow-specific
-layer.
+Spike 1 passes, run Spike 2 to validate the Arrow-specific layer.
+
+Spike 1 result on the user's host (32 GB workstation) recorded in
+`spike1_results_2026-05-09.txt`: clean PASS — total system RAM
+delta during the 8-worker read phase was 0 GB, apparent per-worker
+RSS sum (4.21 GB) tracked file size rather than `n_workers ×
+file_size`. Green-lit Spike 2.
 
 ## Spike 1 — OS-level mmap+fork smoke test
 
-**File:** `spike1_mmap_fork_smoke.py`
+**File:** [`spike1_mmap_fork_smoke.py`](spike1_mmap_fork_smoke.py)
+
+**Result:** [`spike1_results_2026-05-09.txt`](spike1_results_2026-05-09.txt)
+— **PASS** on the user's 32 GB workstation (2026-05-09).
 
 **What it does:**
 
@@ -127,37 +135,54 @@ your host. It does *not* yet validate:
 So Spike 1 is necessary but not sufficient. Pass → green-light
 Spike 2; fail → halt 5d planning until we understand why.
 
-## Spike 2 — Arrow IPC streaming write + zero-copy mmap (planned)
+## Spike 2 — Arrow IPC streaming write + zero-copy mmap
 
-**File:** `spike2_arrow_streaming.py` (not yet written)
+**File:** [`spike2_arrow_streaming.py`](spike2_arrow_streaming.py)
 
-**What it will do:**
+**Result:** _not yet run_ — paste stdout into
+`spike2_results_<date>.txt` alongside this README and link it here
+once available.
 
-1. Synthesise data of realistic shape on the fly:
-   - 10,000 samples × 100,000 sites of int8 genotypes
-   - Per-sample columns (matches the schema choice tentatively
-     locked in by the 5d plan)
-   - ~1 GB raw, ~500 MB Arrow IPC after RLE / dictionary
-     encoding for typical allele frequencies.
+**What it does:**
+
+1. Synthesises data of realistic shape on the fly:
+   - Default: 10,000 samples × 100,000 sites of int8 genotypes
+   - Schema: `pos int64 | genotypes FixedSizeList(int8, n_samples)`
+     — matches the layout tentatively locked in by the 5d plan
+     (per-row fixed-size list = effectively a row-major int8
+     matrix, with workers slicing the columns dimension via
+     numpy's `.reshape(-1, n_samples)[:, lo:hi]` view)
+   - ~1 GB raw GT bytes; Arrow IPC file slightly larger due to
+     metadata
+   - Allele frequency: ~5 % non-ref (sparse-ish, realistic for
+     common variants)
 2. **Streaming write phase:** parent generates one record batch
-   at a time (`batch_size=1024` variants) and writes each via
-   `pyarrow.ipc.new_file(path, schema).write_batch(batch)`.
-   Sample parent RSS continuously during write.
-3. **Worker mmap-read phase:** fork 8 workers; each opens the
-   Arrow file via `pyarrow.ipc.open_file(path)` and projects its
-   sample-column slice (`table.select([f"gt_{i}" for i in
-   range(slice_lo, slice_hi)])`). Each worker iterates per-site
-   over its slice in vectorised form (no Python per-element
-   objects) and computes a slice-level statistic (e.g., per-site
-   alt count for that slice).
-4. **Measure:**
-   - Parent peak RSS during streaming write (pass: < 500 MB
-     independent of total sites).
-   - Total system RSS during worker phase (pass: ≈ file size,
-     fail: ≈ W × file size).
-   - Per-worker reported RSS.
-   - Write throughput (MB/s).
-   - Read throughput (aggregate MB/s across workers).
+   at a time (`--batch-size`, default 1024 sites) and writes
+   each via `pyarrow.ipc.new_file(path, schema).write_batch(...)`.
+   A background thread samples parent RSS at 200 ms intervals
+   throughout the write to catch any growth.
+3. **Worker mmap-read phase:** fork N workers (default 8); each:
+   - Opens the file via `pa.memory_map(path, "r")` →
+     `pa.ipc.open_file(mm)` (explicit mmap, not silently buffered)
+   - Iterates record batches; for each batch, takes the
+     `genotypes` FixedSizeListArray, calls
+     `.values.to_numpy(zero_copy_only=True)` (raises if a copy
+     would be needed — the explicit guarantee), reshapes to
+     `(batch_n_sites, n_samples)`, and slices its sample range
+     (zero-copy view).
+   - Iterates per-site (Python `for` loop over the matrix rows)
+     and computes per-site alt counts. **The per-site loop is
+     deliberate** — it mirrors the realistic 5d.1 worker pattern
+     (per-site BCF write) and validates that this access pattern
+     doesn't trigger PyObject allocation per element or COW
+     divergence.
+4. **Measures:**
+   - Parent peak RSS during streaming write (target: < 500 MB)
+   - Total system RSS during worker phase (target: ≈ file size,
+     not W × file size)
+   - Per-worker reported RSS
+   - Write throughput (MB/s logical)
+   - Aggregate read throughput across workers (MB/s)
 
 **Pass criteria:**
 
@@ -196,25 +221,41 @@ Spike 2; fail → halt 5d planning until we understand why.
 | Mmap-share fails (per-worker copies) | Re-test with explicit `memory_map=True` and compression-off; if still failing, drop Arrow and use raw numpy `np.memmap` directly with our own column-offset format. |
 | Throughput too low | Profile to identify whether bottleneck is mmap read, decode, or worker-side iteration; consider one-file-per-chromosome layout or smaller batches. |
 
-### How to run (when written)
+### How to run
+
+Requires `pyarrow` to be installed in the active env (`pip install
+pyarrow`). The script exits with status 3 and a clear message if
+it isn't.
 
 ```bash
-# default (10k samples × 100k sites, 8 workers)
+# default (10k samples × 100k sites, 8 workers, ~1 GB Arrow file)
 python synthetic_people/scripts/spikes/spike2_arrow_streaming.py
 
-# scale-up smoke (100k samples × 500k sites, ~50 GB Arrow file)
+# scale-up smoke (~10 GB Arrow file)
+python synthetic_people/scripts/spikes/spike2_arrow_streaming.py \
+    --samples 50000 --sites 200000
+
+# stress test (~50 GB Arrow file — only on hosts with adequate disk)
 python synthetic_people/scripts/spikes/spike2_arrow_streaming.py \
     --samples 100000 --sites 500000
 
 # alternate path / fast NVMe
 python synthetic_people/scripts/spikes/spike2_arrow_streaming.py \
     --path /mnt/nvme/spike2.arrow
+
+# fewer workers (test slice-vs-no-slice scaling)
+python synthetic_people/scripts/spikes/spike2_arrow_streaming.py \
+    --workers 4
 ```
+
+The test file is overwritten each run (Arrow's IPC writer creates
+fresh files, unlike Spike 1 which reuses).
 
 ## Recording results
 
 After each spike run, paste the script's stdout into a results
-note alongside the script (e.g., `spike1_results_2026-05-09.txt`)
+note alongside the script (e.g., `spike2_results_<date>.txt`)
 so the evidence is preserved with the project. PR #30 (the 5d
-plan update) can then cite the spike's verdict as the
-pre-implementation gate.
+plan update) can then cite the spikes' verdicts as the
+pre-implementation gate. Spike 1 results from 2026-05-09 are
+already recorded in `spike1_results_2026-05-09.txt`.

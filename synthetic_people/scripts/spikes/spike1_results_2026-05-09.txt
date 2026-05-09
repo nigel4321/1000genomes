@@ -1,0 +1,48 @@
+Spike 1 result — 2026-05-09
+Verdict: PASS — mmap + fork shares physical pages cleanly via the
+OS page cache. Phase 5d's OS-level assumption holds on this host.
+
+Notable: per-worker reported RSS came in at 0.53 GB rather than the
+full 4 GB file size. The kernel attributed only touched (sliced)
+pages to each worker, so the apparent total (4.21 GB) tracks the
+file size, not n_workers × file_size. Cleaner than the worst-case
+shape we worried about for cgroup / monitoring inflation.
+
+Stdout from spike1_mmap_fork_smoke.py (defaults: 4 GB, 8 workers):
+
+writing 4.00 GB of random bytes to /tmp/spike1_mmap_fork.bin...
+wrote 4.00 GB
+
+Baseline system RAM: used = 0.94 GB, available = 30.35 GB
+After parent np.memmap: parent RSS = 0.04 GB, system used = 0.94 GB
+
+Forking 8 workers...
+All workers done in 0.4 s
+
+Per-worker reports:
+  worker 0: checksum=68450732120, reported RSS = 0.53 GB
+  worker 1: checksum=68453311485, reported RSS = 0.53 GB
+  worker 2: checksum=68453324692, reported RSS = 0.53 GB
+  worker 3: checksum=68452904881, reported RSS = 0.53 GB
+  worker 4: checksum=68449459140, reported RSS = 0.53 GB
+  worker 5: checksum=68448571837, reported RSS = 0.53 GB
+  worker 6: checksum=68454680528, reported RSS = 0.53 GB
+  worker 7: checksum=68451633781, reported RSS = 0.53 GB
+
+Sum of per-worker reported RSS (apparent): 4.21 GB
+
+System RAM during worker phase:
+  baseline used:           0.94 GB
+  peak used:               0.94 GB
+  min available:           30.35 GB
+  delta vs baseline:       +-0.00 GB
+  file size:               4.00 GB
+  n_workers × file size:   32.00 GB (what we'd see if no sharing)
+  apparent (sum of RSS):   4.21 GB
+
+=== VERDICT ===
+PASS: system RAM grew by -0.00 GB during worker phase,
+      below the 6.00 GB threshold (1.5 × file_size).
+      Apparent total (4.21 GB) >> physical delta (-0.00 GB)
+      confirms fork-COW sharing via the OS page cache.
+      Phase 5d's OS-level assumption holds on this host.
