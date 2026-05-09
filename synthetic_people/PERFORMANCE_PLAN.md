@@ -86,7 +86,7 @@ The phases compose, not compete:
 | **5f'** | Constant-term chunk-RAM calibration (open) | Auto-derate sees per-worker constant cost | None — bug fix |
 | **5g.1/.2 ✓** | **Batched per-person fanout extraction** | Fanout ~10× fewer bcftools invocations | None — drop-in |
 | **5g.3** | Disk-spilled fanout batch handoff (planned) | Decouples B from W RAM ceiling | +staging disk |
-| **5d.1** | Streaming-mmap cohort intermediate (Apache Arrow) | **`n = 1M`** — parent RAM becomes O(1) per variant | New dep (`pyarrow`) + ~200-300 GB scratch disk per chrom |
+| **5d.1** | Streaming-mmap cohort intermediate (Apache Arrow) — viability spikes ✓ | **`n = 1M`** — parent RAM becomes O(1) per variant | New dep (`pyarrow`) + ~200-300 GB scratch disk per chrom |
 | **5d.2** | Direct binary BCF via pysam (optional) | Writer throughput at `n = 1M+` | New compiled dep |
 | **6** | **SQLite for side-state (truth / ancestry / manifest)** | Filesystem at 100k | +schema |
 
@@ -1582,22 +1582,53 @@ product call from the user first.
 
 ## Phase 5d — streaming-mmap cohort intermediate (path to n=1M)
 
-**Status (2026-05-09):** scope expanded substantially after
-memprof26 demonstrated that Phase 5e Phase A's "parent holds the
-sites list, workers fork-share it" design fails at n=3000 due to
-CPython refcount-COW divergence. Phase B (workers walk the tskit
-TreeSequence directly) bridges to ~n=30,000. Beyond that, even the
-per-worker tskit walk allocates non-trivially: mutation count grows
-with `n × sites`, and per-iteration scratch state per worker starts
-hitting many-GB territory at n=100k+. The design that actually
-scales to n=1M is **streaming the cohort representation to disk and
-mmap-ing it from workers** — parent never materialises a full
-in-memory site set, workers never copy more than their slice.
+**Status (2026-05-09):** **viability spikes complete; both PASSED.
+Phase 5d.1 implementation green-lit.**
+
+Scope expanded substantially after memprof26 demonstrated that
+Phase 5e Phase A's "parent holds the sites list, workers fork-share
+it" design fails at n=3000 due to CPython refcount-COW divergence.
+Phase B (workers walk the tskit TreeSequence directly) bridges to
+~n=30,000. Beyond that, even the per-worker tskit walk allocates
+non-trivially: mutation count grows with `n × sites`, and per-
+iteration scratch state per worker starts hitting many-GB
+territory at n=100k+. The design that actually scales to n=1M is
+**streaming the cohort representation to disk and mmap-ing it from
+workers** — parent never materialises a full in-memory site set,
+workers never copy more than their slice.
 
 **Goal:** make parent's RAM in the cohort phase O(1) per variant,
 independent of `n`. Workers consume their slice's columns via mmap
 without copying. Parent and worker memory both stay bounded as
 `n` grows; only disk and I/O scale.
+
+### Pre-implementation viability spikes (gate cleared)
+
+Before committing to the ~600–800 LOC build, two standalone scripts
+under [`scripts/spikes/`](scripts/spikes/) validated the load-
+bearing assumptions in isolation. Both passed cleanly on the user's
+32 GB workstation on 2026-05-09.
+
+| Spike | What it tested | Result |
+|---|---|---|
+| 1 — [`spike1_mmap_fork_smoke.py`](scripts/spikes/spike1_mmap_fork_smoke.py) | OS-level: does `np.memmap` + `multiprocessing.fork` share physical pages across W workers via the page cache? | **PASS** — see [`spike1_results_2026-05-09.txt`](scripts/spikes/spike1_results_2026-05-09.txt). Total system RAM delta during the 8-worker mmap-read phase was 0 GB; apparent per-worker RSS sum (4.21 GB) tracked file size, not n_workers × file_size. |
+| 2 — [`spike2_arrow_streaming.py`](scripts/spikes/spike2_arrow_streaming.py) | Arrow-specific: does `pyarrow.ipc.new_file` truly stream batches without buffering? Does `pa.memory_map` + `FixedSizeListArray.values.to_numpy(zero_copy_only=True)` give workers true zero-copy reads under a realistic per-site Python loop? | **PASS** — see [`spike2_results_2026-05-09.txt`](scripts/spikes/spike2_results_2026-05-09.txt). All four checks cleared: parent peak RSS during streaming write 184 MB (< 500 MB threshold), system RAM delta during workers +0.01 GB against a 7.83 GB apparent-RSS sum (apparent-to-physical ratio ~700:1), write throughput 245 MB/s (≥ 200 MB/s target), aggregate read throughput 1,355 MB/s (≥ 500 MB/s target). |
+
+The Spike 2 result is the decisive evidence. The realistic per-site
+Python loop — the same shape that killed Phase 5e Phase A through
+refcount-COW divergence at n=3000 — ran cleanly on all 8 workers in
+0.69 s with zero physical RAM growth. **Numpy holds one PyObject
+wrapper for the whole mmap'd array, not one per element**, so per-
+element index access doesn't trigger refcount-COW divergence. This
+is the core architectural difference that makes Phase 5d safe where
+Phase 5e Phase A wasn't.
+
+The spikes did not exhaustively test every n=1M-relevant dimension
+(only the default ~1 GB Arrow file size; no admixture path; no real
+msprime input). Treat the green-light as "the mechanism works on
+this host class" rather than "every implementation detail is
+solved." Implementation-time discoveries are still possible; budget
+for them.
 
 ### Why Apache Arrow IPC
 
