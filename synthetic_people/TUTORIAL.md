@@ -33,8 +33,9 @@ are written to be run from the repository root
 7. [Validating a batch with `validate_batch.py`](#7-validating-a-batch-with-validate_batchpy)
 8. [Reproducibility and seeding](#8-reproducibility-and-seeding)
 9. [Performance and scaling](#9-performance-and-scaling)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Glossary](#11-glossary)
+10. [Configuration files (optional)](#10-configuration-files-optional)
+11. [Troubleshooting](#11-troubleshooting)
+12. [Glossary](#12-glossary)
 
 ---
 
@@ -1024,7 +1025,144 @@ the parent process writes to the TSV.
 
 ---
 
-## 10. Troubleshooting
+## 10. Configuration files (optional)
+
+Once your invocation grows past a handful of flags it's easier to
+keep them in a file than to retype them every run. The tool reads
+**`generate_people_config.yaml`** automatically when it exists in the
+directory you run from. CLI flags still win over config values, so
+you can keep a stable baseline file and override one or two settings
+on the command line for a single experiment.
+
+### Quick start
+
+Create `generate_people_config.yaml` next to where you run from:
+
+```yaml
+# yaml-language-server: $schema=./generate_people_config.schema.json
+schema_version: 1
+
+cohort:
+  n: 3000
+  seed: 42
+  chromosomes: "1-22"
+  chr_length_mb: 70
+
+performance:
+  workers: 8
+  cohort_mode: arrow
+```
+
+Run with no flags — the tool picks it up:
+
+```bash
+.venv/bin/python generate_people.py
+```
+
+You should see on stderr:
+
+```
+  Loading values from config file: generate_people_config.yaml
+  Effective non-default values:
+    n                            = 3000                 [config]
+    seed                         = 42                   [config]
+    chromosomes                  = '1-22'               [config]
+    chr_length_mb                = 70.0                 [config]
+    workers                      = 8                    [config]
+    cohort_mode                  = 'arrow'              [config]
+```
+
+Override one value for a single run:
+
+```bash
+.venv/bin/python generate_people.py --workers 4
+```
+
+stderr now reports the source mix:
+
+```
+    workers                      = 4                    [cli, overrides config value 8]
+    n                            = 3000                 [config]
+    ...
+```
+
+### What every field looks like
+
+The complete set of keys, types, defaults, and bounds is in
+[`generate_people_config.schema.json`](generate_people_config.schema.json).
+Sections in the YAML mirror the CLI groupings:
+
+| Section | Covers |
+|---|---|
+| `cohort` | `n`, `build`, `seed`, `chromosomes`, `chr_length_mb` |
+| `simulation` | `demo_model`, `population`, `rec_rate`, `mu` |
+| `overlays.clinvar` / `overlays.rsid` / `overlays.cosmic` | density + source overrides for each annotation source |
+| `structural_variants` | per-person count + length bounds |
+| `sequencing_errors` | GT flip rate + dropout rate |
+| `performance` | `workers`, `cohort_mode`, `cohort_arrow_batch_size`, `fanout_batch_size`, `chr_chunk_mb`, `no_resume`, `profile_memory` |
+| `output` | `dir`, `cache_dir`, `mode` |
+| `admixture` | `enabled` + EUR/SAS/AFR fractions (must sum to 1.0 when enabled) |
+| `legacy_background` | M4 legacy 1000G-pool sampler config |
+
+Every section is optional. A minimal valid config is just
+`schema_version: 1` — every default applies and the run behaves
+identically to no config at all.
+
+### Editor integration (VS Code, IntelliJ, Helix, …)
+
+The `# yaml-language-server: $schema=...` comment at the top of the
+example wires up live validation. With the
+[YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml)
+installed in VS Code, you get:
+
+- Red squiggles on typos (`cohort_mode: arow` flagged immediately).
+- Hover tooltips with each field's description.
+- Auto-complete for the section names and enum values.
+
+The schema file lives next to the docs as
+`synthetic_people/generate_people_config.schema.json`; it's
+auto-generated from the Pydantic models in
+`syntheticgen/config.py` and a CI test fails if the two ever drift.
+
+### Validation errors
+
+The config is fully validated before any simulation work runs. If
+something's wrong, every problem is reported at once so you don't
+have to fix one, re-run, see the next, fix it, re-run, etc.:
+
+```
+Config validation failed in generate_people_config.yaml:
+  - cohort.n: input should be greater than or equal to 1
+  - performance.cohort_mode: input should be 'auto', 'sites_list', or 'arrow'
+  - overlays.clinvar.inject_density: input should be less than or equal to 1
+```
+
+### Precedence rules
+
+Three sources, in strictly decreasing priority:
+
+1. **CLI flag** you explicitly typed
+2. **Config-file value** (if present)
+3. **Built-in default**
+
+`--no-config` skips the auto-discovery if you want a config-free
+run from a directory that happens to have a config file in it.
+Passing `--config /path/to/other.yaml` overrides discovery and
+loads that file instead. Missing `--config` path is a hard error;
+missing auto-discovery file just falls back to CLI + defaults
+silently.
+
+### Versioning and forward compatibility
+
+`schema_version: 1` is required. The loader rejects configs with
+unknown schema versions with a clear message, so a future incompat-
+ible change can never silently mis-interpret an old config — you'll
+be told to update the schema and check the changelog. Today the
+only supported value is `1`.
+
+---
+
+## 11. Troubleshooting
 
 **"`bcftools not found`"** — install htslib:
 `apt install bcftools tabix` (Linux) or
@@ -1069,7 +1207,7 @@ A simple alphabetic `sort` will *not* match — use
 
 ---
 
-## 11. Glossary
+## 12. Glossary
 
 | Term | Meaning |
 |---|---|

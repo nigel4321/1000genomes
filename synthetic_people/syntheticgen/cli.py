@@ -540,6 +540,19 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    p.add_argument("--config", type=str, default=None,
+                   help="Load values from this YAML config file. CLI "
+                        "flags still override config values; config "
+                        "values still override built-in defaults. If "
+                        "omitted, the tool looks for "
+                        "`generate_people_config.yaml` in the current "
+                        "directory and uses it automatically when "
+                        "present. Pass --no-config to disable that "
+                        "auto-discovery.")
+    p.add_argument("--no-config", action="store_true",
+                   help="Skip the auto-discovery of "
+                        "`generate_people_config.yaml` in the current "
+                        "directory. Has no effect when --config is set.")
     p.add_argument("--n", type=int, default=10,
                    help="Cohort size: number of person VCFs to generate")
     p.add_argument("--output-dir", type=Path,
@@ -1418,7 +1431,53 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
 
 def main(argv: list[str] | None = None) -> int:
     script_dir = Path(__file__).resolve().parent.parent
-    args = _parser(script_dir).parse_args(argv)
+    parser = _parser(script_dir)
+    args = parser.parse_args(argv)
+
+    # ------------------------------------------------------------
+    # Optional YAML config layer (Phase config-file). CLI flags
+    # already win; config layer fills in anything not on the CLI;
+    # defaults apply where neither did. Discovery is cwd-only.
+    # ------------------------------------------------------------
+    from .config import (
+        DEFAULT_CONFIG_FILENAME,
+        discover_config_file,
+        load_and_validate_config,
+        merge_config_into_args,
+        parse_explicit_cli_args,
+        format_effective_values,
+    )
+
+    config_path = None
+    if getattr(args, "config", None):
+        config_path = Path(args.config)
+        if not config_path.is_file():
+            sys.exit(f"--config: file not found: {config_path}")
+    elif not getattr(args, "no_config", False):
+        config_path = discover_config_file(Path.cwd())
+
+    config_obj = None
+    if config_path is not None:
+        print(
+            f"  Loading values from config file: {config_path}",
+            file=sys.stderr,
+        )
+        config_obj = load_and_validate_config(config_path)
+        explicit_cli = parse_explicit_cli_args(parser, argv)
+        # Re-parse so the parser's defaults are restored if
+        # parse_explicit_cli_args left anything inconsistent.
+        args = merge_config_into_args(args, config_obj, explicit_cli)
+        parser_defaults = {
+            a.dest: a.default for a in parser._actions
+            if a.dest not in ("help", "config", "no_config")
+        }
+        effective = format_effective_values(
+            args, parser_defaults, config_obj, explicit_cli,
+        )
+        if effective:
+            print("  Effective non-default values:", file=sys.stderr)
+            for line in effective:
+                print(line, file=sys.stderr)
 
     if args.check_deps:
         return _check_deps()

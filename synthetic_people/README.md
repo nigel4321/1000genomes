@@ -68,6 +68,7 @@ python3 -m venv .venv
 | `demes` (transitive via msprime) | M6 | UK-cohort admixture demography graph |
 | `matplotlib>=3.7`, `scikit-allel>=1.3` | M10 | LD decay r² + cohort PCA + plot artefacts |
 | `scikit-learn>=1.3` (transitive) | M10 | PCA decomposition for the cohort matrix |
+| `pydantic>=2.0`, `PyYAML>=6.0` | config file | Validate and load `generate_people_config.yaml` (see TUTORIAL.md §10) |
 
 **Optional dep — `pyarrow` (cohort scale ≥ n=100 000):**
 
@@ -950,3 +951,5 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--no-resume` | [perf] Ignore any existing `cohort.meta.json` + cohort BCFs and start a fresh simulation. Default behaviour resumes a prior run when its params match. | `False` |
 | `--chr-chunk-mb` | [perf] Split each chromosome's msprime simulation into independent sub-chunks of this size (Mb). `0` = auto-pick from `psutil.virtual_memory().available` and `--workers`. Cross-chunk LD is lost (chunks simulate independently); short-range LD within chunks is preserved. | `0` (auto) |
 | `--profile-memory` | [perf, diagnostic] Sample RSS to a TSV at this path, ~1 s cadence plus labelled marks at phase boundaries (sim start, chrom yielded, BCF written, etc.). Useful for OOM postmortems and peak-RSS plots. | `None` (off) |
+| `--config` | Load values from this YAML config file (overrides built-in defaults; CLI flags still win over config values). If omitted, the tool auto-discovers `./generate_people_config.yaml` in the current directory. See TUTORIAL.md §10. | `None` |
+| `--no-config` | Skip the auto-discovery of `generate_people_config.yaml` in the current directory. No effect when `--config` is set. | `False` |
