@@ -31,3 +31,9 @@ scikit-learn>=1.3
 # memory fits the host. `--chr-chunk-mb 0` (default) needs psutil;
 # explicit `--chr-chunk-mb N` works without it.
 psutil>=5.9
+
+# Config-file support: YAML loading + Pydantic validation for
+# generate_people_config.yaml. Core UX feature (not a perf-scale
+# opt-in like pyarrow), so both are unconditional dependencies.
+pydantic>=2.0
+PyYAML>=6.0

@@ -1,0 +1,576 @@
+{
+  "$defs": {
+    "AdmixtureConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "afr_frac": {
+          "argparse_dest": "afr_frac",
+          "default": 0.15,
+          "description": "African ancestry proportion (eur + sas + afr must sum to 1.0).",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Afr Frac",
+          "type": "number"
+        },
+        "enabled": {
+          "argparse_dest": "admixture",
+          "default": false,
+          "description": "Run M6 EUR + SAS + AFR -> UK admixture and emit ancestry BEDs.",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "eur_frac": {
+          "argparse_dest": "eur_frac",
+          "default": 0.6,
+          "description": "European ancestry proportion.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Eur Frac",
+          "type": "number"
+        },
+        "sas_frac": {
+          "argparse_dest": "sas_frac",
+          "default": 0.25,
+          "description": "South Asian ancestry proportion.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Sas Frac",
+          "type": "number"
+        }
+      },
+      "title": "AdmixtureConfig",
+      "type": "object"
+    },
+    "ClinVarConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "inject_density": {
+          "argparse_dest": "clinvar_inject_density",
+          "default": 0.01,
+          "description": "Fraction of cohort sites overwritten with ClinVar records.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Inject Density",
+          "type": "number"
+        },
+        "sig_filter": {
+          "argparse_dest": "clinvar_sig",
+          "default": "Pathogenic,Likely_pathogenic,Pathogenic/Likely_pathogenic",
+          "description": "Comma-separated CLNSIG values to keep from the ClinVar VCF.",
+          "title": "Sig Filter",
+          "type": "string"
+        }
+      },
+      "title": "ClinVarConfig",
+      "type": "object"
+    },
+    "CohortConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "build": {
+          "argparse_dest": "build",
+          "default": "GRCh38",
+          "description": "Reference build assembly.",
+          "enum": [
+            "GRCh37",
+            "GRCh38"
+          ],
+          "title": "Build",
+          "type": "string"
+        },
+        "chr_length_mb": {
+          "argparse_dest": "chr_length_mb",
+          "default": 5.0,
+          "description": "Simulated prefix per chromosome in Mb; 0 = full length.",
+          "minimum": 0.0,
+          "title": "Chr Length Mb",
+          "type": "number"
+        },
+        "chromosomes": {
+          "argparse_dest": "chromosomes",
+          "default": "22",
+          "description": "Chromosomes spec: list / range / mix (e.g. '22', '19-22,X').",
+          "title": "Chromosomes",
+          "type": "string"
+        },
+        "n": {
+          "argparse_dest": "n",
+          "default": 10,
+          "description": "Cohort size (number of person VCFs).",
+          "minimum": 1,
+          "title": "N",
+          "type": "integer"
+        },
+        "seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "argparse_dest": "seed",
+          "default": null,
+          "description": "Master RNG seed; omit for fresh randomness each run.",
+          "title": "Seed"
+        }
+      },
+      "title": "CohortConfig",
+      "type": "object"
+    },
+    "CosmicConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "argparse_dest": "somatic",
+          "default": false,
+          "description": "Enable COSMIC overlay (--somatic on CLI).",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "inject_density": {
+          "argparse_dest": "cosmic_inject_density",
+          "default": 0.005,
+          "description": "Fraction of cohort sites overwritten with COSMIC records when enabled.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Inject Density",
+          "type": "number"
+        },
+        "vcf": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "argparse_dest": "cosmic_vcf",
+          "default": null,
+          "description": "Path to COSMIC-format VCF (registration required).",
+          "title": "Vcf"
+        }
+      },
+      "title": "CosmicConfig",
+      "type": "object"
+    },
+    "LegacyBackgroundConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "af_min": {
+          "argparse_dest": "af_min",
+          "default": 0.05,
+          "description": "Minimum AF when loading the legacy pool.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Af Min",
+          "type": "number"
+        },
+        "background_glob": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "argparse_dest": "background_glob",
+          "default": null,
+          "description": "Source glob(s) for common variants (legacy path only).",
+          "title": "Background Glob"
+        },
+        "enabled": {
+          "argparse_dest": "legacy_background",
+          "default": false,
+          "description": "Use M4 1000G-pool + power-law SFS sampler (--legacy-background).",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "n_background": {
+          "argparse_dest": "n_background",
+          "default": 500,
+          "description": "Shared background site count (legacy path only).",
+          "minimum": 1,
+          "title": "N Background",
+          "type": "integer"
+        },
+        "sfs_alpha": {
+          "argparse_dest": "sfs_alpha",
+          "default": 2.0,
+          "description": "Power-law exponent for the legacy SFS.",
+          "exclusiveMinimum": 0.0,
+          "title": "Sfs Alpha",
+          "type": "number"
+        }
+      },
+      "title": "LegacyBackgroundConfig",
+      "type": "object"
+    },
+    "OutputConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_dir": {
+          "argparse_dest": "cache_dir",
+          "default": "./cache",
+          "description": "Cache directory for ClinVar / dbSNP / COSMIC downloads.",
+          "title": "Cache Dir",
+          "type": "string"
+        },
+        "dir": {
+          "argparse_dest": "output_dir",
+          "default": "./out",
+          "description": "Output directory for per-person VCFs and cohort BCFs.",
+          "title": "Dir",
+          "type": "string"
+        },
+        "mode": {
+          "argparse_dest": "mode",
+          "default": "per-person",
+          "description": "What the run writes: per-person VCFs, cohort BCFs only, or both.",
+          "enum": [
+            "per-person",
+            "cohort",
+            "both"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "title": "OutputConfig",
+      "type": "object"
+    },
+    "OverlaysConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "clinvar": {
+          "$ref": "#/$defs/ClinVarConfig",
+          "default": {
+            "inject_density": 0.01,
+            "sig_filter": "Pathogenic,Likely_pathogenic,Pathogenic/Likely_pathogenic"
+          }
+        },
+        "cosmic": {
+          "$ref": "#/$defs/CosmicConfig",
+          "default": {
+            "enabled": false,
+            "inject_density": 0.005,
+            "vcf": null
+          }
+        },
+        "rsid": {
+          "$ref": "#/$defs/RsidConfig",
+          "default": {
+            "density": 0.2,
+            "vcf": null
+          }
+        }
+      },
+      "title": "OverlaysConfig",
+      "type": "object"
+    },
+    "PerformanceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "chr_chunk_mb": {
+          "argparse_dest": "chr_chunk_mb",
+          "default": 0.0,
+          "description": "Per-chromosome msprime chunk size in Mb; 0=auto-pick.",
+          "minimum": 0.0,
+          "title": "Chr Chunk Mb",
+          "type": "number"
+        },
+        "cohort_arrow_batch_size": {
+          "argparse_dest": "cohort_arrow_batch_size",
+          "default": 256,
+          "description": "Sites per Arrow record batch when cohort_mode='arrow'.",
+          "minimum": 1,
+          "title": "Cohort Arrow Batch Size",
+          "type": "integer"
+        },
+        "cohort_mode": {
+          "argparse_dest": "cohort_mode",
+          "default": "auto",
+          "description": "Cohort intermediate between simulation and BCF write.",
+          "enum": [
+            "auto",
+            "sites_list",
+            "arrow"
+          ],
+          "title": "Cohort Mode",
+          "type": "string"
+        },
+        "fanout_batch_size": {
+          "argparse_dest": "fanout_batch_size",
+          "default": 4,
+          "description": "Persons grouped per bcftools-query invocation during fan-out.",
+          "minimum": 1,
+          "title": "Fanout Batch Size",
+          "type": "integer"
+        },
+        "no_resume": {
+          "argparse_dest": "no_resume",
+          "default": false,
+          "description": "If true, ignore any existing cohort.meta.json + cohort BCFs.",
+          "title": "No Resume",
+          "type": "boolean"
+        },
+        "profile_memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "argparse_dest": "profile_memory",
+          "default": null,
+          "description": "Path to write a memory-profile TSV (~1s cadence + phase marks).",
+          "title": "Profile Memory"
+        },
+        "workers": {
+          "argparse_dest": "workers",
+          "default": 0,
+          "description": "Worker processes; 0=auto (cpu_count), 1=serial.",
+          "minimum": 0,
+          "title": "Workers",
+          "type": "integer"
+        }
+      },
+      "title": "PerformanceConfig",
+      "type": "object"
+    },
+    "RsidConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "density": {
+          "argparse_dest": "rsid_density",
+          "default": 0.2,
+          "description": "Fraction of cohort sites rewritten to a known dbSNP variant.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Density",
+          "type": "number"
+        },
+        "vcf": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "argparse_dest": "dbsnp_vcf",
+          "default": null,
+          "description": "Override the rsID source VCF; default uses the cached ClinVar VCF's INFO/RS.",
+          "title": "Vcf"
+        }
+      },
+      "title": "RsidConfig",
+      "type": "object"
+    },
+    "SequencingErrorsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "dropout_rate": {
+          "argparse_dest": "dropout_rate",
+          "default": 0.0005,
+          "description": "Per-call probability of a coverage dropout.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Dropout Rate",
+          "type": "number"
+        },
+        "gt_flip_rate": {
+          "argparse_dest": "error_rate",
+          "default": 0.001,
+          "description": "Per-call probability of a GT flip (lightweight noise model).",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Gt Flip Rate",
+          "type": "number"
+        }
+      },
+      "title": "SequencingErrorsConfig",
+      "type": "object"
+    },
+    "SimulationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "demo_model": {
+          "argparse_dest": "demo_model",
+          "default": "OutOfAfrica_3G09",
+          "description": "stdpopsim model id, or 'none' for constant-size Ne.",
+          "title": "Demo Model",
+          "type": "string"
+        },
+        "mu": {
+          "argparse_dest": "mu",
+          "default": 1.29e-08,
+          "description": "Mutation rate, consulted only when demo_model='none'.",
+          "minimum": 0.0,
+          "title": "Mu",
+          "type": "number"
+        },
+        "population": {
+          "argparse_dest": "population",
+          "default": "CEU",
+          "description": "Sampling population for the demographic model.",
+          "title": "Population",
+          "type": "string"
+        },
+        "rec_rate": {
+          "argparse_dest": "rec_rate",
+          "default": 1e-08,
+          "description": "Recombination rate, consulted only when demo_model='none'.",
+          "minimum": 0.0,
+          "title": "Rec Rate",
+          "type": "number"
+        }
+      },
+      "title": "SimulationConfig",
+      "type": "object"
+    },
+    "StructuralVariantsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "length_max": {
+          "argparse_dest": "sv_length_max",
+          "default": 10000,
+          "description": "Maximum SV length in bp.",
+          "minimum": 1,
+          "title": "Length Max",
+          "type": "integer"
+        },
+        "length_min": {
+          "argparse_dest": "sv_length_min",
+          "default": 50,
+          "description": "Minimum SV length in bp (log-uniform draw).",
+          "minimum": 1,
+          "title": "Length Min",
+          "type": "integer"
+        },
+        "per_person": {
+          "argparse_dest": "svs_per_person",
+          "default": 3,
+          "description": "Structural variants (DEL/DUP/INV) per person.",
+          "minimum": 0,
+          "title": "Per Person",
+          "type": "integer"
+        }
+      },
+      "title": "StructuralVariantsConfig",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Schema for synthetic_people's generate_people_config.yaml. Documented at: https://github.com/nigel4321/synthetic-people/blob/main/synthetic_people/TUTORIAL.md",
+  "properties": {
+    "admixture": {
+      "$ref": "#/$defs/AdmixtureConfig",
+      "default": {
+        "afr_frac": 0.15,
+        "enabled": false,
+        "eur_frac": 0.6,
+        "sas_frac": 0.25
+      }
+    },
+    "cohort": {
+      "$ref": "#/$defs/CohortConfig",
+      "default": {
+        "build": "GRCh38",
+        "chr_length_mb": 5.0,
+        "chromosomes": "22",
+        "n": 10,
+        "seed": null
+      }
+    },
+    "legacy_background": {
+      "$ref": "#/$defs/LegacyBackgroundConfig",
+      "default": {
+        "af_min": 0.05,
+        "background_glob": null,
+        "enabled": false,
+        "n_background": 500,
+        "sfs_alpha": 2.0
+      }
+    },
+    "output": {
+      "$ref": "#/$defs/OutputConfig",
+      "default": {
+        "cache_dir": "./cache",
+        "dir": "./out",
+        "mode": "per-person"
+      }
+    },
+    "overlays": {
+      "$ref": "#/$defs/OverlaysConfig",
+      "default": {
+        "clinvar": {
+          "inject_density": 0.01,
+          "sig_filter": "Pathogenic,Likely_pathogenic,Pathogenic/Likely_pathogenic"
+        },
+        "cosmic": {
+          "enabled": false,
+          "inject_density": 0.005,
+          "vcf": null
+        },
+        "rsid": {
+          "density": 0.2,
+          "vcf": null
+        }
+      }
+    },
+    "performance": {
+      "$ref": "#/$defs/PerformanceConfig",
+      "default": {
+        "chr_chunk_mb": 0.0,
+        "cohort_arrow_batch_size": 256,
+        "cohort_mode": "auto",
+        "fanout_batch_size": 4,
+        "no_resume": false,
+        "profile_memory": null,
+        "workers": 0
+      }
+    },
+    "schema_version": {
+      "description": "Config-file schema version. Required so the loader can reject incompatibly-old configs with a clear message rather than silently mis-interpreting fields.",
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "sequencing_errors": {
+      "$ref": "#/$defs/SequencingErrorsConfig",
+      "default": {
+        "dropout_rate": 0.0005,
+        "gt_flip_rate": 0.001
+      }
+    },
+    "simulation": {
+      "$ref": "#/$defs/SimulationConfig",
+      "default": {
+        "demo_model": "OutOfAfrica_3G09",
+        "mu": 1.29e-08,
+        "population": "CEU",
+        "rec_rate": 1e-08
+      }
+    },
+    "structural_variants": {
+      "$ref": "#/$defs/StructuralVariantsConfig",
+      "default": {
+        "length_max": 10000,
+        "length_min": 50,
+        "per_person": 3
+      }
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "generate_people_config",
+  "type": "object"
+}
