@@ -35,6 +35,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r synthetic_people/requirements.txt
+          # pyarrow is a *conditional* dep at runtime (Phase 5d.1
+          # cohort-mode arrow path; n>=100k workloads). For CI we
+          # install it explicitly so the @skipUnless(HAS_PYARROW, ...)
+          # gates don't silently hide failures in the Arrow round-
+          # trip / parity / cli integration tests.
+          pip install pyarrow
 
       - name: Run unit tests
         working-directory: synthetic_people
