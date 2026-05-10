@@ -42,6 +42,27 @@ process MULTIQC {
         if [ -s "\$f" ]; then cp "\$f" _mqc_in/; fi
     done
 
+    # Diagnostic: print a digest of each bcftools_stats file so a CI
+    # failure has the actual input data visible in the workflow log.
+    # MultiQC 1.34's bcftools module has been seen to crash with
+    # "No datasets to plot" on edge-case Ts/Tv inputs (e.g. when
+    # every sample has nTransversions=0, so the per-sample tstv
+    # collapses to all zeros). Printing the PSC + ST sections inline
+    # lets us diagnose without re-running. Cheap, ~20 lines per
+    # input file; preserved in CI logs alongside the MultiQC error.
+    echo "=== bcftools_stats inputs (PSC + ST sections) ==="
+    for f in _mqc_in/*.bcftools_stats.txt; do
+        echo "--- \$f ---"
+        echo "[SN summary]"
+        grep -E "^SN\\s" "\$f" | head -20 || true
+        echo "[PSC per-sample]"
+        grep -E "^# PSC|^PSC\\s" "\$f" | head -30 || true
+        echo "[ST substitution types]"
+        grep -E "^# ST|^ST\\s" "\$f" || true
+        echo
+    done
+    echo "=== end bcftools_stats inputs ==="
+
     # `--filename` strips the .html and uses the basename for the data dir
     # too (e.g. `multiqc_report` → `multiqc_report.html` + `multiqc_report_data/`).
     # We want the canonical `multiqc_report.html` + `multiqc_data/` pair, so
