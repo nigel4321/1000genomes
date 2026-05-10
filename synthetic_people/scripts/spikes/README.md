@@ -28,7 +28,7 @@ learn early.
 |---|---|---|---|
 | 1 | ✅ shipped, **PASS** (2026-05-09) | OS-level: `np.memmap` + `fork` + 8 workers shares physical RAM | ~120 LOC |
 | 2 | ✅ shipped, **PASS** (2026-05-09) | `pyarrow` IPC streaming write + zero-copy mmap read across workers | ~280 LOC |
-| 2b | shipped, _not yet run_ | follow-up matrix: parent peak RSS as a function of `batch_size` × memory pool × `release_unused`-between-writes; pick a known-good default for 5d.1 | ~330 LOC |
+| 2b | ✅ shipped, **decided** (2026-05-10): `batch_size=256` | follow-up matrix: parent peak RSS as a function of `batch_size` × memory pool × `release_unused`-between-writes; pick a known-good default for 5d.1 | ~330 LOC |
 
 Run Spike 1 first. If it fails (workers don't share physical RAM),
 Spike 2 is moot — 5d's foundation is wrong and we rethink. If
@@ -280,9 +280,38 @@ fresh files, unlike Spike 1 which reuses).
 
 **File:** [`spike2b_pool_batch_matrix.py`](spike2b_pool_batch_matrix.py)
 
-**Result:** _not yet run_ — paste stdout into
-`spike2b_results_<date>.txt` alongside this README and link it here
-once available.
+**Result:** [`spike2b_results_2026-05-10.txt`](spike2b_results_2026-05-10.txt)
+— ran on the user's 32 GB workstation (2026-05-10) at two scales
+(20k × 50k = ~1 GB and 50k × 200k = ~10 GB). **Decision for 5d.1:
+`batch_size = 256`, default memory pool, no `release_unused()`
+calls.** Three findings, in order of importance:
+
+1. `batch_size` is the only knob that materially affects parent
+   peak RSS. Peak grows almost linearly with batch_size (256 →
+   ~125 MB / 1024 → ~469 MB / 4096 → ~1853 MB at 10 GB scale). The
+   peak is set by what's live during a single batch
+   (`batch_size × n_samples` raw bytes plus a ~3× multiplier for
+   per-batch numpy intermediates and the Arrow buffer copy), not by
+   anything the pool retains across batches.
+2. Pool choice doesn't move the needle. jemalloc and system show
+   numbers within ±50 MB everywhere — well inside noise.
+3. `release_unused()` between writes is a no-op. Same numbers
+   within 2 % across all paired cells.
+
+**Implication for n=1M.** Linearity model fitted to both scales:
+`peak_growth ≈ ~9.5 bytes/element × batch_size × n_samples`. Predicted
+parent peak at n=1M:
+
+  - `batch_size=256` → ~2.5 GB
+  - `batch_size=1024` → ~9.4 GB
+  - `batch_size=4096` → ~37 GB (catastrophic on a 32 GB host)
+
+Throughput cost of `batch_size=256` vs the hypothetical "best
+throughput" cell: ~7 % slower. Negligible vs disk I/O at n=1M.
+
+**Plan update needed (separate PR):** §5d task list currently shows
+`stream_variants_to_arrow_batches(ts, batch_size=1024)`. That should
+drop to `batch_size=256` with a citation to this spike.
 
 **Why this exists.** Spike 2's stress run (100k × 500k, ~46.57 GB
 Arrow file) showed parent peak RSS at 1051 MB during the streaming

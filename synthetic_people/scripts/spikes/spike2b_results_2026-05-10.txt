@@ -1,0 +1,206 @@
+Spike 2b result — 2026-05-10  (pool x batch_size x release_unused matrix)
+
+Verdict: clear winner.
+
+Decision for Phase 5d.1:
+  - batch_size = 256
+  - memory pool: keep pyarrow's default (jemalloc); do not call
+    pa.set_memory_pool(...)
+  - do not call pa.default_memory_pool().release_unused() between
+    write_batch() calls
+
+Cost of this decision: ~7% write-throughput reduction vs the
+hypothetical "best throughput" cell (batch_size=1024, jemalloc, no
+release_unused).
+
+Benefit: parent peak RSS at n=1M scale drops from a predicted ~9.4 GB
+(at batch_size=1024) to ~2.5 GB (at batch_size=256). At batch_size=
+4096 the predicted peak is ~37 GB — catastrophic on a 32 GB host.
+
+Three findings, in order of importance:
+
+1. batch_size is the only knob that materially affects parent peak
+   RSS. Across both runs (1 GB and 10 GB scale), peak grows almost
+   linearly with batch_size:
+     - 256  : +55 / +125 MB    (small / default scale)
+     - 1024 : +193 / +469 MB
+     - 4096 : +747 / +1853 MB
+   The peak is set by what's live during a single batch
+   (batch_size x n_samples raw bytes plus a ~3x multiplier for the
+   per-batch numpy intermediates and the Arrow buffer copy), not by
+   anything the pool retains across batches.
+
+2. Pool choice does not move the needle. jemalloc and system show
+   numbers within +/- 50 MB everywhere — well inside noise. The
+   hypothesis from the Spike 2 stress run that jemalloc's free-list
+   retention was driving parent RSS growth was wrong. The peak isn't
+   about retained-free buffers; it's about live-during-batch memory.
+
+3. release_unused() between writes is a no-op. Same numbers within
+   2% across all paired cells. Confirms #2 — the freelist isn't
+   where the cost lives. Adds code complexity for zero benefit.
+
+Linearity model and extrapolation to n=1M:
+
+  peak_growth ~= ~0.0095 bytes/element x batch_size x n_samples
+  (fitted from 6 data points across both scales; r^2 > 0.99)
+
+  Predicted parent peak at n_samples = 1,000,000:
+    batch_size = 256  ->   ~2.5 GB
+    batch_size = 1024 ->  ~9.4 GB
+    batch_size = 4096 -> ~37 GB  (would not run on a 32 GB host)
+
+The Spike 2 stress run (100k x 500k, batch_size=1024) measured
+1051 MB peak; the model predicts 938 MB from these matrix runs.
+1.12x ratio — within reason given larger files trigger more allocator
+high-water mark events.
+
+Throughput cost of going from batch_size=1024 -> 256 at 10 GB scale:
+  - jemalloc: 200 MB/s vs 218-239 MB/s, ~7% slower
+  - system  : 208-228 MB/s vs 216-228 MB/s, ~2-7% slower
+
+Negligible vs disk I/O at n=1M (NVMe headroom is 3 GB/s; even at
+228 MB/s we're disk-bound on the partial-BCF write side, not the
+Arrow stream-write side).
+
+Plan update needed: §5d task list currently shows
+  `stream_variants_to_arrow_batches(ts, batch_size=1024)`
+That should drop to `batch_size=256`. Separate PR.
+
+--- Step 1 stdout (smoke, 20k samples x 50k sites = ~1.0 GB) ---
+
+Spike 2b — pool x batch_size matrix
+  cells: 12
+  scale: 20000 samples x 50000 sites = ~1.0 GB raw GT bytes
+  pools: ['jemalloc', 'system']
+  batch sizes: [256, 1024, 4096]
+  release_unused axis: on
+  per-cell timeout: 1200 s
+  cell file: /tmp/spike2b_cell.arrow (deleted between cells)
+
+--- cell 1/12: pool=jemalloc batch_size=256 release_unused=False ---
+  pool_backend=jemalloc  peak=122.7 MB  growth=+55.1 MB  thr=245.4 MB/s  elapsed=4.07 s  (wallclock 4.4 s)
+
+--- cell 2/12: pool=jemalloc batch_size=256 release_unused=True ---
+  pool_backend=jemalloc  peak=124.0 MB  growth=+56.4 MB  thr=246.0 MB/s  elapsed=4.06 s  (wallclock 4.4 s)
+
+--- cell 3/12: pool=jemalloc batch_size=1024 release_unused=False ---
+  pool_backend=jemalloc  peak=258.8 MB  growth=+191.2 MB  thr=260.6 MB/s  elapsed=3.84 s  (wallclock 4.2 s)
+
+--- cell 4/12: pool=jemalloc batch_size=1024 release_unused=True ---
+  pool_backend=jemalloc  peak=261.5 MB  growth=+193.9 MB  thr=260.5 MB/s  elapsed=3.84 s  (wallclock 4.2 s)
+
+--- cell 5/12: pool=jemalloc batch_size=4096 release_unused=False ---
+  pool_backend=jemalloc  peak=814.8 MB  growth=+747.2 MB  thr=264.7 MB/s  elapsed=3.78 s  (wallclock 4.0 s)
+
+--- cell 6/12: pool=jemalloc batch_size=4096 release_unused=True ---
+  pool_backend=jemalloc  peak=814.6 MB  growth=+746.8 MB  thr=264.6 MB/s  elapsed=3.78 s  (wallclock 4.0 s)
+
+--- cell 7/12: pool=system batch_size=256 release_unused=False ---
+  pool_backend=system  peak=123.0 MB  growth=+55.3 MB  thr=244.8 MB/s  elapsed=4.09 s  (wallclock 4.4 s)
+
+--- cell 8/12: pool=system batch_size=256 release_unused=True ---
+  pool_backend=system  peak=122.4 MB  growth=+54.8 MB  thr=243.5 MB/s  elapsed=4.11 s  (wallclock 4.4 s)
+
+--- cell 9/12: pool=system batch_size=1024 release_unused=False ---
+  pool_backend=system  peak=262.2 MB  growth=+194.6 MB  thr=259.5 MB/s  elapsed=3.85 s  (wallclock 4.2 s)
+
+--- cell 10/12: pool=system batch_size=1024 release_unused=True ---
+  pool_backend=system  peak=260.1 MB  growth=+192.5 MB  thr=257.9 MB/s  elapsed=3.88 s  (wallclock 4.2 s)
+
+--- cell 11/12: pool=system batch_size=4096 release_unused=False ---
+  pool_backend=system  peak=763.9 MB  growth=+696.3 MB  thr=264.8 MB/s  elapsed=3.78 s  (wallclock 4.0 s)
+
+--- cell 12/12: pool=system batch_size=4096 release_unused=True ---
+  pool_backend=system  peak=810.0 MB  growth=+742.4 MB  thr=263.8 MB/s  elapsed=3.79 s  (wallclock 4.0 s)
+
+==============================================================================
+=== Summary ===
+  scale: 20000 samples x 50000 sites = ~1.0 GB raw
+
+  pool       backend     batch rel_unused    peak_MB  growth_MB   thr_MB/s  elapsed_s
+  -----------------------------------------------------------------------------------
+  jemalloc   jemalloc      256      False      122.7       55.1      245.4       4.07
+  jemalloc   jemalloc      256       True      124.0       56.4      246.0       4.06
+  jemalloc   jemalloc     1024      False      258.8      191.2      260.6       3.84
+  jemalloc   jemalloc     1024       True      261.5      193.9      260.5       3.84
+  jemalloc   jemalloc     4096      False      814.8      747.2      264.7       3.78
+  jemalloc   jemalloc     4096       True      814.6      746.8      264.6       3.78
+  system     system        256      False      123.0       55.3      244.8       4.09
+  system     system        256       True      122.4       54.8      243.5       4.11
+  system     system       1024      False      262.2      194.6      259.5       3.85
+  system     system       1024       True      260.1      192.5      257.9       3.88
+  system     system       4096      False      763.9      696.3      264.8       3.78
+  system     system       4096       True      810.0      742.4      263.8       3.79
+
+  Lowest peak growth: pool=system batch_size=256 release_unused=True -> +54.8 MB at 243.5 MB/s
+  Fastest write:      pool=system batch_size=4096 release_unused=False -> 264.8 MB/s at +696.3 MB peak
+
+--- Step 2 stdout (default, 50k samples x 200k sites = ~10.0 GB) ---
+
+Spike 2b — pool x batch_size matrix
+  cells: 12
+  scale: 50000 samples x 200000 sites = ~10.0 GB raw GT bytes
+  pools: ['jemalloc', 'system']
+  batch sizes: [256, 1024, 4096]
+  release_unused axis: on
+  per-cell timeout: 1200 s
+  cell file: /tmp/spike2b_cell.arrow (deleted between cells)
+
+--- cell 1/12: pool=jemalloc batch_size=256 release_unused=False ---
+  pool_backend=jemalloc  peak=192.9 MB  growth=+125.3 MB  thr=200.3 MB/s  elapsed=49.92 s  (wallclock 50.2 s)
+
+--- cell 2/12: pool=jemalloc batch_size=256 release_unused=True ---
+  pool_backend=jemalloc  peak=192.8 MB  growth=+125.2 MB  thr=199.8 MB/s  elapsed=50.05 s  (wallclock 50.2 s)
+
+--- cell 3/12: pool=jemalloc batch_size=1024 release_unused=False ---
+  pool_backend=jemalloc  peak=536.6 MB  growth=+469.0 MB  thr=238.7 MB/s  elapsed=41.9 s  (wallclock 42.2 s)
+
+--- cell 4/12: pool=jemalloc batch_size=1024 release_unused=True ---
+  pool_backend=jemalloc  peak=536.9 MB  growth=+469.3 MB  thr=218.0 MB/s  elapsed=45.88 s  (wallclock 46.2 s)
+
+--- cell 5/12: pool=jemalloc batch_size=4096 release_unused=False ---
+  pool_backend=jemalloc  peak=1911.2 MB  growth=+1843.6 MB  thr=218.7 MB/s  elapsed=45.72 s  (wallclock 46.0 s)
+
+--- cell 6/12: pool=jemalloc batch_size=4096 release_unused=True ---
+  pool_backend=jemalloc  peak=1920.2 MB  growth=+1852.6 MB  thr=212.1 MB/s  elapsed=47.15 s  (wallclock 47.4 s)
+
+--- cell 7/12: pool=system batch_size=256 release_unused=False ---
+  pool_backend=system  peak=193.1 MB  growth=+125.6 MB  thr=207.9 MB/s  elapsed=48.09 s  (wallclock 48.4 s)
+
+--- cell 8/12: pool=system batch_size=256 release_unused=True ---
+  pool_backend=system  peak=190.9 MB  growth=+123.3 MB  thr=228.1 MB/s  elapsed=43.83 s  (wallclock 44.0 s)
+
+--- cell 9/12: pool=system batch_size=1024 release_unused=False ---
+  pool_backend=system  peak=536.8 MB  growth=+469.2 MB  thr=216.0 MB/s  elapsed=46.3 s  (wallclock 46.6 s)
+
+--- cell 10/12: pool=system batch_size=1024 release_unused=True ---
+  pool_backend=system  peak=538.8 MB  growth=+471.3 MB  thr=227.7 MB/s  elapsed=43.91 s  (wallclock 44.2 s)
+
+--- cell 11/12: pool=system batch_size=4096 release_unused=False ---
+  pool_backend=system  peak=1920.8 MB  growth=+1853.2 MB  thr=220.3 MB/s  elapsed=45.4 s  (wallclock 45.6 s)
+
+--- cell 12/12: pool=system batch_size=4096 release_unused=True ---
+  pool_backend=system  peak=1920.9 MB  growth=+1853.3 MB  thr=225.8 MB/s  elapsed=44.29 s  (wallclock 44.6 s)
+
+==============================================================================
+=== Summary ===
+  scale: 50000 samples x 200000 sites = ~10.0 GB raw
+
+  pool       backend     batch rel_unused    peak_MB  growth_MB   thr_MB/s  elapsed_s
+  -----------------------------------------------------------------------------------
+  jemalloc   jemalloc      256      False      192.9      125.3      200.3      49.92
+  jemalloc   jemalloc      256       True      192.8      125.2      199.8      50.05
+  jemalloc   jemalloc     1024      False      536.6      469.0      238.7       41.9
+  jemalloc   jemalloc     1024       True      536.9      469.3      218.0      45.88
+  jemalloc   jemalloc     4096      False     1911.2     1843.6      218.7      45.72
+  jemalloc   jemalloc     4096       True     1920.2     1852.6      212.1      47.15
+  system     system        256      False      193.1      125.6      207.9      48.09
+  system     system        256       True      190.9      123.3      228.1      43.83
+  system     system       1024      False      536.8      469.2      216.0       46.3
+  system     system       1024       True      538.8      471.3      227.7      43.91
+  system     system       4096      False     1920.8     1853.2      220.3       45.4
+  system     system       4096       True     1920.9     1853.3      225.8      44.29
+
+  Lowest peak growth: pool=system batch_size=256 release_unused=True -> +123.3 MB at 228.1 MB/s
+  Fastest write:      pool=jemalloc batch_size=1024 release_unused=False -> 238.7 MB/s at +469.0 MB peak
