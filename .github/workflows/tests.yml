@@ -61,7 +61,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq bcftools tabix
 
-      # bin/ scripts are stdlib-only; tests self-skip when optional tools
-      # (e.g. nextflow for the e2e test) are missing.
+      # Install the pipeline-stage Python deps so the corresponding
+      # tests don't skip silently. Without this, test_plot_pca and
+      # test_qc_validate self-skip on missing numpy / sklearn /
+      # matplotlib / multiqc — and a regression in plot_pca.py or
+      # qc_validate.py would never fail CI. Same skip-hiding-bugs
+      # failure mode the Phase 5d.1 / pyarrow bug taught us about.
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r nextflow_pipeline/bin/requirements.txt
+
+      # Nextflow is required by tests/test_pipeline_e2e.py — without
+      # it the e2e test silently skips via fixtures.require_tools.
+      # The pipeline itself runs local-exec with no container
+      # directives (verified in main.nf + modules/*), so we only
+      # need nextflow itself + Java (pre-installed on ubuntu-latest).
+      - name: Set up Nextflow
+        uses: nf-core/setup-nextflow@v2
+
       - name: Run unit tests
         run: python .github/scripts/run_tests.py nextflow_pipeline
