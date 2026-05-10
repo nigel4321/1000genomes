@@ -137,8 +137,18 @@ def _densify_carriers_to_matrix(
     return matrix
 
 
-def _build_batch(sites: list, n_samples: int):
-    """Construct one ``pyarrow.RecordBatch`` from a list of site dicts."""
+def _build_batch(sites: list, n_samples: int, schema):
+    """Construct one ``pyarrow.RecordBatch`` from a list of site dicts.
+
+    ``schema`` must be the writer's declared schema (from
+    :func:`cohort_schema`). The batch is built with this schema
+    explicitly — without it, ``RecordBatch.from_pydict`` infers a
+    schema from the data that doesn't match the writer's (different
+    nullability, missing schema metadata, possibly different integer
+    widths), and the IPC writer rejects the batch with
+    ``ArrowInvalid: Tried to write record batch with different
+    schema``.
+    """
     import pyarrow as pa
 
     n_haplotypes = 2 * n_samples
@@ -194,13 +204,14 @@ def _build_batch(sites: list, n_samples: int):
             type=pa.int32(),
         ),
     }
-    return pa.RecordBatch.from_pydict(columns)
+    return pa.RecordBatch.from_pydict(columns, schema=schema)
 
 
 def stream_sites_to_arrow_batches(
     sites_iter: Iterable[dict],
     n_samples: int,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    schema=None,
 ) -> Iterator:
     """Yield one ``pyarrow.RecordBatch`` per ``batch_size`` sites.
 
@@ -209,19 +220,30 @@ def stream_sites_to_arrow_batches(
     ``~9.5 bytes/element × batch_size × n_haplotypes`` (Spike 2b
     empirical fit). At ``batch_size=256``, ``n_samples=1_000_000`` the
     predicted parent peak is ~5 GB.
+
+    ``schema`` should be the writer's declared schema (from
+    :func:`cohort_schema`). When omitted, a schema is built locally
+    with an empty ``chrom`` — fine for callers that don't write the
+    batches to an IPC file. When passed to a downstream
+    ``ipc.new_file(...).write_batch(...)`` writer the same schema
+    must be used both there and here, otherwise the writer rejects
+    the batch with ``ArrowInvalid: Tried to write record batch with
+    different schema``.
     """
     _require_pyarrow()
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
 
+    if schema is None:
+        schema = cohort_schema(n_samples, chrom="")
     buffer: list = []
     for site in sites_iter:
         buffer.append(site)
         if len(buffer) >= batch_size:
-            yield _build_batch(buffer, n_samples)
+            yield _build_batch(buffer, n_samples, schema)
             buffer = []
     if buffer:
-        yield _build_batch(buffer, n_samples)
+        yield _build_batch(buffer, n_samples, schema)
 
 
 def write_arrow_file(
@@ -247,7 +269,7 @@ def write_arrow_file(
 
     with ipc.new_file(str(arrow_path), schema) as writer:
         for batch in stream_sites_to_arrow_batches(
-            sites_iter, n_samples, batch_size=batch_size
+            sites_iter, n_samples, batch_size=batch_size, schema=schema,
         ):
             writer.write_batch(batch)
             n_written += batch.num_rows
