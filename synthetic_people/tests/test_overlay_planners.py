@@ -351,20 +351,55 @@ class WrapperThreadsReserveIndicesTest(unittest.TestCase):
     reserve constraint."""
 
     def test_inject_rsids_honours_reserve_indices(self):
+        # Marker-tag the reserved sites before injection, then assert
+        # they're untouched after. Without this, asserting only
+        # ``n > 0`` would mask a wrapper that ignored reserve_indices
+        # entirely. (PR #54 review caught this gap.)
         sites = [_site("22", i * 100) for i in range(1, 21)]
         pool = [_rsid_rec("22", 5_000_000 + i, "C", "T",
                           rsid=f"rs{i}") for i in range(40)]
-        # Pre-mark some sites as "claimed" by a prior overlay (here we
-        # simulate clinvar's clnsig field rather than running it).
         reserved = {2, 6, 10}
+        for i in reserved:
+            sites[i]["__test_marker"] = i
+            sites[i]["__original_pos"] = sites[i]["pos"]
+            sites[i]["__original_ref"] = sites[i]["ref"]
+            sites[i]["__original_alt"] = sites[i]["alts"][0]
+            sites[i]["__original_id"] = sites[i]["id"]
+
         n = inject_rsids(sites, pool, density=0.4,
                          rng=random.Random(11),
                          reserve_indices=reserved)
-        self.assertGreater(n, 0)
-        # After sort, the original index→pos mapping is gone; check by
-        # carrying a marker through. Re-run with reserve covering EVERY
-        # site to prove that no rsID injection happens when nothing's
-        # eligible.
+        self.assertGreater(n, 0,
+            "fixture must produce some injections so the partial-"
+            "reserve assertion below is meaningful")
+
+        # Every protected marker must survive the inject + sort. If a
+        # future refactor replaces site dicts (instead of mutating
+        # them) the markers disappear; the count assertion catches
+        # that silent regression rather than letting the per-site
+        # checks no-op past it.
+        marker_count = sum(1 for s in sites if "__test_marker" in s)
+        self.assertEqual(
+            marker_count, len(reserved),
+            f"expected all {len(reserved)} protected markers to "
+            f"survive but {marker_count} did — wrapper may be "
+            f"replacing site dicts instead of mutating",
+        )
+        # Each marked site must still have its original coordinates
+        # and id (i.e., no rsID was injected here).
+        for s in sites:
+            if "__test_marker" in s:
+                self.assertEqual(s["pos"], s["__original_pos"])
+                self.assertEqual(s["ref"], s["__original_ref"])
+                self.assertEqual(s["alts"], [s["__original_alt"]])
+                self.assertEqual(s["id"], s["__original_id"])
+                self.assertFalse(
+                    str(s["id"]).startswith("rs"),
+                    "reserved site picked up an rsID — wrapper "
+                    "ignored reserve_indices",
+                )
+
+        # Full-reserve case: nothing eligible → nothing injected.
         sites_full_reserve = [_site("22", i * 100) for i in range(1, 21)]
         full_reserve = set(range(len(sites_full_reserve)))
         n_blocked = inject_rsids(
@@ -382,7 +417,7 @@ class WrapperThreadsReserveIndicesTest(unittest.TestCase):
         # Use a marker pattern: tag specific sites with a known field
         # before injection, run inject_cosmic with reserve_indices
         # protecting those tagged sites, then assert the tagged sites
-        # are unchanged.
+        # are unchanged after the inject + sort.
         sites = [_site("22", i * 100) for i in range(1, 21)]
         protected_indices = {3, 7, 11, 15}
         for i in protected_indices:
@@ -399,8 +434,19 @@ class WrapperThreadsReserveIndicesTest(unittest.TestCase):
                           reserve_indices=protected_indices)
         self.assertGreater(n, 0)
 
-        # Find the protected sites (by marker) in the post-sort list
-        # and assert they were not overwritten.
+        # PR #54 review caught a silent-skip risk here: if a future
+        # refactor replaces site dicts instead of mutating them, the
+        # ``if "__test_marker" in s`` filter excludes every entry and
+        # the per-site assertion loop runs zero checks. Pin the
+        # marker count to ``len(protected_indices)`` first so any
+        # dict-replacement regression fails loudly.
+        marker_count = sum(1 for s in sites if "__test_marker" in s)
+        self.assertEqual(
+            marker_count, len(protected_indices),
+            f"expected all {len(protected_indices)} protected markers "
+            f"to survive but {marker_count} did — wrapper may be "
+            f"replacing site dicts instead of mutating",
+        )
         for s in sites:
             if "__test_marker" in s:
                 self.assertEqual(s["pos"], s["__original_pos"])
