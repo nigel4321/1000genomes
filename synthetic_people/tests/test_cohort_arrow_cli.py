@@ -506,5 +506,196 @@ class EffectiveChrLengthTest(unittest.TestCase):
         )
 
 
+class PreflightDiskCheckUsesEffectiveLengthTest(unittest.TestCase):
+    """Regression test for PR #55 Copilot review comment 1.
+
+    Pre-fix bug: cli.main called ``_preflight_arrow_disk_check`` with
+    raw ``args.chr_length_mb``. When the user passed ``--chr-length-mb
+    0`` (full contig) the scratch estimate collapsed to ~0 bytes and
+    the pre-flight became a silent no-op for exactly the WGS-scale
+    runs that needed it most. Post-fix wraps the length through
+    ``_effective_chr_length_mb`` so the check sees the real per-chrom
+    length (~249 Mb chr1 on GRCh38)."""
+
+    def test_raw_zero_length_estimate_is_trivial(self):
+        # Documents the broken path: at chr_length=0 the scratch
+        # estimator clamps to ``max(1, variants)`` and the resulting
+        # byte count is in the low-KB range, which defeats the disk
+        # check on any host with non-empty filesystem.
+        broken = _estimate_arrow_chrom_scratch_bytes(3000, 0)
+        self.assertLess(broken, 100_000)  # < 100 KB
+
+    def test_effective_length_estimate_is_multi_gigabyte(self):
+        # Post-fix: the effective length (chr1 ≈ 249 Mb) gives a
+        # scratch estimate in the multi-GB range for WGS-scale n,
+        # which actually catches scratch-disk pressure.
+        from syntheticgen.cli import _effective_chr_length_mb
+        eff_len = _effective_chr_length_mb(0, ["1"], "GRCh38")
+        self.assertGreater(eff_len, 240.0)
+        fixed = _estimate_arrow_chrom_scratch_bytes(3000, eff_len)
+        self.assertGreater(fixed, 5 * 1024**3)  # > 5 GB
+
+    def test_preflight_with_resolved_length_trips_disk_check(self):
+        # End-to-end the contract: when we pass the resolved length
+        # into _preflight_arrow_disk_check and there's no free disk,
+        # SystemExit fires. Without the fix (passing 0) it would
+        # silently pass.
+        from syntheticgen.cli import _effective_chr_length_mb
+        eff_len = _effective_chr_length_mb(0, ["1"], "GRCh38")
+        with tempfile.TemporaryDirectory() as tmp:
+            cohort_dir = Path(tmp) / "cohort"
+            DiskUsage = collections.namedtuple(
+                "DiskUsage", "total used free",
+            )
+            with mock.patch.object(
+                cli_module.shutil, "disk_usage",
+                return_value=DiskUsage(
+                    total=10**12, used=0, free=1024,  # 1 KB free
+                ),
+            ):
+                with self.assertRaises(SystemExit):
+                    _preflight_arrow_disk_check(
+                        cohort_dir, 3000, eff_len,
+                    )
+
+
+class CheckCohortModeChunkingCompatTest(unittest.TestCase):
+    """Helper extracted from cli main so the streaming-+-chunking
+    guard rails are unit-testable. PR #55 Copilot review comment 2
+    flagged that the explicit-mode hard-error path and the auto-mode
+    demote path were untested."""
+
+    def test_resolved_mode_not_streaming_is_noop(self):
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        # When the resolved mode isn't arrow-streaming the helper
+        # short-circuits to a no-op regardless of chunk size.
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow",
+            resolved_cohort_mode="arrow",
+            chunk_size_mb=5,
+            chromosomes=["1"],
+            build="GRCh38",
+            chr_length_mb=0,
+        )
+        self.assertEqual(final, "arrow")
+        self.assertIsNone(msg)
+
+    def test_streaming_with_chunk_zero_is_noop(self):
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        # The cli default of --chr-chunk-mb 0 means "no chunking" so
+        # the helper has nothing to do — important because the cli's
+        # pre-flight call site passes args.chr_chunk_mb (0 if user
+        # didn't set it) and would otherwise misfire.
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow-streaming",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=0,
+            chromosomes=["1"],
+            build="GRCh38",
+            chr_length_mb=0,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertIsNone(msg)
+
+    def test_streaming_with_full_chunk_is_noop(self):
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        # Chunk >= chrom length is a no-op (no actual split).
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow-streaming",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=70,
+            chromosomes=["22"],
+            build="GRCh38",
+            chr_length_mb=70,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertIsNone(msg)
+
+    def test_explicit_streaming_with_splitting_chunk_returns_error(self):
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        # User explicitly asked for --cohort-mode arrow-streaming
+        # AND --chr-chunk-mb 5 against a 70 Mb chrom: would split.
+        # Helper returns the original mode + ERROR message; the
+        # caller is responsible for sys.exiting the body.
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow-streaming",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=5,
+            chromosomes=["22"],
+            build="GRCh38",
+            chr_length_mb=70,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertIsNotNone(msg)
+        self.assertTrue(
+            msg.startswith("ERROR: "), f"got: {msg!r}",
+        )
+        self.assertIn(
+            "arrow-streaming does not yet support", msg,
+        )
+        self.assertIn("chunk_size_mb=5.00", msg)
+        self.assertIn("70.0 Mb", msg)
+
+    def test_auto_streaming_with_splitting_chunk_demotes_to_arrow(self):
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        # User picked --cohort-mode auto and the resolver settled on
+        # arrow-streaming. The auto-picked chunk would now split, so
+        # demote to arrow (which preserves mmap-share via the
+        # chunked materialised path) and emit INFO so the user can
+        # see what happened.
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="auto",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=5,
+            chromosomes=["22"],
+            build="GRCh38",
+            chr_length_mb=70,
+        )
+        self.assertEqual(final, "arrow")
+        self.assertIsNotNone(msg)
+        self.assertTrue(
+            msg.startswith("INFO: "), f"got: {msg!r}",
+        )
+        self.assertIn("demoted arrow-streaming → arrow", msg)
+        self.assertIn("chunk_size_mb=5.00", msg)
+
+    def test_explicit_streaming_full_contig_uses_effective_length(self):
+        # When the user passes --chr-length-mb 0 (full contig) the
+        # helper must resolve the length via chr1's contig size
+        # (~249 Mb on GRCh38) — otherwise small chunks would look
+        # like "no split" and the ERROR wouldn't fire. Regression
+        # test for the Comment 1 wiring at the actual check call.
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow-streaming",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=50,
+            chromosomes=["1"],
+            build="GRCh38",
+            chr_length_mb=0,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertTrue(msg.startswith("ERROR: "))
+        # The message should report a real per-chrom length, not 0.
+        self.assertNotIn("0.0 Mb", msg)
+
+    def test_no_chrom_info_defers_silently(self):
+        # Defensive: when chromosomes/build are missing and the user
+        # didn't pin chr_length_mb, the effective length resolves to
+        # 0 and the helper defers (silent no-op) rather than firing
+        # spurious messages off stale data.
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="auto",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=5,
+            chromosomes=None,
+            build=None,
+            chr_length_mb=0,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertIsNone(msg)
+
+
 if __name__ == "__main__":
     unittest.main()
