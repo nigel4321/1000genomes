@@ -801,7 +801,8 @@ def _plan_cohort_overlays(
       The materialised path is::
 
           inject_clinvar(sites, ...)   # mutates pos in place, then sorts
-          clinvar_reserved = {i: sites[i].clnsig}   # POST-SORT indices
+          clinvar_reserved = {i for i, s in enumerate(sites)
+                              if s.get("clnsig")}   # POST-SORT indices
           inject_rsids(sites, ..., reserve=clinvar_reserved)
           ...
 
