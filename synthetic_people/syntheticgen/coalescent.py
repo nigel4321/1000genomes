@@ -464,6 +464,403 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
     return sites
 
 
+# ---------------------------------------------------------------------------
+# Streaming-cohort primitives (PR 2 of the option-3 refactor)
+# ---------------------------------------------------------------------------
+#
+# At WGS scale (chr1 = 249 Mb, ~1.5 M variants × n=3000) the in-memory
+# sites list returned by ``_tree_sequence_to_sites`` reaches ~17 GB
+# (memprof28). The streaming approach replaces "materialise everything,
+# then mutate in place, then sort, then stream into Arrow" with:
+#
+#   pass 1: walk ts.variants() once, accept/reject under the same
+#           filters, consume rng identically (ref + alt picks), build
+#           a light ``sites_meta`` list of one tuple per accepted site.
+#
+#   plan:   the cli (PR 3) calls ``clinvar.plan_inject_clinvar`` /
+#           ``dbsnp.plan_inject_rsids`` / ``cosmic.plan_inject_cosmic``
+#           against ``sites_meta`` to get ``{index: overlay_record}``
+#           plans. ``annotate_clinvar``'s match set is similarly
+#           pre-computed from ``sites_meta`` (no carriers needed for
+#           a (chrom, pos, ref, alt) key match).
+#
+#   pass 2: walk ts.variants() again, this time building full site
+#           dicts (with carriers). The rng is restored to its
+#           pre-pass-1 state via getstate/setstate so the same
+#           per-variant rng.choice + choose_alt sequence happens —
+#           guaranteeing byte-identical ref/alt picks. Pass 2 yields
+#           sites in pos order: tree-derived sites are emitted at
+#           tree pos (which is monotone); overlay-injected sites are
+#           held in a small heap and drained when the tree-walk pos
+#           crosses the overlay's pos.
+#
+# Memory bound: ~75 MB sites_meta + ~few-hundred MB peak heap at
+# density=0.04 × 1.5 M sites = ~60 k injected records × ~few KB
+# carriers each. Two orders of magnitude smaller than the 17 GB
+# materialised path while preserving byte-identical output at every
+# fixed seed (master rng + overlay rng).
+
+
+def _tree_sequence_to_sites_meta(ts, chrom: str, n_people: int,
+                                 rng: random.Random,
+                                 titv_target: float,
+                                 position_offset: int = 0,
+                                 keep_below_bp: int | None = None
+                                 ) -> list:
+    """Pass 1 of the streaming-cohort walk: produce one
+    ``(chrom, pos, ref, alt, n_alt_haplotypes, n_haplotypes)`` tuple
+    per accepted variant *without* building carriers.
+
+    Consumes rng in the same sequence as :func:`_tree_sequence_to_sites`
+    — same filters, same ``rng.choice`` + ``choose_alt`` calls per
+    accepted variant, same per-call position dedup advancement. The
+    only difference is what's stored: a 6-tuple instead of a site
+    dict with full ``carriers``.
+
+    The tuple shape carries everything the overlay planners and the
+    pass-2 walk need:
+
+    - ``(chrom, pos)`` for the ``plan_inject_*`` index-picking
+      planners and the ``annotate_clinvar`` match-key lookup.
+    - ``(ref, alt)`` so pass 2 can avoid re-consuming rng for these
+      picks (and so ``annotate_clinvar`` keys match the legacy
+      ``(chrom, pos, ref, alt)`` form).
+    - ``(n_alt_haplotypes, n_haplotypes)`` so AC/AN/AF can be re-
+      derived in pass 2 without re-scanning ``var.genotypes``.
+
+    At WGS chr1 × n=3000: ~1.5 M tuples × ~80 bytes ≈ 120 MB.
+    """
+    n_haplotypes = 2 * n_people
+    meta: list = []
+    used_positions: set = set()
+    for var in ts.variants():
+        if (keep_below_bp is not None
+                and int(var.site.position) >= keep_below_bp):
+            continue
+
+        pos = int(var.site.position) + 1 + position_offset
+        while pos in used_positions:
+            pos += 1
+        used_positions.add(pos)
+
+        gts_arr = var.genotypes
+        if int(gts_arr.max(initial=0)) > 1:
+            continue
+        n_alt_haplotypes = int((gts_arr > 0).sum())
+        if n_alt_haplotypes == 0 or n_alt_haplotypes == n_haplotypes:
+            continue
+
+        ref = rng.choice(("A", "C", "G", "T"))
+        alt = choose_alt(ref, rng, target=titv_target)
+        assert alt is not None
+
+        meta.append((chrom, pos, ref, alt,
+                     n_alt_haplotypes, n_haplotypes))
+    return meta
+
+
+def _build_carriers_from_variant(var):
+    """Extract the sparse ``[(hap_idx, allele_idx), ...]`` carriers
+    list from a tskit :class:`Variant`. Same logic as the inline list
+    comprehension in :func:`_tree_sequence_to_sites`, lifted to a
+    helper so pass 2 of the streaming walk can call it without
+    duplicating the per-haplotype loop.
+    """
+    gts_arr = var.genotypes
+    return [(int(idx), int(allele))
+            for idx, allele in enumerate(gts_arr) if allele > 0]
+
+
+def _stream_cohort_pass2(ts, chrom: str, n_people: int,
+                        rng: random.Random,
+                        titv_target: float,
+                        sites_meta: list,
+                        inject_map: dict,
+                        annotation_map: dict,
+                        position_offset: int = 0,
+                        keep_below_bp: int | None = None):
+    """Pass 2 of the streaming-cohort walk: yield full site dicts in
+    pos-sorted order, applying pre-computed overlays.
+
+    Walks ``ts.variants()`` a second time, consumes rng identically to
+    pass 1 (so per-variant ``rng.choice`` + ``choose_alt`` produce the
+    same ref/alt picks the planners already decided against — caller is
+    responsible for ``getstate``/``setstate`` around the two passes).
+    For each accepted site:
+
+    - If the post-filter index is in ``inject_map``: builds the
+      overlay site dict (overlay's pos / ref / alts / id / overlay-
+      specific INFO fields, paired with the tree variant's carriers
+      and the meta's AC/AN/AF), and pushes it into a min-heap keyed
+      on overlay pos.
+    - Otherwise: builds the tree-derived site dict (with annotation
+      applied if applicable) at the tree pos, and pushes that into
+      the same heap.
+
+    After each iteration we compute a **safe-yield threshold** =
+    smallest pos any future site can have. Future tree sites have
+    pos > current_pos (monotone walk + dedup); future overlay sites
+    have pos >= ``overlay_positions_sorted[overlay_next_idx]``. The
+    threshold is ``min(pos + 1, next-overlay-pos)``. Anything in the
+    heap with ``pos < threshold`` is safe to yield.
+
+    Result: a stream of site dicts in monotone-by-pos order,
+    structurally identical to what the materialised path produces
+    post-``sites.sort(key=lambda s: s["pos"])``.
+
+    Memory model: buffer holds tree-derived sites that are "ahead of"
+    an un-emitted overlay (e.g. tree at pos=120k waiting for overlay
+    at pos=75k) plus overlay sites awaiting their turn. With overlay
+    positions roughly uniform across the chromosome the buffer stays
+    small (O(sqrt(N_inject))); with overlays pathologically clustered
+    at one end it can grow to ~all tree sites pending the cluster,
+    which is the bounded worst case the materialised path always
+    paid. Practical density × position distributions keep it in the
+    hundreds-of-MB range — far below the 17 GB materialised cost.
+    """
+    import heapq
+
+    # Pre-compute sorted overlay positions so we know what's still
+    # ahead at each iteration. Each entry is `(pos, accepted_idx)`
+    # so we could in principle look up the overlay record by idx,
+    # but for the safe-yield bound we only need pos.
+    overlay_positions_sorted = sorted(
+        rec["pos"] for rec in inject_map.values()
+    )
+    overlay_next_idx = 0
+
+    buffer: list = []  # min-heap of (pos, counter, site_dict)
+    counter = 0
+    accepted_idx = -1
+    used_positions: set = set()
+    n_haplotypes_total_cohort = n_haplotypes_total(n_people)
+
+    for var in ts.variants():
+        if (keep_below_bp is not None
+                and int(var.site.position) >= keep_below_bp):
+            continue
+
+        pos = int(var.site.position) + 1 + position_offset
+        while pos in used_positions:
+            pos += 1
+        used_positions.add(pos)
+
+        gts_arr = var.genotypes
+        if int(gts_arr.max(initial=0)) > 1:
+            continue
+        n_alt_haplotypes = int((gts_arr > 0).sum())
+        if (n_alt_haplotypes == 0
+                or n_alt_haplotypes == n_haplotypes_total_cohort):
+            continue
+
+        ref = rng.choice(("A", "C", "G", "T"))
+        alt = choose_alt(ref, rng, target=titv_target)
+        assert alt is not None
+
+        accepted_idx += 1
+        _, _, meta_ref, meta_alt, ac, n_haplotypes = sites_meta[accepted_idx]
+        assert ref == meta_ref and alt == meta_alt, (
+            f"streaming pass 2 rng divergence at idx {accepted_idx}: "
+            f"got ({ref!r},{alt!r}) expected ({meta_ref!r},{meta_alt!r})"
+        )
+
+        carriers = _build_carriers_from_variant(var)
+
+        if accepted_idx in inject_map:
+            overlay = inject_map[accepted_idx]
+            site = {
+                "chrom": chrom,
+                "pos": overlay["pos"],
+                "id": overlay.get("id", "."),
+                "ref": overlay["ref"],
+                "alts": list(overlay["alts"]),
+                "afs": [ac / n_haplotypes],
+                "acs": [ac],
+                "n_haplotypes": n_haplotypes,
+                "carriers": carriers,
+            }
+            for k in ("clnsig", "clndn", "cosmic_id", "cosmic_gene"):
+                if k in overlay:
+                    site[k] = overlay[k]
+            heapq.heappush(buffer, (site["pos"], counter, site))
+            counter += 1
+            overlay_next_idx += 1
+        else:
+            site = {
+                "chrom": chrom,
+                "pos": pos,
+                "id": ".",
+                "ref": ref,
+                "alts": [alt],
+                "afs": [ac / n_haplotypes],
+                "acs": [ac],
+                "n_haplotypes": n_haplotypes,
+                "carriers": carriers,
+            }
+            if accepted_idx in annotation_map:
+                ann = annotation_map[accepted_idx]
+                site["clnsig"] = ann["clnsig"]
+                site["clndn"] = ann["clndn"]
+                if site.get("id") in (None, "", ".") and ann.get("id"):
+                    site["id"] = ann["id"]
+            heapq.heappush(buffer, (pos, counter, site))
+            counter += 1
+
+        # Safe-yield threshold: smallest pos any future site can have.
+        if overlay_next_idx < len(overlay_positions_sorted):
+            next_overlay_pos = overlay_positions_sorted[overlay_next_idx]
+        else:
+            next_overlay_pos = float("inf")
+        # Future tree pos > current pos; tighten using +1 because dedup
+        # always advances strictly.
+        smallest_future_pos = min(pos + 1, next_overlay_pos)
+
+        while buffer and buffer[0][0] < smallest_future_pos:
+            yield heapq.heappop(buffer)[2]
+
+    # Drain remaining buffer entries (all guaranteed to be in order
+    # since no future site can land below their pos at end-of-walk).
+    while buffer:
+        yield heapq.heappop(buffer)[2]
+
+
+def n_haplotypes_total(n_people: int) -> int:
+    """Cohort haplotype count = 2 × n_people (diploid). Helper used by
+    the streaming pass 2 so the monomorphic-site filter line stays
+    readable."""
+    return 2 * n_people
+
+
+def _build_annotation_map(sites_meta: list,
+                          clinvar_records: list | None) -> dict:
+    """Pre-compute the ``annotate_clinvar`` index→record mapping from a
+    light sites_meta list, without needing the full sites list.
+
+    Matches on ``(chrom, pos, ref, alt)`` identically to
+    :func:`syntheticgen.clinvar.annotate_clinvar`. Returns
+    ``{accepted_idx: clinvar_record}`` for indices that match. The
+    streaming pass 2 then attaches ``clnsig`` / ``clndn`` / ``id``
+    fields to those sites as they pass through.
+    """
+    if not clinvar_records:
+        return {}
+    index: dict = {}
+    for r in clinvar_records:
+        index[(r["chrom"], r["pos"], r["ref"], r["alt"])] = r
+    out: dict = {}
+    for i, meta in enumerate(sites_meta):
+        chrom, pos, ref, alt = meta[0], meta[1], meta[2], meta[3]
+        rec = index.get((chrom, pos, ref, alt))
+        if rec is not None:
+            out[i] = rec
+    return out
+
+
+def stream_cohort_sites(
+    ts, chrom: str, n_people: int,
+    rng: random.Random,
+    titv_target: float = DEFAULT_TARGET_TITV,
+    *,
+    clinvar_records: list | None = None,
+    clinvar_inject_density: float = 0.0,
+    rsid_pool: list | None = None,
+    rsid_density: float = 0.0,
+    cosmic_records: list | None = None,
+    cosmic_inject_density: float = 0.0,
+    overlay_rng: random.Random | None = None,
+    position_offset: int = 0,
+    keep_below_bp: int | None = None,
+):
+    """Top-level streaming-cohort entry point.
+
+    Replaces the materialised pattern::
+
+        sites = _tree_sequence_to_sites(ts, ..., rng=rng)
+        annotate_clinvar(sites, clinvar_records)
+        inject_clinvar(sites, clinvar_records, density, overlay_rng)
+        inject_rsids(sites, rsid_pool, density, overlay_rng, reserve_indices=...)
+        inject_cosmic(sites, cosmic_records, density, overlay_rng, reserve_indices=...)
+        sites.sort(key=lambda s: s["pos"])
+        # ... downstream consumer iterates sites
+
+    with::
+
+        for site in stream_cohort_sites(ts, chrom, n_people, rng,
+                                        clinvar_records=clinvar_records,
+                                        clinvar_inject_density=density,
+                                        ..., overlay_rng=overlay_rng):
+            # ... downstream consumer
+
+    Output is **byte-identical** at every fixed combination of seeds
+    (``rng`` and ``overlay_rng``) to the materialised path. The rng
+    consumes the same number of randoms (each variant consumes
+    ``rng.choice + choose_alt``); the per-pass rng state is bracketed
+    via ``getstate``/``setstate`` so two passes produce the same
+    cumulative consumption as one.
+
+    Memory bound: ``sites_meta`` (~120 MB at WGS chr1) + overlay heap
+    (~few hundred MB peak) — two orders of magnitude smaller than the
+    materialised path.
+
+    Caller still owns the ``ts.dump`` lifecycle / overlay record
+    sourcing / sort-on-completion logic — this function only replaces
+    the in-memory site list with a streaming iterator.
+    """
+    state_before = rng.getstate()
+
+    sites_meta = _tree_sequence_to_sites_meta(
+        ts, chrom, n_people, rng, titv_target,
+        position_offset=position_offset,
+        keep_below_bp=keep_below_bp,
+    )
+
+    annotation_map = _build_annotation_map(sites_meta, clinvar_records)
+
+    # Light (chrom, pos) view for the planners — sufficient for index
+    # picking and pos-collision avoidance.
+    sites_meta_chrpos = [(m[0], m[1]) for m in sites_meta]
+
+    from .clinvar import plan_inject_clinvar
+    from .dbsnp import plan_inject_rsids
+    from .cosmic import plan_inject_cosmic
+
+    rng_for_plans = overlay_rng if overlay_rng is not None else rng
+
+    clinvar_plan = plan_inject_clinvar(
+        sites_meta_chrpos, clinvar_records or [],
+        clinvar_inject_density, rng_for_plans,
+    )
+    clinvar_reserved = set(annotation_map.keys()) | set(clinvar_plan.keys())
+    rsid_plan = plan_inject_rsids(
+        sites_meta_chrpos, rsid_pool or [],
+        rsid_density, rng_for_plans,
+        reserve_indices=clinvar_reserved,
+    )
+    all_reserved = clinvar_reserved | set(rsid_plan.keys())
+    cosmic_plan = plan_inject_cosmic(
+        sites_meta_chrpos, cosmic_records or [],
+        cosmic_inject_density, rng_for_plans,
+        reserve_indices=all_reserved,
+    )
+
+    # Combine: cosmic last so its keys override on (impossible) collisions.
+    inject_map: dict = {}
+    inject_map.update(clinvar_plan)
+    inject_map.update(rsid_plan)
+    inject_map.update(cosmic_plan)
+
+    # Restore rng state for pass 2 — same per-variant rng calls reproduce
+    # the same ref/alt picks the planners already locked in.
+    rng.setstate(state_before)
+
+    yield from _stream_cohort_pass2(
+        ts, chrom, n_people, rng, titv_target,
+        sites_meta, inject_map, annotation_map,
+        position_offset=position_offset,
+        keep_below_bp=keep_below_bp,
+    )
+
+
 def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
                                    length_mb: float,
                                    demo_model: str | None,
