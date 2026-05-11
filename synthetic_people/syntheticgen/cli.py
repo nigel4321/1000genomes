@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import random
 import shutil
@@ -438,14 +439,22 @@ def _check_cohort_mode_chunking_compat(
         # this same check on whatever the auto-picker lands at.
         # Recommend an explicit chunk size at or above the effective
         # chrom length (which guarantees no split), or switching
-        # modes.
+        # modes. ``ceil`` (not ``round`` or ``.0f``) because a
+        # recommendation of ``round(70.1) = 70`` would still split
+        # a 70.1 Mb chromosome, and ``round(0.4) = 0`` would
+        # reintroduce the forbidden ``--chr-chunk-mb 0`` suggestion
+        # for sub-Mb effective lengths. PR #60 review caught this.
+        # We reach this branch only when
+        # ``_chunking_would_split`` returned True, which requires
+        # ``eff_len_mb > 0``, so ``ceil`` always yields >= 1.
+        suggested_chunk = math.ceil(eff_len_mb)
         return (
             resolved_cohort_mode,
             f"ERROR: --cohort-mode arrow-streaming does not yet "
             f"support a chunked simulation that splits chromosomes "
             f"(chunk_size_mb={chunk_size_mb:.2f} Mb < effective "
             f"chrom length {eff_len_mb:.1f} Mb). Pass an explicit "
-            f"--chr-chunk-mb {eff_len_mb:.0f} (or larger) to keep "
+            f"--chr-chunk-mb {suggested_chunk} (or larger) to keep "
             f"the chromosome unsplit, or use --cohort-mode arrow / "
             f"sites_list.",
         )
