@@ -691,6 +691,49 @@ class CheckCohortModeChunkingCompatTest(unittest.TestCase):
         # The message should report a real per-chrom length, not 0.
         self.assertNotIn("0.0 Mb", msg)
 
+    def test_suggested_chunk_is_ceil_not_round_for_non_integer_length(self):
+        # PR #60 review: the suggested chunk in the ERROR message was
+        # ``{eff_len_mb:.0f}``, which rounds (Python's banker's rule
+        # at .5) and can produce a value BELOW eff_len — so the
+        # advised remedy would still split the chrom. Use a pinned
+        # explicit chr_length_mb=70.1 to make the bug visible: the
+        # suggestion must be 71 (ceil), never 70.
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow-streaming",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=5,
+            chromosomes=["22"],
+            build="GRCh38",
+            chr_length_mb=70.1,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertTrue(msg.startswith("ERROR: "))
+        self.assertIn("70.1 Mb", msg)
+        self.assertIn("--chr-chunk-mb 71", msg)
+        # And critically: must NOT recommend 70 (would still split).
+        self.assertNotIn("--chr-chunk-mb 70 ", msg)
+
+    def test_suggested_chunk_never_zero_for_sub_mb_length(self):
+        # The original ``.0f`` formatter would have rounded a 0.4 Mb
+        # effective length down to 0 and reintroduced the forbidden
+        # ``--chr-chunk-mb 0`` recommendation that PR #58 already
+        # removed. Pin a sub-Mb explicit length so the helper has to
+        # ceil to 1 here.
+        from syntheticgen.cli import _check_cohort_mode_chunking_compat
+        final, msg = _check_cohort_mode_chunking_compat(
+            cli_cohort_mode="arrow-streaming",
+            resolved_cohort_mode="arrow-streaming",
+            chunk_size_mb=0.1,
+            chromosomes=["22"],
+            build="GRCh38",
+            chr_length_mb=0.4,
+        )
+        self.assertEqual(final, "arrow-streaming")
+        self.assertTrue(msg.startswith("ERROR: "))
+        self.assertIn("--chr-chunk-mb 1", msg)
+        self.assertNotIn("--chr-chunk-mb 0", msg)
+
     def test_no_chrom_info_defers_silently(self):
         # Defensive: when chromosomes/build are missing and the user
         # didn't pin chr_length_mb, the effective length resolves to
