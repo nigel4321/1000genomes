@@ -382,6 +382,73 @@ def _estimate_materialised_parent_peak_bytes(
     return int(n_samples * chr_length_mb * bytes_per_sample_per_mb)
 
 
+def _check_cohort_mode_chunking_compat(
+    *,
+    cli_cohort_mode: str,
+    resolved_cohort_mode: str,
+    chunk_size_mb: float,
+    chromosomes: list | None,
+    build: str | None,
+    chr_length_mb: float,
+) -> tuple[str, str | None]:
+    """Validate streaming-mode + chunking compatibility.
+
+    Used at two cli call sites:
+
+    - **pre-flight** (before chunk auto-pick): catches the explicit-
+      explicit combination ``--cohort-mode arrow-streaming`` +
+      ``--chr-chunk-mb`` that would split. Caller passes
+      ``chunk_size_mb=args.chr_chunk_mb`` — i.e. the explicit value
+      (0 if user defaulted, which makes ``_chunking_would_split``
+      return False and this helper a no-op).
+    - **second pass** (after chunk auto-pick lands): catches the
+      auto-picked-chunk-would-split case. Caller passes the resolved
+      ``chunk_size_mb``.
+
+    Returns ``(final_mode, status_message)`` where ``status_message``
+    is one of:
+
+    - ``None`` — nothing to do; ``final_mode == resolved_cohort_mode``.
+    - prefix ``"ERROR: "`` — fatal; caller should ``sys.exit`` the
+      message body. Fires when user explicitly asked for
+      ``--cohort-mode arrow-streaming`` AND chunking would split.
+    - prefix ``"INFO: "`` — informational demote; caller should
+      print to stderr. Fires when ``--cohort-mode auto`` picked
+      streaming but chunking would split, and the helper falls
+      back to ``arrow`` (which preserves mmap-share for workers).
+
+    Pulled out of cli's main flow so the user-facing guard rails
+    around streaming-+-chunking are unit-testable without needing
+    the full ``cli.main`` integration test stack. PR #55 Copilot
+    review caught the gap.
+    """
+    if resolved_cohort_mode != "arrow-streaming":
+        return (resolved_cohort_mode, None)
+    eff_len_mb = _effective_chr_length_mb(
+        chr_length_mb, chromosomes, build,
+    )
+    if not _chunking_would_split(chunk_size_mb, eff_len_mb):
+        return (resolved_cohort_mode, None)
+    # Streaming + chunking-would-split is unsupported. Branch on
+    # whether the user picked streaming explicitly or via auto.
+    if cli_cohort_mode == "arrow-streaming":
+        return (
+            resolved_cohort_mode,
+            f"ERROR: --cohort-mode arrow-streaming does not yet "
+            f"support a chunked simulation that splits chromosomes "
+            f"(chunk_size_mb={chunk_size_mb:.2f} Mb < effective "
+            f"chrom length {eff_len_mb:.1f} Mb). Pass "
+            f"--chr-chunk-mb 0 (no chunking) or use --cohort-mode "
+            f"arrow / sites_list.",
+        )
+    return (
+        "arrow",
+        f"INFO: --cohort-mode auto demoted arrow-streaming → arrow "
+        f"because chunk_size_mb={chunk_size_mb:.2f} would split the "
+        f"simulation (streaming does not yet support chunked sim).",
+    )
+
+
 def _resolve_cohort_mode(cli_mode: str, n: int,
                          chr_length_mb: float = 0.0,
                          chromosomes: list | None = None,
@@ -1179,21 +1246,19 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     # simulation isn't supported (simulate_chromosome_ts raises
     # NotImplementedError if it gets there). Catch it here so the
     # user sees a clear message immediately rather than after several
-    # minutes of msprime work.
-    if (args.cohort_mode == "arrow-streaming"
-            and args.chr_chunk_mb > 0):
-        eff_len_mb = _effective_chr_length_mb(
-            args.chr_length_mb, chromosomes, args.build,
-        )
-        if _chunking_would_split(args.chr_chunk_mb, eff_len_mb):
-            sys.exit(
-                f"--cohort-mode arrow-streaming does not yet support "
-                f"a chunked simulation that splits chromosomes "
-                f"(--chr-chunk-mb {args.chr_chunk_mb} Mb < effective "
-                f"chrom length {eff_len_mb:.1f} Mb). Either pass "
-                f"--chr-chunk-mb 0 (no chunking) or use "
-                f"--cohort-mode arrow / sites_list."
-            )
+    # minutes of msprime work. Passing ``args.chr_chunk_mb`` here
+    # (default 0) makes the helper a no-op for auto users — the
+    # auto-picked-chunk case is caught by the second-pass check below.
+    _, _msg = _check_cohort_mode_chunking_compat(
+        cli_cohort_mode=args.cohort_mode,
+        resolved_cohort_mode=cohort_mode,
+        chunk_size_mb=args.chr_chunk_mb,
+        chromosomes=chromosomes,
+        build=args.build,
+        chr_length_mb=args.chr_length_mb,
+    )
+    if _msg and _msg.startswith("ERROR: "):
+        sys.exit(_msg[len("ERROR: "):])
     if cohort_mode in ("arrow", "arrow-streaming"):
         try:
             from . import cohort_arrow  # noqa: F401
@@ -1216,8 +1281,17 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
                     f"n~30000)."
                 )
     if cohort_mode in ("arrow", "arrow-streaming"):
+        # Use the EFFECTIVE chrom length, not the raw flag value:
+        # when --chr-length-mb is 0 (full contig), the raw value would
+        # make the scratch-bytes estimate collapse to ~0, silently
+        # turning the disk pre-flight into a no-op for exactly the
+        # WGS-scale runs that need it most. PR #55 Copilot review
+        # caught this; resolve to chr1-equivalent here too.
         _preflight_arrow_disk_check(
-            cohort_dir, args.n, args.chr_length_mb,
+            cohort_dir, args.n,
+            _effective_chr_length_mb(
+                args.chr_length_mb, chromosomes, args.build,
+            ),
         )
     print(
         f"  cohort intermediate mode: {cohort_mode} "
@@ -1318,34 +1392,21 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     # ``chunk_size_mb`` (auto-picked or explicit) would actually
     # split the simulation, and we previously resolved cohort_mode to
     # arrow-streaming, we have to handle the unsupported combination.
-    # For ``--cohort-mode auto``: silently demote streaming → arrow
-    # since the chunked materialised+arrow path covers the same
-    # memory ceiling. For explicit ``--cohort-mode arrow-streaming``
-    # the early pre-flight above already handled the explicit-chunk
-    # case; the auto-picked-chunk case is what we catch here.
-    if cohort_mode == "arrow-streaming":
-        eff_len_mb = _effective_chr_length_mb(
-            args.chr_length_mb, chromosomes, args.build,
-        )
-        if _chunking_would_split(chunk_size_mb, eff_len_mb):
-            if args.cohort_mode == "arrow-streaming":
-                sys.exit(
-                    f"--cohort-mode arrow-streaming does not yet "
-                    f"support a chunked simulation that splits "
-                    f"chromosomes. Chunk size auto-picked at "
-                    f"{chunk_size_mb:.2f} Mb < effective chrom "
-                    f"length {eff_len_mb:.1f} Mb. Pass an explicit "
-                    f"--chr-chunk-mb 0 to disable chunking, or use "
-                    f"--cohort-mode arrow / sites_list."
-                )
-            print(
-                f"  --cohort-mode auto demoted arrow-streaming → "
-                f"arrow because chunk_size_mb={chunk_size_mb:.2f} "
-                f"would split the simulation (streaming does not yet "
-                f"support chunked sim)",
-                file=sys.stderr,
-            )
-            cohort_mode = "arrow"
+    # The helper routes both paths: ERROR for explicit
+    # ``--cohort-mode arrow-streaming``, INFO + demote → arrow for
+    # ``--cohort-mode auto``.
+    cohort_mode, _msg = _check_cohort_mode_chunking_compat(
+        cli_cohort_mode=args.cohort_mode,
+        resolved_cohort_mode=cohort_mode,
+        chunk_size_mb=chunk_size_mb,
+        chromosomes=chromosomes,
+        build=args.build,
+        chr_length_mb=args.chr_length_mb,
+    )
+    if _msg and _msg.startswith("ERROR: "):
+        sys.exit(_msg[len("ERROR: "):])
+    elif _msg and _msg.startswith("INFO: "):
+        print(f"  {_msg[len('INFO: '):]}", file=sys.stderr)
 
     print(
         f"Simulating coalescent cohort (streamed): {args.n} people "
