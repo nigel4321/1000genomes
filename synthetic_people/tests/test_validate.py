@@ -238,6 +238,113 @@ class TestCohortChromStats(unittest.TestCase):
         out = cohort_chrom_stats([a])
         self.assertEqual(list(out.keys()), ["chr2", "chr22"])
 
+    def test_mixed_prefix_has_deterministic_tertiary_tiebreak(self):
+        # Regression for PR #74 review #3: when ``"22"`` and
+        # ``"chr22"`` are both present, the primary sort key is
+        # identical (both → ``(0, 22, ...)``). The tertiary
+        # tie-breaker (raw chrom string) must give a deterministic
+        # order — lexicographic, so ``"22"`` < ``"chr22"``.
+        a = self._stats_with_chroms({
+            "chr22": {"n_records": 1},
+            "22": {"n_records": 1},
+        })
+        out = cohort_chrom_stats([a])
+        self.assertEqual(list(out.keys()), ["22", "chr22"])
+        # And the reverse insertion order must produce the same
+        # final order — the tie-breaker dominates over insertion.
+        b = self._stats_with_chroms({
+            "22": {"n_records": 1},
+            "chr22": {"n_records": 1},
+        })
+        out2 = cohort_chrom_stats([b])
+        self.assertEqual(list(out2.keys()), ["22", "chr22"])
+
+    def test_cohort_overlay_density_handles_generator_input(self):
+        # Regression for PR #74 review #1: ``cohort_overlay_density``
+        # previously made four separate ``sum()`` calls, exhausting
+        # a generator after the first. Now it's a single-pass loop;
+        # passing a one-shot generator must yield correct counts.
+        from syntheticgen.validate import cohort_overlay_density
+        s1 = SampleStats(name="a")
+        s1.n_records = 10
+        s1.n_with_rs = 3
+        s1.n_with_clnsig = 1
+        s1.n_with_cosmic_id = 0
+        s2 = SampleStats(name="b")
+        s2.n_records = 20
+        s2.n_with_rs = 5
+        s2.n_with_clnsig = 2
+        s2.n_with_cosmic_id = 1
+        # ``iter(...)`` makes it a true one-shot generator —
+        # exhausted after a single pass.
+        out = cohort_overlay_density(iter([s1, s2]))
+        self.assertEqual(out["n_records"], 30)
+        self.assertEqual(out["rsid"]["n"], 8)
+        self.assertEqual(out["clinvar"]["n"], 3)
+        self.assertEqual(out["cosmic"]["n"], 1)
+
+
+class TestJsonable(unittest.TestCase):
+    """Regression for PR #74 review #5. ``_jsonable`` in
+    ``validate_batch.py`` must replace non-finite floats with
+    ``None`` so the emitted ``summary.json`` is RFC-8259 valid
+    (``Infinity`` / ``NaN`` are forbidden by strict JSON parsers,
+    and per-chrom Ti/Tv goes to ``inf`` when ``tv == 0``)."""
+
+    def setUp(self):
+        # ``validate_batch.py`` lives at the repo root; importable
+        # because tests already insert that path.
+        import validate_batch  # noqa: F401
+        self._jsonable = validate_batch._jsonable
+
+    def test_inf_replaced_with_none(self):
+        self.assertIsNone(self._jsonable(float("inf")))
+        self.assertIsNone(self._jsonable(float("-inf")))
+
+    def test_nan_replaced_with_none(self):
+        self.assertIsNone(self._jsonable(float("nan")))
+
+    def test_finite_floats_pass_through(self):
+        for v in (0.0, -1.5, 3.14, 1e308):
+            self.assertEqual(self._jsonable(v), v)
+
+    def test_non_float_types_unchanged(self):
+        # ints, strings, bools, None — none of these are
+        # non-finite floats, so they pass through unchanged.
+        self.assertEqual(self._jsonable(42), 42)
+        self.assertEqual(self._jsonable("hello"), "hello")
+        self.assertIs(self._jsonable(True), True)
+        self.assertIsNone(self._jsonable(None))
+
+    def test_walks_nested_dicts(self):
+        # Mimics the shape of the cohort_chrom_stats output.
+        inp = {
+            "22": {"n_records": 100, "titv": 2.1},
+            "Y":  {"n_records": 5, "titv": float("inf")},
+            "X":  {"n_records": 50, "titv": float("nan")},
+        }
+        out = self._jsonable(inp)
+        self.assertEqual(out["22"]["titv"], 2.1)
+        self.assertIsNone(out["Y"]["titv"])
+        self.assertIsNone(out["X"]["titv"])
+
+    def test_walks_nested_lists(self):
+        # Mimics the ld_decay list-of-dicts shape.
+        inp = [{"mean_r2": 0.5}, {"mean_r2": float("nan")}]
+        out = self._jsonable(inp)
+        self.assertEqual(out[0]["mean_r2"], 0.5)
+        self.assertIsNone(out[1]["mean_r2"])
+
+    def test_round_trips_through_strict_json(self):
+        # End-to-end: a sanitised payload with an inf-typed value
+        # must serialise cleanly under strict JSON (``allow_nan=False``).
+        import json
+        inp = {"chrom_stats": {"Y": {"titv": float("inf")}}}
+        out = self._jsonable(inp)
+        # allow_nan=False raises on inf/nan; success proves
+        # _jsonable replaced everything non-finite.
+        json.dumps(out, allow_nan=False)
+
 
 class TestCohortOverlayDensity(unittest.TestCase):
     """Tier 1: realised overlay-density counts let the validator
@@ -341,44 +448,79 @@ class TestCheckRefAgainstFasta(unittest.TestCase):
 
 
 class TestSummariseVcfOverlayCounters(unittest.TestCase):
-    """Tier 1: confirm summarise_vcf increments the overlay-density
-    counters for records that carry INFO/RS, INFO/CLNSIG, or
-    INFO/COSMIC_ID — and ignores empty / dotted values."""
+    """Tier 1: confirm ``summarise_vcf`` increments the overlay-
+    density counters on ``SampleStats`` for records that carry
+    INFO/RS, INFO/CLNSIG, or INFO/COSMIC_ID — and ignores empty,
+    dotted, or absent values.
 
-    def _make_record(self, info_str: str) -> Record:
-        # Minimal Record fixture skipping iter_records / bcftools.
+    Exercises the *production* counter logic by patching
+    ``iter_records`` to yield ``Record`` fixtures rather than
+    re-implementing the predicate inline (PR #74 review caught
+    that the original tests passed even if ``summarise_vcf`` was
+    broken). End-to-end through ``SampleStats``.
+    """
+
+    def _record(self, info_str: str) -> Record:
         return Record(
             chrom="22", pos=100, ref="A", alt="C", gt="0|1",
             dp=30, gq=40, ad_ref=15, ad_alt=15,
             info=_parse_info(info_str),
         )
 
-    def test_info_rs_counted(self):
-        r = self._make_record("RS=12345")
-        self.assertTrue(r.info.get("RS"))
-        # Manual simulation of the counter logic in summarise_vcf,
-        # ensuring the same predicate matches truthy values.
-        rs = r.info.get("RS")
-        self.assertTrue(rs is True or (rs and rs != "."))
+    def _summarise(self, records: list):
+        # Patch iter_records to yield the fixture records,
+        # bypassing the bcftools subprocess in summarise_vcf.
+        from syntheticgen.validate import summarise_vcf
+        with patch(
+            "syntheticgen.validate.iter_records",
+            return_value=iter(records),
+        ):
+            return summarise_vcf(Path("/nonexistent.vcf.gz"), name="t")
+
+    def test_info_rs_increments_counter(self):
+        stats = self._summarise([self._record("RS=12345")])
+        self.assertEqual(stats.n_with_rs, 1)
+        self.assertEqual(stats.n_with_clnsig, 0)
+        self.assertEqual(stats.n_with_cosmic_id, 0)
 
     def test_info_rs_empty_not_counted(self):
+        # "." and "" both mean "no value" in VCF INFO conventions
+        # — neither should increment the rsID counter.
         for empty in (".", ""):
-            r = self._make_record(f"RS={empty}")
-            rs = r.info.get("RS")
-            self.assertFalse(rs is True or (rs and rs != "."))
+            stats = self._summarise([self._record(f"RS={empty}")])
+            self.assertEqual(stats.n_with_rs, 0)
 
     def test_info_rs_absent_not_counted(self):
-        r = self._make_record("AC=1;AN=2")
-        rs = r.info.get("RS")
-        self.assertFalse(rs is True or (rs and rs != "."))
+        stats = self._summarise([self._record("AC=1;AN=2")])
+        self.assertEqual(stats.n_with_rs, 0)
 
     def test_info_flag_form_counted(self):
         # ``INFO=FLAG`` (no "=") is parsed as ``True`` by
-        # ``_parse_info``; the truthy check must accept it too,
-        # since some VCFs use flag-style markers.
-        r = self._make_record("CLNSIG;AC=1")
-        cln = r.info.get("CLNSIG")
-        self.assertTrue(cln is True or (cln and cln != "."))
+        # ``_parse_info``; the counter must accept it as set.
+        stats = self._summarise([self._record("CLNSIG;AC=1")])
+        self.assertEqual(stats.n_with_clnsig, 1)
+
+    def test_clinvar_and_cosmic_counters(self):
+        # Three records: rsID-only, ClinVar-only, COSMIC-only —
+        # each should increment exactly one counter.
+        stats = self._summarise([
+            self._record("RS=12345"),
+            self._record("CLNSIG=Pathogenic"),
+            self._record("COSMIC_ID=COSV12345"),
+        ])
+        self.assertEqual(stats.n_with_rs, 1)
+        self.assertEqual(stats.n_with_clnsig, 1)
+        self.assertEqual(stats.n_with_cosmic_id, 1)
+        self.assertEqual(stats.n_records, 3)
+
+    def test_multi_marker_record_counts_each_channel(self):
+        # A record carrying both rs and CLNSIG (e.g. a ClinVar
+        # entry with a known rsID) must increment both counters.
+        stats = self._summarise([
+            self._record("RS=12345;CLNSIG=Pathogenic"),
+        ])
+        self.assertEqual(stats.n_with_rs, 1)
+        self.assertEqual(stats.n_with_clnsig, 1)
 
 
 @unittest.skipUnless(HAS_NUMPY, "numpy required")

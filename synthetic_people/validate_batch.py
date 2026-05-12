@@ -40,6 +40,27 @@ from syntheticgen.validate import (  # noqa: E402
 )
 
 
+def _jsonable(obj):
+    """Recursively sanitise an object for ``json.dumps``.
+
+    Replaces non-finite floats (``inf``, ``-inf``, ``NaN``) with
+    ``None``. Per-chrom Ti/Tv ratios go to ``inf`` when ``tv == 0``
+    (see ``cohort_chrom_stats``), and Python's default
+    ``json.dumps`` writes those as literal ``Infinity`` / ``NaN``
+    which RFC 8259 forbids — strict parsers reject the resulting
+    file. Walks dicts and lists; leaves other types alone so the
+    existing ``default=str`` fallback still handles them.
+    """
+    import math
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
 def _try_plots():
     try:
         from syntheticgen import plots
@@ -257,8 +278,12 @@ def main(argv: list[str] | None = None) -> int:
         ],
     }
     json_path = out_dir / "summary.json"
-    json_path.write_text(json.dumps(summary_json, indent=2,
-                                    default=str))
+    # Sanitise non-finite floats (e.g. per-chrom Ti/Tv = inf when
+    # tv == 0) before serialising — Python's json.dumps writes
+    # ``Infinity`` / ``NaN`` by default, which is invalid per
+    # RFC 8259 and rejected by strict parsers.
+    json_path.write_text(json.dumps(_jsonable(summary_json),
+                                    indent=2, default=str))
     print(f"Summary JSON → {json_path}", file=sys.stderr)
 
     # --- artefacts: plots ---
