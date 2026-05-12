@@ -345,7 +345,9 @@ def cohort_chrom_stats(samples: Iterable[SampleStats]) -> dict:
 
     Returns ``{chrom: {n_records, n_snv, n_indel, n_sv, n_ti, n_tv,
     n_het, n_hom_alt, n_hom_ref, n_dropout, titv}}``. Per-chrom Ti/Tv
-    is computed from the per-chrom ti/tv counts (NaN if tv=0).
+    is the ti/tv ratio, with ``float('inf')`` when ``tv == 0 and
+    ti > 0`` and ``0.0`` when both are zero. Sanitised to ``None``
+    for JSON serialisation by ``validate_batch._jsonable``.
 
     Surfaces chrom-specific regressions that cohort-wide aggregates
     hide — e.g. a Y-chromosome ploidy bug after M13 lands would
@@ -381,11 +383,18 @@ def cohort_overlay_density(samples: Iterable[SampleStats]) -> dict:
     against the manifest's requested density (catches drift in the
     overlay pipeline before it shows up as missing CLNSIG /
     missing rsID counts at use time).
+
+    Iterates ``samples`` once — necessary because the ``Iterable``
+    signature lets callers pass a generator. Four separate ``sum()``
+    calls would exhaust the generator after the first and zero-out
+    every subsequent count.
     """
-    total = sum(s.n_records for s in samples)
-    rs = sum(s.n_with_rs for s in samples)
-    cln = sum(s.n_with_clnsig for s in samples)
-    cos = sum(s.n_with_cosmic_id for s in samples)
+    total = rs = cln = cos = 0
+    for s in samples:
+        total += s.n_records
+        rs += s.n_with_rs
+        cln += s.n_with_clnsig
+        cos += s.n_with_cosmic_id
     def _frac(n: int) -> float:
         return (n / total) if total > 0 else 0.0
     return {
@@ -404,13 +413,17 @@ _SPECIAL_ORDER = {"X": 23, "Y": 24, "MT": 25, "M": 25}
 
 def _chrom_sort_key(item) -> tuple:
     chrom, _ = item
-    # Strip leading "chr" if present so "chr22" and "22" sort together.
+    # Strip leading "chr" if present so "chr22" and "22" sort together
+    # by their semantic rank. ``chrom`` (the raw key) is the tertiary
+    # tie-breaker so a mixed-prefix dict (``{"22": ..., "chr22": ...}``)
+    # has a deterministic order rather than depending on insertion
+    # order alone.
     label = chrom.removeprefix("chr") if chrom.startswith("chr") else chrom
     if label.isdigit():
-        return (0, int(label))
+        return (0, int(label), chrom)
     if label in _SPECIAL_ORDER:
-        return (0, _SPECIAL_ORDER[label])
-    return (1, label)
+        return (0, _SPECIAL_ORDER[label], chrom)
+    return (1, label, chrom)
 
 
 def check_ref_against_fasta(
@@ -434,10 +447,17 @@ def check_ref_against_fasta(
     distinct from a real mismatch.
     """
     try:
+        # ``-Ou`` makes bcftools write the normalised BCF stream to
+        # stdout in uncompressed form — on a real WGS VCF that's
+        # multiple GB of binary. ``capture_output=True`` would slurp
+        # all of it into Python bytes and OOM the validator. We only
+        # need stderr (for ``REF_MISMATCH`` lines), so discard stdout.
         proc = subprocess.run(
             ["bcftools", "norm", "--check-ref", "w",
              "-f", str(fasta_path), str(vcf_path), "-Ou"],
-            capture_output=True, check=False, timeout=600,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False, timeout=600,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return {
