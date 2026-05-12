@@ -158,7 +158,7 @@ throughout). memprof phase trail:
 | t | parent RSS | phase |
 |---|---|---|
 | 16 s | 718 MB | streaming sim start (23 chroms) |
-| 901 s | 2.6 GB | chrom 1 TS ready (1 081 579 sites) |
+| 901 s | 2.6 GB | chrom 1 ts ready (1 081 579 sites) |
 | 6905 s | **63.3 GB** | killed (no further phase mark reached) |
 
 ### Root cause
