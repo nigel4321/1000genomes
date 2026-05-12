@@ -354,3 +354,158 @@ chronologically.
 - stdpopsim catalogue: <https://popsim-consortium.github.io/stdpopsim-docs/>
 - HapMap II / deCODE recombination maps:
   <https://github.com/popsim-consortium/stdpopsim/tree/main/stdpopsim/catalog/HomSap>
+
+---
+
+## Appendix A: Validation-coverage audit (2026-05-12)
+
+A walk through `validate_batch.py` + `syntheticgen/validate.py`,
+itemising what the existing acceptance suite actually proves and
+where the silent gaps are. Companion to §1 — that scorecard is
+about the *output content*; this appendix is about what the
+*validator can detect*. The two are connected: if a fidelity gap
+isn't visible to the validator, a regression in that area can
+ship silently.
+
+### A.1 What `validate_batch.py` checks today
+
+Per-person walk (`summarise_vcf`, `syntheticgen/validate.py:183-231`)
+produces a `SampleStats` per VCF, then aggregates across the cohort:
+
+| Check | Source | Notes |
+|---|---|---|
+| Per-person record count | `n_records` | trivial sanity gate |
+| SNV / indel / SV classification | `_classify_record` | by ALT shape (`<>` → SV, single-base → SNV, else indel) |
+| Ti/Tv ratio | `titv_from_stats` | cohort-aggregate; Markdown report flags "outside [1.7, 2.6]" — wide band |
+| Het / Hom-alt ratio | `het_hom_ratio` | per-sample + cohort; reported but uninterpreted |
+| Per-record AF histogram | `af_histogram` | uses single-sample `INFO/AF`, 20 linear bins on [0, 1] |
+| Indel length distribution | `aggregate_indel_lengths` | bp = `len(ALT) − len(REF)` |
+| SV-by-type counts | `aggregate_sv_summary` | DEL/DUP/INV tallies |
+| Singleton count | `s.singletons` | `INFO/AC == 1` in single-sample VCF — not a true cohort singleton |
+| Dropout count | `n_dropout` | GT contains `.` |
+| LD decay r² vs distance | `ld_decay` | log-spaced bins, ~5K pair sample per bin, single curve |
+| Cohort PCA (synthetic-only) | `cohort_pca` | sklearn PCA on `(n_samples, n_variants)` dosage matrix |
+| Admixture-mode PCA labels | `_default_pca_labels` | dominant-ancestry colouring from manifest |
+
+Artefacts: `summary.json` + Markdown `report.md` + four PNGs
+(`ld_decay`, `af_histogram`, `indel_lengths`, `pca`).
+
+### A.2 What the validator does NOT check
+
+Two categories: things the existing data *could* be checked
+against today, and things blocked on infrastructure that doesn't
+exist yet.
+
+**Category 1 — checkable from current output, just not done:**
+
+| Missing check | Fidelity gap it would catch |
+|---|---|
+| **REF allele matches GRCh38 at POS** | every fabricated REF (§4.1) — `bcftools norm --check-ref` would fail today on every record |
+| **GT phasing preserved across overlay injections** | silent phase loss in `inject_clinvar` / `inject_rsids` / `inject_cosmic` |
+| **Mutation spectrum (96-channel SNV context)** | the "no CpG μ" gap from §4.4 — real WGS is dominated by C>T at CpG |
+| **Population-stratified AFs** | demographic-model misuse — the validator currently collapses to one univariate histogram |
+| **Hardy-Weinberg equilibrium per site** | overlay-genotype mishandling, downstream of injection bugs |
+| **F-statistic (inbreeding coefficient)** | hidden inbreeding in the simulation; admixture-mode F patterns |
+| **Per-region variant density (per-Mb)** | flat density from uniform μ (§4.4) |
+| **DP/GQ/AD distribution sanity** | silent regression in `quality.py`'s Poisson(λ≈30) + 0.475 ref-bias model |
+| **Realised vs requested overlay density** | density-target drift in `--rsid-density` / `--clinvar-inject-density` / `--cosmic-inject-density` |
+| **Per-chromosome statistics** | chrom-specific regressions (e.g. X-only bug after M13) invisible to today's cohort-wide aggregates |
+| **Ti/Tv tolerance tightening** | the current `[1.7, 2.6]` band passes any biologically-plausible noise; real WGS is 2.0–2.1 ± 0.05 |
+| **Realised admixture tract-length distribution** | ancestry BEDs are written but the validator never reads them |
+
+**Category 2 — needs new infrastructure:**
+
+| Missing check | Blocked on | Tied to roadmap |
+|---|---|---|
+| Sex-chromosome ploidy (Y haploid in males, X non-PAR haploid in males, MT clonal) | The simulation treats X/Y/MT as autosomes (§3) | **M13** |
+| PAR1/PAR2 X↔Y consistency | Same | **M13** |
+| PCA projected onto 1000G reference axes | Need cached 1000G phase3 VCFs + projection matrix | **M17** (spec §6.1 ask) |
+| LD-block boundary fidelity at hotspots | Need real recombination map for comparison | **M14** |
+| Mendelian consistency | No trio architecture today | **M18** |
+
+### A.3 How the gaps connect to the roadmap
+
+Mapping missing checks back to §7's M-milestones:
+
+- **M12 (reference-aware FASTA)** unblocks: REF-matches-GRCh38 check.
+- **M13 (sex chromosomes)** unblocks: Y-haploid, PAR consistency, MT clonality.
+- **M14 (mutation + recombination)** unblocks: mutation spectrum, per-region density, LD-hotspot fidelity.
+- **M15 (overlay AF consistency)** unblocks: HWE-per-site, realised-vs-target overlay density (the latter is actually checkable already without M15).
+- **M17 (validation vs 1000G)** unblocks: PCA projection, population-stratified AF.
+- **M18 (trios)** unblocks: Mendelian consistency.
+
+The unblocked Category 1 checks (per-region density, per-chrom
+stats, Ti/Tv tightening, rsID coverage, DP/GQ/AD sanity, mutation
+spectrum modulo REF, phasing consistency, F-statistic, realised
+admixture tract lengths) are all implementable today against the
+current output. Adding them would 2–3× the validator's
+discrimination power before any new code feature ships.
+
+### A.4 Recommended additions, prioritised
+
+Choose-your-own-adventure, ordered by catch-rate per cost.
+
+#### Tier 1 — cheap, high-discrimination, no blockers
+
+1. **REF-matches-GRCh38 gate**. Wrap a
+   `bcftools norm --check-ref e -f reference.fa` in the validator
+   (skip cleanly if no FASTA). Even without M12 in place, this
+   proves the validator catches the bug if/when M12 lands
+   incomplete. ~1 hour.
+2. **Realised overlay density counters**. Walk the VCF `ID`
+   column for rsIDs (for example, `ID` values starting with `rs`),
+   plus `INFO/CLNSIG` and `INFO/COSMIC_ID`; tally non-empty
+   fractions; compare against manifest's requested densities.
+   ~1 hour.
+3. **Per-chromosome breakouts**. Re-emit all the aggregate stats
+   (Ti/Tv, het/hom, AF histogram, indel lengths) per chromosome,
+   not just cohort-wide. ~2 hours.
+4. **Ti/Tv tolerance tightening**. Drop the report band from
+   `[1.7, 2.6]` to `[2.0, 2.2]` for WGS. The wider band hides
+   drift. ~5 min + recalibration if it fails.
+
+#### Tier 2 — moderately cheap, illuminates the model
+
+5. **Mutation spectrum (96-channel)**. For each SNV with a real
+   REF (post-M12), bin into the 96 trinucleotide contexts.
+   Compare against COSMIC SBS1. Today's spectrum is degenerate;
+   post-M14 it should match reality. **Blocked on M12** for real
+   REF. ~1 day.
+6. **Per-region variant density**. Variant count per Mb plotted
+   along each chrom. Currently flat; should show gene-density
+   variation post-M14. ~half a day.
+7. **DP/GQ/AD distribution sanity**. Sample N records; plot DP
+   histogram (expect Poisson(30) + jitter), AD ratio histogram
+   (expect 0.475 ref-bias at hets), GQ distribution. ~half a day.
+8. **F-statistic / inbreeding coefficient**. Per-sample
+   observed-vs-expected heterozygosity. Cohort F should be ≈ 0.
+   ~half a day.
+9. **Realised admixture tract-length distribution**. Read the
+   per-person ancestry BEDs that the M6 path already writes;
+   plot tract-length histogram. Pulse-time inference from the
+   exponential decay gives a sanity check against the configured
+   `PULSE_TIME = 20`. ~half a day.
+
+#### Tier 3 — wait for the corresponding feature
+
+10. Sex-chromosome ploidy checks — wait for M13.
+11. PCA-vs-1000G projection — wait for M17.
+12. Mendelian consistency — wait for M18.
+
+### A.5 Recommendation
+
+**Ship Tier 1 first, as one PR, before any M12+ code work.**
+Reasoning:
+
+- Total cost ~5 hours.
+- Becomes the regression net for M12+. When M12 lands and the
+  REF-check gate passes, that's empirical evidence the FASTA
+  wiring actually works.
+- Each Tier 1 check is independent — no architectural risk.
+- Today's discrimination power is weak enough that some M12+
+  features could silently regress and the suite would pass.
+
+After Tier 1: revisit M12–M18 ordering with the sharper
+validator in hand. The priority of M12 vs M15 vs M17 may shift
+once we can actually *measure* overlay AF realism, mutation
+spectrum, etc. — instead of intuiting it.
