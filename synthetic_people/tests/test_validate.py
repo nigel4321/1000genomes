@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -765,6 +766,271 @@ class TestPlots(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = plots.plot_pca(None, [], Path(d) / "pca.png")
             self._check_png(out)
+
+
+class TestCohortPerRegionDensity(unittest.TestCase):
+    """Tier 2 #6: per-Mb variant density bins.
+
+    Flat under today's uniform-μ simulation; should show gene-density
+    structure post-M14. The validator surfaces both the per-chrom
+    table and a coefficient-of-variation diagnostic.
+    """
+
+    def _stats(self, name: str, density: dict) -> SampleStats:
+        s = SampleStats(name=name)
+        for chrom, bins in density.items():
+            for bin_idx, count in bins.items():
+                s.density_bin_counts[chrom][bin_idx] = count
+        return s
+
+    def test_aggregates_counts_per_bin_across_samples(self):
+        from syntheticgen.validate import cohort_per_region_density
+        a = self._stats("a", {"22": {0: 5, 1: 3}})
+        b = self._stats("b", {"22": {0: 7, 2: 2}, "1": {0: 10}})
+        out = cohort_per_region_density([a, b])
+        # Sorted by canonical chromosome order (1 before 22).
+        self.assertEqual(list(out.keys()), ["1", "22"])
+        # Bins sorted within each chrom; counts summed across samples.
+        self.assertEqual(out["22"], [
+            {"start_mb": 0, "end_mb": 1, "count": 12},
+            {"start_mb": 1, "end_mb": 2, "count": 3},
+            {"start_mb": 2, "end_mb": 3, "count": 2},
+        ])
+        self.assertEqual(out["1"], [
+            {"start_mb": 0, "end_mb": 1, "count": 10},
+        ])
+
+    def test_empty_density_returns_empty_dict(self):
+        from syntheticgen.validate import cohort_per_region_density
+        self.assertEqual(cohort_per_region_density([]), {})
+
+    def test_canonical_chrom_order(self):
+        from syntheticgen.validate import cohort_per_region_density
+        s = self._stats("a", {
+            "Y": {0: 1}, "X": {0: 1}, "2": {0: 1}, "22": {0: 1},
+        })
+        out = cohort_per_region_density([s])
+        self.assertEqual(list(out.keys()), ["2", "22", "X", "Y"])
+
+
+class TestCohortQualityMetrics(unittest.TestCase):
+    """Tier 2 #7: DP / GQ / AD-ref-fraction distribution sanity.
+
+    Surfaces drift in the empirical targets baked into quality.py
+    (Poisson(30) DP, 0.475 ref-bias at hets). The aggregator returns
+    summary stats only — keeps summary.json compact while still
+    exposing whether the distributions match the claimed model.
+    """
+
+    def _stats(self, name: str, dp: list, gq: list, ad: list) -> SampleStats:
+        s = SampleStats(name=name)
+        s.dp_samples = list(dp)
+        s.gq_samples = list(gq)
+        s.ad_het_ref_frac_samples = list(ad)
+        return s
+
+    def test_summary_stats_attached_per_metric(self):
+        from syntheticgen.validate import cohort_quality_metrics
+        a = self._stats("a", dp=[28, 30, 32], gq=[99, 99, 95],
+                        ad=[0.48, 0.50, 0.45])
+        out = cohort_quality_metrics([a])
+        # DP target carried through from quality.py.
+        self.assertEqual(out["dp"]["target"], 30.0)
+        self.assertAlmostEqual(out["dp"]["mean"], 30.0)
+        self.assertEqual(out["dp"]["n"], 3)
+        # AD ref-fraction target carried through.
+        self.assertEqual(out["ad_het_ref_fraction"]["target"], 0.475)
+        self.assertAlmostEqual(
+            out["ad_het_ref_fraction"]["mean"], 0.4767, places=4,
+        )
+
+    def test_empty_samples_returns_none_stats(self):
+        from syntheticgen.validate import cohort_quality_metrics
+        out = cohort_quality_metrics([])
+        self.assertEqual(out["dp"]["n"], 0)
+        self.assertIsNone(out["dp"]["mean"])
+
+    def test_aggregates_across_samples(self):
+        from syntheticgen.validate import cohort_quality_metrics
+        a = self._stats("a", dp=[30], gq=[99], ad=[0.5])
+        b = self._stats("b", dp=[30, 30], gq=[99, 99], ad=[0.4, 0.5])
+        out = cohort_quality_metrics([a, b])
+        self.assertEqual(out["dp"]["n"], 3)
+        self.assertEqual(out["ad_het_ref_fraction"]["n"], 3)
+
+
+class TestCohortFStatistic(unittest.TestCase):
+    """Tier 2 #8: per-sample inbreeding coefficient F."""
+
+    def test_outbred_cohort_has_f_near_zero(self):
+        from syntheticgen.validate import cohort_f_statistic
+        import numpy as np
+        # 4 samples × 4 variants. Construct a dosage matrix where
+        # cohort AF = 0.5 at every variant and each sample has the
+        # observed-het count equal to the expected.
+        # Variant 0: dosages [0, 1, 1, 2] → AF = 0.5, het count = 2.
+        # Variant 1: same. Variant 2: same. Variant 3: same.
+        matrix = np.array([
+            [0, 0, 0, 0],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [2, 2, 2, 2],
+        ])
+        out = cohort_f_statistic(matrix)
+        # Sample 0 (all hom-ref): observed_het = 0, expected = 2.0,
+        # F = 1.0 (extreme — typical of inbred lineage).
+        # Sample 1 (all hets): observed_het = 4, expected = 2.0,
+        # F = -1.0. We just check the structure is correct.
+        self.assertEqual(len(out["per_sample"]), 4)
+        self.assertIsNotNone(out["cohort_mean"])
+        self.assertEqual(out["per_sample"][0]["observed_het"], 0)
+        self.assertEqual(out["per_sample"][1]["observed_het"], 4)
+
+    def test_empty_matrix_returns_empty_result(self):
+        from syntheticgen.validate import cohort_f_statistic
+        import numpy as np
+        out = cohort_f_statistic(np.zeros((0, 0), dtype=int))
+        self.assertEqual(out["per_sample"], [])
+        self.assertIsNone(out["cohort_mean"])
+
+    def test_per_sample_struct_shape(self):
+        from syntheticgen.validate import cohort_f_statistic
+        import numpy as np
+        # Simple 2x2 with one het each side: AF = 0.5 at each variant.
+        matrix = np.array([[1, 0], [0, 1]])
+        out = cohort_f_statistic(matrix)
+        for entry in out["per_sample"]:
+            self.assertIn("sample_idx", entry)
+            self.assertIn("observed_het", entry)
+            self.assertIn("expected_het", entry)
+            self.assertIn("f", entry)
+
+
+class TestCohortAncestryTracts(unittest.TestCase):
+    """Tier 2 #9: tract-length distribution from per-person
+    ancestry BEDs (admixture mode)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_bed(self, name: str, rows: list) -> Path:
+        path = self.dir / name
+        path.write_text(
+            "".join(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\t{r[4]}\n"
+                    for r in rows),
+        )
+        return path
+
+    def test_single_population_single_tract(self):
+        from syntheticgen.validate import cohort_ancestry_tracts
+        # One person, one row: hap1 and hap2 both EUR.
+        p = self._write_bed("p.bed", [
+            ("22", 0, 1_000_000, "EUR", "EUR"),
+        ])
+        out = cohort_ancestry_tracts([p])
+        # Two tracts (one per haplotype), each 1 Mb of EUR.
+        self.assertEqual(out["by_population"]["EUR"]["n"], 2)
+        self.assertEqual(
+            out["by_population"]["EUR"]["mean_bp"], 1_000_000,
+        )
+
+    def test_consecutive_same_pop_rows_merge_into_one_tract(self):
+        from syntheticgen.validate import cohort_ancestry_tracts
+        # Adjacent rows with the same hap1_pop but different hap2_pop
+        # — hap1's tract spans both rows, hap2 has two tracts.
+        p = self._write_bed("p.bed", [
+            ("22", 0, 1_000_000, "EUR", "EUR"),
+            ("22", 1_000_000, 2_000_000, "EUR", "SAS"),
+        ])
+        out = cohort_ancestry_tracts([p])
+        # hap1: one EUR tract of 2 Mb (rows merged).
+        # hap2: one EUR tract of 1 Mb + one SAS tract of 1 Mb.
+        eur = out["by_population"]["EUR"]
+        sas = out["by_population"]["SAS"]
+        # Two EUR tracts total: hap1's 2Mb + hap2's 1Mb.
+        self.assertEqual(eur["n"], 2)
+        self.assertEqual(sas["n"], 1)
+        self.assertEqual(sas["mean_bp"], 1_000_000)
+
+    def test_chrom_boundary_breaks_tract(self):
+        from syntheticgen.validate import cohort_ancestry_tracts
+        # Same hap1_pop across two chroms — must be reported as two
+        # tracts, not one (a chr1 and chr22 stretch are not
+        # contiguous even if the ancestry happens to match).
+        p = self._write_bed("p.bed", [
+            ("1", 0, 1_000_000, "EUR", "EUR"),
+            ("22", 0, 1_000_000, "EUR", "EUR"),
+        ])
+        out = cohort_ancestry_tracts([p])
+        # 2 EUR tracts × 2 haplotypes = 4 tracts.
+        self.assertEqual(out["by_population"]["EUR"]["n"], 4)
+
+    def test_missing_file_skipped_silently(self):
+        # An OSError on the BED read shouldn't tank the whole run.
+        from syntheticgen.validate import cohort_ancestry_tracts
+        out = cohort_ancestry_tracts([Path("/nonexistent.bed")])
+        self.assertEqual(out["by_population"], {})
+
+
+class TestSummariseVcfTier2(unittest.TestCase):
+    """End-to-end Tier 2 wiring through ``summarise_vcf`` —
+    confirms the new SampleStats fields are populated correctly
+    when records flow through the real (mocked-iter_records)
+    summarisation path."""
+
+    def _record(self, chrom: str, pos: int, gt: str,
+                dp: int = 30, gq: int = 99,
+                ad_ref: int = 15, ad_alt: int = 15) -> Record:
+        return Record(
+            chrom=chrom, pos=pos, ref="A", alt="C", gt=gt,
+            dp=dp, gq=gq, ad_ref=ad_ref, ad_alt=ad_alt,
+            info={},
+        )
+
+    def _summarise(self, records: list):
+        from syntheticgen.validate import summarise_vcf
+        with patch(
+            "syntheticgen.validate.iter_records",
+            return_value=iter(records),
+        ):
+            return summarise_vcf(Path("/nonexistent.vcf.gz"), name="t")
+
+    def test_density_bins_increment_per_pos(self):
+        # Three records on chr22 at positions 100, 1_500_000,
+        # 1_999_999. Bin 0 gets 1, bin 1 gets 2.
+        stats = self._summarise([
+            self._record("22", 100, "0|1"),
+            self._record("22", 1_500_000, "0|1"),
+            self._record("22", 1_999_999, "0|1"),
+        ])
+        self.assertEqual(stats.density_bin_counts["22"][0], 1)
+        self.assertEqual(stats.density_bin_counts["22"][1], 2)
+
+    def test_dp_gq_samples_captured(self):
+        stats = self._summarise([
+            self._record("22", 100, "0|1", dp=28, gq=99),
+            self._record("22", 200, "0|1", dp=32, gq=99),
+        ])
+        self.assertEqual(stats.dp_samples, [28, 32])
+        self.assertEqual(stats.gq_samples, [99, 99])
+
+    def test_ad_ref_fraction_recorded_only_at_hets(self):
+        # Two hets (dosage=1) and one hom-alt (dosage=2) — the
+        # AD ref-fraction is only recorded at hets.
+        stats = self._summarise([
+            self._record("22", 100, "0|1", ad_ref=14, ad_alt=16),
+            self._record("22", 200, "1|1", ad_ref=0, ad_alt=30),
+            self._record("22", 300, "1|0", ad_ref=15, ad_alt=15),
+        ])
+        self.assertEqual(len(stats.ad_het_ref_frac_samples), 2)
+        # First het: 14/30 ≈ 0.467.
+        self.assertAlmostEqual(
+            stats.ad_het_ref_frac_samples[0], 14 / 30, places=4,
+        )
 
 
 if __name__ == "__main__":

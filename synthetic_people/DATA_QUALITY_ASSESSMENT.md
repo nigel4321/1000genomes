@@ -471,20 +471,22 @@ Choose-your-own-adventure, ordered by catch-rate per cost.
    Compare against COSMIC SBS1. Today's spectrum is degenerate;
    post-M14 it should match reality. **Blocked on M12** for real
    REF. ~1 day.
-6. **Per-region variant density**. Variant count per Mb plotted
-   along each chrom. Currently flat; should show gene-density
-   variation post-M14. ~half a day.
-7. **DP/GQ/AD distribution sanity**. Sample N records; plot DP
-   histogram (expect Poisson(30) + jitter), AD ratio histogram
-   (expect 0.475 ref-bias at hets), GQ distribution. ~half a day.
-8. **F-statistic / inbreeding coefficient**. Per-sample
-   observed-vs-expected heterozygosity. Cohort F should be ≈ 0.
-   ~half a day.
-9. **Realised admixture tract-length distribution**. Read the
-   per-person ancestry BEDs that the M6 path already writes;
-   plot tract-length histogram. Pulse-time inference from the
-   exponential decay gives a sanity check against the configured
-   `PULSE_TIME = 20`. ~half a day.
+6. ~~**Per-region variant density**~~ — **shipped 2026-05-13**.
+   1 Mb bins per chrom, with a coefficient-of-variation
+   diagnostic. Today flat (CV ≈ 0); post-M14 expect 0.5–1.0 on
+   most chroms.
+7. ~~**DP/GQ/AD distribution sanity**~~ — **shipped 2026-05-13**.
+   Sampled at ~50K records per VCF; summary stats (mean / median
+   / stdev / p10 / p90) compared against the targets baked into
+   `quality.py` (DP=30, AD ref-fraction=0.475 at hets).
+8. ~~**F-statistic / inbreeding coefficient**~~ — **shipped
+   2026-05-13**. Computed from the existing
+   `build_genotype_matrix` cohort dosage matrix; expected F ≈ 0
+   for outbred cohorts. |F| > 0.05 flags drift.
+9. ~~**Realised admixture tract-length distribution**~~ —
+   **shipped 2026-05-13**. Parses per-person ancestry BEDs;
+   reports mean / median tract length per population. Activates
+   only when ancestry BEDs are present (i.e., admixture mode).
 
 #### Tier 3 — wait for the corresponding feature
 
