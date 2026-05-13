@@ -30,9 +30,13 @@ from syntheticgen.validate import (  # noqa: E402
     af_histogram,
     build_genotype_matrix,
     check_ref_against_fasta,
+    cohort_ancestry_tracts,
     cohort_chrom_stats,
+    cohort_f_statistic,
     cohort_overlay_density,
     cohort_pca,
+    cohort_per_region_density,
+    cohort_quality_metrics,
     het_hom_ratio,
     ld_decay,
     summarise_vcf,
@@ -172,6 +176,12 @@ def main(argv: list[str] | None = None) -> int:
     overlay_density = cohort_overlay_density(samples)
     overlay_requested = _overlay_requested_from_manifest(manifest)
 
+    # Tier 2 validation additions: per-region density, DP/GQ/AD
+    # sanity, F-statistic, admixture tract lengths. See
+    # DATA_QUALITY_ASSESSMENT.md §A.4 Tier 2 for the rationale.
+    region_density = cohort_per_region_density(samples)
+    quality_metrics = cohort_quality_metrics(samples)
+
     # Tier 1: REF-matches-FASTA gate — only when the caller passes
     # --reference-fasta. Today's synthetic REF is fabricated so
     # every record mismatches; the gate exists so a post-M12 run
@@ -216,6 +226,37 @@ def main(argv: list[str] | None = None) -> int:
               f"n={b['n_pairs']:>5d}  mean_r²={b['mean_r2']:.4f}",
               file=sys.stderr)
 
+    # --- Tier 2 #8: F-statistic / inbreeding coefficient ---
+    print("Computing per-sample F-statistic...", file=sys.stderr)
+    f_statistic = cohort_f_statistic(matrix)
+    if f_statistic.get("cohort_mean") is not None:
+        print(
+            f"  Cohort F mean={f_statistic['cohort_mean']:+.4f} "
+            f"median={f_statistic['cohort_median']:+.4f}",
+            file=sys.stderr,
+        )
+
+    # --- Tier 2 #9: admixture tract lengths (admixture mode only) ---
+    ancestry_dir = args.batch_dir / "ancestry"
+    ancestry_beds = (
+        sorted(ancestry_dir.glob("person_*.bed"))
+        if ancestry_dir.is_dir() else []
+    )
+    ancestry_tracts = None
+    if ancestry_beds:
+        print(
+            f"Reading {len(ancestry_beds)} ancestry BEDs for "
+            f"tract-length distribution...", file=sys.stderr,
+        )
+        ancestry_tracts = cohort_ancestry_tracts(ancestry_beds)
+        mean_bp = ancestry_tracts.get("mean_bp_across_pops")
+        if mean_bp:
+            print(
+                f"  Mean ancestry tract length: "
+                f"{mean_bp / 1e6:.2f} Mb across {len(ancestry_beds)} "
+                f"people", file=sys.stderr,
+            )
+
     # --- PCA ---
     print("Running cohort PCA...", file=sys.stderr)
     transformed, explained, kept = cohort_pca(
@@ -253,6 +294,12 @@ def main(argv: list[str] | None = None) -> int:
             "requested": overlay_requested,
         },
         "ref_check": ref_check,
+        # Tier 2 additions: per-region density, DP/GQ/AD sanity,
+        # F-statistic, admixture tract lengths.
+        "region_density": region_density,
+        "quality_metrics": quality_metrics,
+        "f_statistic": f_statistic,
+        "ancestry_tracts": ancestry_tracts,
         "ld_decay": ld,
         "pca": {
             "components": args.pca_components,
@@ -487,6 +534,108 @@ def _build_markdown_report(batch_dir: Path, summary: dict,
             "*Today's synthetic output uses fabricated REF "
             "(`rng.choice('ACGT')`); this section will report "
             "failures until M12 wires in the real FASTA.*"
+        )
+        lines.append("")
+
+    # Tier 2 #7: DP / GQ / AD distribution sanity — surfaces drift
+    # in the quality.py model's empirical targets.
+    qm = summary.get("quality_metrics") or {}
+    if qm.get("dp", {}).get("n"):
+        lines += ["## Quality-metric distributions (DP / GQ / AD)", "",
+                  "Metric | n | Mean | Median | Stdev | p10 | p90 | Target",
+                  "---|---|---|---|---|---|---|---"]
+        for label, key in (
+            ("DP", "dp"), ("GQ", "gq"),
+            ("AD ref-fraction (hets)", "ad_het_ref_fraction"),
+        ):
+            m = qm.get(key) or {}
+            if not m.get("n"):
+                continue
+            tgt = m.get("target")
+            tgt_str = f"{tgt}" if tgt is not None else "—"
+            lines.append(
+                f"{label} | {m['n']} | {m['mean']:.3f} | "
+                f"{m['median']} | {m['stdev']:.3f} | "
+                f"{m['p10']} | {m['p90']} | {tgt_str}"
+            )
+        lines.append("")
+
+    # Tier 2 #8: F-statistic / inbreeding coefficient. Cohort F ≈ 0
+    # for an outbred cohort; strongly positive or negative values
+    # are diagnostic.
+    fs = summary.get("f_statistic") or {}
+    if fs.get("cohort_mean") is not None:
+        lines += [
+            "## F-statistic (inbreeding coefficient)",
+            "",
+            f"- Cohort mean F: **{fs['cohort_mean']:+.4f}**",
+            f"- Cohort median F: **{fs['cohort_median']:+.4f}**",
+            "",
+            "*Expected F ≈ 0 for an outbred cohort. |F| > 0.05 "
+            "suggests hidden inbreeding / population structure or a "
+            "regression in the simulator's HWE balance.*",
+            "",
+        ]
+
+    # Tier 2 #9: admixture tract lengths (only when ancestry BEDs
+    # were present in the batch dir).
+    at = summary.get("ancestry_tracts")
+    if at and at.get("by_population"):
+        lines += [
+            "## Ancestry tract lengths",
+            "",
+            "Population | Tracts | Mean (bp) | Median (bp)",
+            "---|---|---|---",
+        ]
+        for pop, stats in at["by_population"].items():
+            lines.append(
+                f"{pop} | {stats['n']} | {int(stats['mean_bp'])} | "
+                f"{stats['median_bp']}"
+            )
+        lines.append("")
+        if at.get("mean_bp_across_pops"):
+            lines.append(
+                f"*Mean tract length across populations: "
+                f"**{at['mean_bp_across_pops'] / 1e6:.2f} Mb**. "
+                f"Under a single-pulse admixture model, mean tract "
+                f"length in Morgans ≈ 1 / ((1 − α) · T) where T is "
+                f"the pulse time. The cli's `PULSE_TIME = 20` "
+                f"generations + 60 % EUR fraction predicts roughly "
+                f"~6 Mb mean tract length under the rough 1 Mb = "
+                f"1 cM approximation.*"
+            )
+            lines.append("")
+
+    # Tier 2 #6: per-region variant density — flat under uniform μ
+    # today, expected to show gene-density structure post-M14. Show
+    # cohort-wide per-chrom summary (count of bins + mean density)
+    # rather than every bin (would be hundreds of rows per chrom).
+    rd = summary.get("region_density") or {}
+    if rd:
+        lines += [
+            "## Per-region variant density (1 Mb bins)",
+            "",
+            "Chrom | Bins | Mean count/Mb | Max count/Mb | CV",
+            "---|---|---|---|---",
+        ]
+        import statistics
+        for chrom, rows in rd.items():
+            if not rows:
+                continue
+            counts = [r["count"] for r in rows]
+            mean = statistics.fmean(counts)
+            stdev = statistics.stdev(counts) if len(counts) >= 2 else 0.0
+            cv = (stdev / mean) if mean > 0 else 0.0
+            lines.append(
+                f"{chrom} | {len(rows)} | {mean:.1f} | "
+                f"{max(counts)} | {cv:.3f}"
+            )
+        lines.append("")
+        lines.append(
+            "*Coefficient of variation (CV = stdev / mean) is the "
+            "key signal: ~0 means flat density (today's uniform-μ "
+            "model), higher values mean the density tracks gene "
+            "structure. Post-M14 expect CV ≈ 0.5–1.0 on most chroms.*"
         )
         lines.append("")
 

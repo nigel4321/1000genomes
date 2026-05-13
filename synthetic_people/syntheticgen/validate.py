@@ -163,6 +163,35 @@ class SampleStats:
     # an X-only bug after M13 lands would be invisible to cohort-wide
     # aggregates but obvious in the per-chrom Ti/Tv).
     by_chrom: dict = field(default_factory=lambda: defaultdict(_chrom_bucket))
+    # Tier 2 validation additions (2026-05-13):
+    # Per-Mb variant-density bins, keyed by chrom → bin_mb → count.
+    # Surfaces gene-density variation in per-region density plots
+    # (currently flat under uniform μ; should show structure
+    # post-M14 once context-aware μ lands).
+    density_bin_counts: dict = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(int))
+    )
+    # Sampled DP / GQ / AD-ref-fraction values for distribution
+    # sanity. Bounded by ``_QUALITY_SAMPLE_CAP`` per VCF so memory
+    # stays flat at WGS scale. AD ref-fraction is recorded only at
+    # heterozygous calls (where it should hit the empirical 0.475
+    # Illumina+BWA-MEM ref-bias target).
+    dp_samples: list = field(default_factory=list)
+    gq_samples: list = field(default_factory=list)
+    ad_het_ref_frac_samples: list = field(default_factory=list)
+
+
+# Cap how many records contribute to the DP/GQ/AD-ratio sample
+# arrays per VCF. 50K is enough to render meaningful histograms
+# without bloating memory at WGS scale (~5M records per VCF at
+# WGS chr22; full WGS ~50M).
+_QUALITY_SAMPLE_CAP = 50_000
+
+# Width of per-region density bins. 1 Mb is the natural unit for
+# variant-count-per-Mb plots — fine-grained enough to show
+# gene-dense vs gene-poor regions but coarse enough that bin
+# counts stay meaningful at moderate cohort sizes.
+_DENSITY_BIN_MB = 1
 
 
 def _chrom_bucket() -> dict:
@@ -216,10 +245,34 @@ def summarise_vcf(vcf_path: Path, name: str | None = None) -> SampleStats:
     if name is None:
         name = vcf_path.stem.replace(".vcf", "")
     s = SampleStats(name=name)
+    quality_samples_taken = 0
     for rec in iter_records(vcf_path):
         s.n_records += 1
         chrom_bucket = s.by_chrom[rec.chrom]
         chrom_bucket["n_records"] += 1
+
+        # Tier 2: per-Mb density bin (1-based POS → 0-indexed Mb bin).
+        s.density_bin_counts[rec.chrom][
+            (rec.pos - 1) // (_DENSITY_BIN_MB * 1_000_000)
+        ] += 1
+
+        # Tier 2: sample DP/GQ/AD for distribution sanity, capped at
+        # ``_QUALITY_SAMPLE_CAP`` to bound per-VCF memory. First-N
+        # sampling (not reservoir) is fine because the cli writes
+        # records in genomic order, not in any biased order that
+        # would distort the early-N quality distribution.
+        if quality_samples_taken < _QUALITY_SAMPLE_CAP:
+            s.dp_samples.append(rec.dp)
+            s.gq_samples.append(rec.gq)
+            ad_total = rec.ad_ref + rec.ad_alt
+            if _gt_dosage(rec.gt) == 1 and ad_total > 0:
+                # Ref-allele fraction at heterozygous calls — should
+                # cluster near the empirical 0.475 Illumina+BWA-MEM
+                # ref-bias from ``quality.py``.
+                s.ad_het_ref_frac_samples.append(
+                    rec.ad_ref / ad_total
+                )
+            quality_samples_taken += 1
         kind = _classify_record(rec)
         if kind == "snv":
             s.n_snv += 1
@@ -403,6 +456,273 @@ def cohort_overlay_density(samples: Iterable[SampleStats]) -> dict:
         "rsid": {"n": rs, "fraction": _frac(rs)},
         "clinvar": {"n": cln, "fraction": _frac(cln)},
         "cosmic": {"n": cos, "fraction": _frac(cos)},
+    }
+
+
+def cohort_per_region_density(
+    samples: Iterable[SampleStats],
+) -> dict:
+    """Aggregate per-Mb variant density across the cohort (Tier 2 #6).
+
+    Returns ``{chrom: [(start_mb, end_mb, count), ...]}`` sorted by
+    chromosome (canonical 1-22, X, Y, MT order) and by bin start
+    within each chrom. Counts are summed across samples; for a
+    cohort of n persons each variant is counted n times (once per
+    per-person VCF).
+
+    Today's uniform-μ simulation produces flat density (modulo
+    statistical noise); post-M14 with context-aware μ the density
+    should show real gene-density structure. The validator
+    surfaces both the JSON table and a per-chrom line plot.
+    """
+    aggregated: dict = defaultdict(lambda: defaultdict(int))
+    for s in samples:
+        for chrom, bins in s.density_bin_counts.items():
+            for bin_idx, n in bins.items():
+                aggregated[chrom][bin_idx] += n
+    out: dict = {}
+    for chrom, bins in sorted(
+        aggregated.items(), key=_chrom_sort_key,
+    ):
+        rows = []
+        for bin_idx in sorted(bins.keys()):
+            start_mb = bin_idx * _DENSITY_BIN_MB
+            end_mb = start_mb + _DENSITY_BIN_MB
+            rows.append({
+                "start_mb": start_mb,
+                "end_mb": end_mb,
+                "count": bins[bin_idx],
+            })
+        out[chrom] = rows
+    return out
+
+
+def cohort_quality_metrics(
+    samples: Iterable[SampleStats],
+) -> dict:
+    """Aggregate DP / GQ / AD-ref-fraction sanity stats (Tier 2 #7).
+
+    Returns summary statistics (count, mean, std, percentiles)
+    rather than the raw samples — keeps ``summary.json`` compact
+    while still exposing whether the empirical distributions
+    match ``quality.py``'s claimed model:
+
+    - **DP** ~ Poisson(λ ≈ 30) with per-sample Gaussian jitter,
+      so cohort mean should be ~30 and the distribution roughly
+      bell-shaped around it.
+    - **GQ** is recomputed from AD vs GT; clean hom-ref / hom-alt
+      calls hit the cap, hets are slightly lower; cohort median
+      should be high.
+    - **AD-ref-fraction at hets** should cluster around the
+      empirical 0.475 Illumina+BWA-MEM ref-bias target. Drift
+      from that band is the most useful regression signal —
+      it means either the ref-bias constant in ``quality.py``
+      changed or the AD computation regressed.
+    """
+    import statistics
+
+    dp_all: list = []
+    gq_all: list = []
+    ad_all: list = []
+    for s in samples:
+        dp_all.extend(s.dp_samples)
+        gq_all.extend(s.gq_samples)
+        ad_all.extend(s.ad_het_ref_frac_samples)
+
+    def _summarise(values: list, target: float | None = None) -> dict:
+        if not values:
+            return {
+                "n": 0, "mean": None, "median": None,
+                "stdev": None, "p10": None, "p90": None,
+                "target": target,
+            }
+        values_sorted = sorted(values)
+        n = len(values_sorted)
+        return {
+            "n": n,
+            "mean": statistics.fmean(values_sorted),
+            "median": values_sorted[n // 2],
+            "stdev": (statistics.stdev(values_sorted)
+                      if n >= 2 else 0.0),
+            "p10": values_sorted[max(0, int(0.10 * n))],
+            "p90": values_sorted[min(n - 1, int(0.90 * n))],
+            "target": target,
+        }
+
+    return {
+        # Targets pulled from ``syntheticgen/quality.py`` constants
+        # — drift surfaces the moment those change.
+        "dp": _summarise(dp_all, target=30.0),
+        "gq": _summarise(gq_all, target=None),
+        "ad_het_ref_fraction": _summarise(ad_all, target=0.475),
+    }
+
+
+def cohort_f_statistic(
+    matrix, max_records: int | None = None,
+) -> dict:
+    """Per-sample inbreeding coefficient F from a dosage matrix
+    (Tier 2 #8).
+
+    ``matrix`` is the ``(n_samples, n_variants)`` int dosage
+    matrix from :func:`build_genotype_matrix` — 0 = hom-ref,
+    1 = het, 2 = hom-alt, -1 = missing. Computes per-variant
+    cohort allele frequency p, then per-sample:
+
+    - observed_het = count of dosage==1 sites for this sample
+    - expected_het = Σᵥ 2 · p_v · (1 - p_v) across the same sites
+    - F = 1 − observed_het / expected_het
+
+    Real outbred cohorts have F ≈ 0 (slightly negative is typical
+    under finite-sample sampling variance). Strongly positive F
+    (> ~0.05) indicates inbreeding or hidden structure; strongly
+    negative F is a hint that the simulator emits too many hets
+    relative to the expected HWE distribution.
+
+    Returns ``{"per_sample": [...], "cohort_mean": float,
+    "cohort_median": float}``. Per-sample entries include
+    ``sample_idx``, ``observed_het``, ``expected_het``, ``f``.
+    """
+    import numpy as np
+    import statistics
+
+    arr = np.asarray(matrix)
+    n_samples, n_variants = arr.shape
+    if n_samples == 0 or n_variants == 0:
+        return {"per_sample": [], "cohort_mean": None,
+                "cohort_median": None}
+
+    # Per-variant cohort AF, ignoring missing (-1) entries.
+    # arr is int dosage; mask out missing.
+    valid = arr >= 0
+    n_called = valid.sum(axis=0)
+    # Avoid divide-by-zero: variants where no sample has a call.
+    safe_n = np.where(n_called > 0, n_called, 1)
+    total_dosage = np.where(valid, arr, 0).sum(axis=0)
+    p = total_dosage / (2.0 * safe_n)
+    # Expected het per variant: 2 p (1 − p), zeroed for
+    # zero-call variants.
+    expected_het_per_variant = np.where(
+        n_called > 0, 2.0 * p * (1.0 - p), 0.0,
+    )
+
+    out_per_sample = []
+    fs: list = []
+    for i in range(n_samples):
+        sample_valid = valid[i]
+        observed_het = int(((arr[i] == 1) & sample_valid).sum())
+        # Sum expected_het only over the variants this sample
+        # actually has a call at; otherwise we'd over-count.
+        expected_het = float(
+            (expected_het_per_variant * sample_valid).sum()
+        )
+        f = (1.0 - observed_het / expected_het
+             if expected_het > 0 else None)
+        out_per_sample.append({
+            "sample_idx": i,
+            "observed_het": observed_het,
+            "expected_het": expected_het,
+            "f": f,
+        })
+        if f is not None:
+            fs.append(f)
+    return {
+        "per_sample": out_per_sample,
+        "cohort_mean": (statistics.fmean(fs) if fs else None),
+        "cohort_median": (
+            statistics.median(fs) if fs else None
+        ),
+    }
+
+
+def cohort_ancestry_tracts(
+    ancestry_bed_paths: list,
+) -> dict:
+    """Tract-length distribution from admixture-mode ancestry BEDs
+    (Tier 2 #9).
+
+    Each per-person ancestry BED carries 5 columns:
+    ``chrom\tstart\tend\thap1_pop\thap2_pop`` (one segment per row,
+    0-based half-open). A "tract" is a maximal run of consecutive
+    rows where the haplotype's ancestry is constant; tract length
+    is ``end - start`` in bp.
+
+    Returns ``{"by_population": {pop: {"n": int, "mean_bp": float,
+    "median_bp": int}}, "mean_bp_across_pops": float}``.
+
+    Reads the BEDs the M6 admixture path already writes, so this
+    check needs no extra cli machinery — just runs when ancestry
+    BEDs exist under the batch dir. Useful as a sanity check that
+    the realised pulse-time matches the configured one (mean
+    tract length L_morgans ≈ 1 / ((1 − α) · T) under a clean
+    single-pulse admixture).
+    """
+    import statistics
+
+    by_pop: dict = defaultdict(list)
+
+    for bed_path in ancestry_bed_paths:
+        try:
+            text = Path(bed_path).read_text()
+        except OSError:
+            continue
+        # Track tracts for each haplotype independently. State:
+        # (chrom, pop) per haplotype; emit tract when either
+        # changes.
+        for hap_col in (3, 4):  # 0-indexed columns: hap1=3, hap2=4
+            current_chrom = None
+            current_pop = None
+            current_start = 0
+            current_end = 0
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 5:
+                    continue
+                chrom, start_s, end_s = parts[0], parts[1], parts[2]
+                try:
+                    start = int(start_s)
+                    end = int(end_s)
+                except ValueError:
+                    continue
+                pop = parts[hap_col]
+                if (chrom != current_chrom
+                        or pop != current_pop):
+                    if current_pop is not None:
+                        by_pop[current_pop].append(
+                            current_end - current_start,
+                        )
+                    current_chrom = chrom
+                    current_pop = pop
+                    current_start = start
+                    current_end = end
+                else:
+                    current_end = end
+            # Flush the final tract.
+            if current_pop is not None:
+                by_pop[current_pop].append(
+                    current_end - current_start,
+                )
+
+    out = {}
+    all_lengths: list = []
+    for pop, lengths in sorted(by_pop.items()):
+        if not lengths:
+            continue
+        lengths_sorted = sorted(lengths)
+        out[pop] = {
+            "n": len(lengths_sorted),
+            "mean_bp": statistics.fmean(lengths_sorted),
+            "median_bp": lengths_sorted[len(lengths_sorted) // 2],
+        }
+        all_lengths.extend(lengths_sorted)
+    return {
+        "by_population": out,
+        "mean_bp_across_pops": (
+            statistics.fmean(all_lengths) if all_lengths else None
+        ),
     }
 
 
