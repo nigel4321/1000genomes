@@ -2195,6 +2195,36 @@ def main(argv: list[str] | None = None) -> int:
             f"AFR={args.afr_frac:.2f}, length={args.chr_length_mb} Mb)",
             file=sys.stderr,
         )
+        # M12: pre-flight validate the FASTA at the parent process
+        # level so a missing file / wrong contigs / too-short
+        # chrom fails in seconds rather than after msprime starts
+        # in each worker. The streamed coalescent path validates
+        # the same way; PR #84 review flagged that the admixture
+        # path was skipping this safety net and silently producing
+        # rng-fabricated REF when the FASTA's contigs didn't match.
+        # The open handle is discarded — workers re-open from the
+        # path inside ``simulate_chromosome``.
+        if args.reference_fasta:
+            from .reference import load_fasta, validate_fasta
+            print(
+                f"  loading reference FASTA: {args.reference_fasta}",
+                file=sys.stderr,
+            )
+            _fa = load_fasta(args.reference_fasta)
+            try:
+                try:
+                    validate_fasta(
+                        _fa, chromosomes, args.chr_length_mb,
+                    )
+                except ValueError as exc:
+                    sys.exit(str(exc))
+                print(
+                    f"  reference FASTA OK ({len(_fa.references)} contigs)",
+                    file=sys.stderr,
+                )
+            finally:
+                _fa.close()  # workers will re-open from the path
+
         cohort_sites, person_ancestry = simulate_admixed_cohort(
             chromosomes=chromosomes, build=args.build,
             n_people=args.n, length_mb=args.chr_length_mb,

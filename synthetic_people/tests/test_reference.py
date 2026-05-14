@@ -355,9 +355,18 @@ class ReferenceEndToEndTest(unittest.TestCase):
             )
 
 
+_HAVE_DEMES = importlib.util.find_spec("demes") is not None
+_HAVE_TSKIT = importlib.util.find_spec("tskit") is not None
+
+
 @unittest.skipUnless(
-    _HAVE_PYSAM and _HAVE_MSPRIME and _HAVE_STDPOPSIM,
-    "needs pysam + msprime + stdpopsim",
+    _HAVE_PYSAM and _HAVE_MSPRIME and _HAVE_DEMES and _HAVE_TSKIT,
+    # PR #84 review: the admixture path's deps are msprime + demes +
+    # tskit (see ``syntheticgen/admixture.py:_require_deps``).
+    # ``stdpopsim`` is NOT required — the original guard here was
+    # too strict and skipped the test in environments where the
+    # admixture stack is present but stdpopsim is not.
+    "needs pysam + msprime + demes + tskit (admixture deps)",
 )
 class AdmixtureReferenceTest(unittest.TestCase):
     """PR #83 review #2: the admixture path has its own
@@ -372,15 +381,26 @@ class AdmixtureReferenceTest(unittest.TestCase):
     re-opens from the path; kernel mmap is shared.
     """
 
-    def _build_fasta(self, tmp: Path) -> Path:
+    def _build_fasta(self, tmp: Path, chroms: tuple = ("22",)) -> Path:
+        # 1 Mb of CG repeats per requested chrom — distinct bytes
+        # per pos so the test catches an "all-rng-fallback" bug
+        # (which would produce a uniform distribution, not all C/G).
         import pysam
-        path = tmp / "admix_chr22.fa"
-        seq = ("CGCG" * 250_000)  # 1 Mb of CG repeats — distinct
-        # bytes per pos so the test catches an "all-rng-fallback"
-        # bug (which would produce a uniform distribution, not all C/G).
-        path.write_text(f">22\n{seq}\n")
+        path = tmp / "admix.fa"
+        body = "".join(
+            f">{c}\n{'CGCG' * 250_000}\n" for c in chroms
+        )
+        path.write_text(body)
         pysam.faidx(str(path))
         return path
+
+    def _assert_all_refs_cg(self, sites: list, label: str) -> None:
+        non_cg = [s["ref"] for s in sites if s["ref"] not in "CG"]
+        self.assertEqual(
+            non_cg, [],
+            f"{label}: {len(non_cg)}/{len(sites)} REFs were not C/G "
+            f"— FASTA path not threaded; rng fallback fired uniformly",
+        )
 
     def test_admixture_serial_chain_uses_fasta(self):
         # workers=1 path → serial, no ProcessPoolExecutor.
@@ -402,15 +422,139 @@ class AdmixtureReferenceTest(unittest.TestCase):
                 fasta_path=str(fasta_path),
             )
             self.assertGreater(len(sites), 0)
-            # Every site's REF must be C or G (since FASTA is CGCG…)
-            # — if the fasta_path threading is broken, REF would be
-            # rng.choice('ACGT'), giving roughly 50% A/T.
-            non_cg = [s["ref"] for s in sites if s["ref"] not in "CG"]
+            self._assert_all_refs_cg(sites, "serial")
+
+    def test_admixture_parallel_chain_pickles_fasta_path(self):
+        # PR #84 review #2: workers > 1 AND len(chromosomes) > 1
+        # routes through ProcessPoolExecutor. The fasta_path
+        # (string) pickles cleanly; an open FastaFile would not.
+        # This test exercises that branch — if a future change
+        # accidentally passes a handle through the executor, it'll
+        # fail to pickle and this test catches it before WGS users
+        # do.
+        import random
+        from syntheticgen.admixture import simulate_cohort
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            fasta_path = self._build_fasta(tmp, chroms=("21", "22"))
+            rng = random.Random(42)
+            sites, ancestry = simulate_cohort(
+                chromosomes=["21", "22"], build="GRCh38",
+                n_people=2, length_mb=0.3,
+                proportions=(0.6, 0.25, 0.15),
+                rec_rate=1e-8, mu=1.29e-8,
+                rng=rng, verbose=False, workers=2,
+                fasta_path=str(fasta_path),
+            )
+            self.assertGreater(len(sites), 0)
+            self._assert_all_refs_cg(sites, "parallel (workers=2)")
+
+
+@unittest.skipUnless(
+    _HAVE_PYSAM and _HAVE_MSPRIME and _HAVE_DEMES and _HAVE_TSKIT
+    and _BCFTOOLS_BIN,
+    "needs pysam + admixture deps + bcftools",
+)
+class AdmixtureCliFastaTest(unittest.TestCase):
+    """PR #84 review #2: end-to-end cli invocation with
+    ``--reference-fasta --admixture``. The previous regression
+    test in ``AdmixtureReferenceTest`` calls ``simulate_cohort``
+    directly, bypassing the cli's arg-routing + pre-flight
+    validation. This test runs the cli's ``main`` so a future
+    regression in the cli plumbing (e.g. forgetting to pass
+    ``args.reference_fasta`` through) trips here.
+    """
+
+    def _build_fasta(self, tmp: Path) -> Path:
+        import pysam
+        path = tmp / "cli_admix.fa"
+        path.write_text(f">22\n{'CGCG' * 250_000}\n")
+        pysam.faidx(str(path))
+        return path
+
+    def test_cli_admixture_emits_real_refs(self):
+        import subprocess
+        from syntheticgen import cli as cli_module
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            fasta_path = self._build_fasta(tmp)
+            out_dir = tmp / "out"
+            # Minimal cli invocation: 2 people, chr22 only, 0.5 Mb,
+            # admixture proportions sum to 1.0, --reference-fasta
+            # threaded all the way through.
+            argv = [
+                "--no-config",
+                "--n", "2",
+                "--seed", "42",
+                "--build", "GRCh38",
+                "--chromosomes", "22",
+                "--chr-length-mb", "0.5",
+                "--admixture",
+                "--eur-frac", "0.6",
+                "--sas-frac", "0.25",
+                "--afr-frac", "0.15",
+                "--rsid-density", "0",
+                "--clinvar-inject-density", "0",
+                "--svs-per-person", "0",
+                "--error-rate", "0",
+                "--dropout-rate", "0",
+                "--workers", "1",
+                "--output-dir", str(out_dir),
+                "--cache-dir", str(out_dir / "cache"),
+                "--reference-fasta", str(fasta_path),
+            ]
+            rc = cli_module.main(argv)
+            self.assertEqual(rc, 0)
+            # Pull every REF out of the first person's VCF;
+            # they must all be C or G.
+            vcf = out_dir / "person_0001.vcf.gz"
+            self.assertTrue(vcf.is_file(), f"person VCF missing: {vcf}")
+            out = subprocess.check_output(
+                ["bcftools", "query", "-f", "%REF\n", str(vcf)],
+                text=True,
+            )
+            refs = [r for r in out.strip().splitlines() if r]
+            self.assertGreater(len(refs), 0)
+            non_cg = [r for r in refs if r not in ("C", "G")]
             self.assertEqual(
                 non_cg, [],
-                f"{len(non_cg)}/{len(sites)} REFs were not C/G — "
-                f"FASTA path not threaded into the admixture chain",
+                f"cli admixture: {len(non_cg)}/{len(refs)} non-C/G "
+                f"REFs — the --reference-fasta flag was not routed "
+                f"into the admixture path",
             )
+
+    def test_cli_admixture_rejects_missing_fasta_early(self):
+        # PR #84 review #3: a missing FASTA path must fail at
+        # startup, not after msprime starts working inside the
+        # admixture worker. The streamed coalescent path
+        # validates at startup; this test ensures the admixture
+        # path now does too (PR #84 added the validate-then-discard
+        # block to the admixture branch in cli.main).
+        from syntheticgen import cli as cli_module
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            out_dir = tmp / "out"
+            argv = [
+                "--no-config",
+                "--n", "2",
+                "--seed", "42",
+                "--build", "GRCh38",
+                "--chromosomes", "22",
+                "--chr-length-mb", "0.5",
+                "--admixture",
+                "--eur-frac", "0.6",
+                "--sas-frac", "0.25",
+                "--afr-frac", "0.15",
+                "--rsid-density", "0",
+                "--clinvar-inject-density", "0",
+                "--svs-per-person", "0",
+                "--workers", "1",
+                "--output-dir", str(out_dir),
+                "--cache-dir", str(out_dir / "cache"),
+                "--reference-fasta", "/nonexistent/path.fa",
+            ]
+            with self.assertRaises(FileNotFoundError):
+                cli_module.main(argv)
 
 
 if __name__ == "__main__":
