@@ -41,6 +41,7 @@ from syntheticgen.resume import (
     ResumeMismatch,
     load_or_create_meta,
 )
+from tests._shared_cache import SHARED_TEST_CACHE_DIR
 
 
 _HAVE_BCFTOOLS = shutil.which("bcftools") is not None
@@ -179,7 +180,9 @@ def _streamed_args(out_dir: Path, no_resume: bool = False) -> list:
         "--dropout-rate", "0",
         "--workers", "1",
         "--output-dir", str(out_dir),
-        "--cache-dir", str(out_dir / "cache"),
+        # Share the ClinVar download across tests in this process —
+        # see tests/_shared_cache.py.
+        "--cache-dir", str(SHARED_TEST_CACHE_DIR),
         "--mode", "cohort",
         # M12: opt out of the auto-fetch (default-on behaviour
         # would download a 3 GB FASTA into the per-test cache_dir).
