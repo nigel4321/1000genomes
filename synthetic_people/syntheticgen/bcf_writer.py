@@ -459,8 +459,21 @@ def write_cohort_bcf_parallel(out_path: Path, build: str,
     # sample-column concatenation in the order the partials appear
     # on the command line. Pass them in slice order so the merged
     # sample columns align with ``sample_ids``.
+    #
+    # ``--threads`` parallelizes htslib's BGZF compression of the
+    # output BCF — the dominant CPU cost of the merge step (the
+    # join itself is a trivial sample-column concatenation since
+    # partials have identical variants). By merge-time the parallel
+    # partial-writer workers have already exited (``fut.result()``
+    # above), so all cores are idle. Cap at 4: htslib's marginal
+    # benefit flattens past 4 compression threads because the
+    # main thread (read/decode/encode) becomes the bottleneck, and
+    # 4 × 8 MB pthread stacks ≈ 32 MB extra RSS is the right
+    # ceiling on the memory cost.
+    merge_threads = min(4, workers)
     merge_cmd = [
         "bcftools", "merge", "-O", "b",
+        "--threads", str(merge_threads),
         "-o", str(out_path),
         *[str(p) for p in partial_paths],
     ]
@@ -473,7 +486,9 @@ def write_cohort_bcf_parallel(out_path: Path, build: str,
             f"{out_path}: {stderr[-500:] or '(no stderr)'}"
         )
     subprocess.run(
-        ["bcftools", "index", "-f", str(out_path)],
+        ["bcftools", "index", "-f",
+         "--threads", str(merge_threads),
+         str(out_path)],
         check=True, capture_output=True,
     )
 
@@ -634,8 +649,13 @@ def write_cohort_bcf_parallel_from_arrow(
     finally:
         _COHORT_ARROW_STATE.clear()
 
+    # See ``write_cohort_bcf_parallel`` for rationale on the
+    # ``--threads min(4, workers)`` choice — both paths share the
+    # same merge orchestration shape and the same cost profile.
+    merge_threads = min(4, workers)
     merge_cmd = [
         "bcftools", "merge", "-O", "b",
+        "--threads", str(merge_threads),
         "-o", str(out_path),
         *[str(p) for p in partial_paths],
     ]
@@ -648,7 +668,9 @@ def write_cohort_bcf_parallel_from_arrow(
             f"{out_path}: {stderr[-500:] or '(no stderr)'}"
         )
     subprocess.run(
-        ["bcftools", "index", "-f", str(out_path)],
+        ["bcftools", "index", "-f",
+         "--threads", str(merge_threads),
+         str(out_path)],
         check=True, capture_output=True,
     )
 
