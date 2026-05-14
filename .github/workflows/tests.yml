@@ -42,26 +42,45 @@ jobs:
           # trip / parity / cli integration tests.
           pip install pyarrow
 
+      - name: Run unit tests
+        run: python .github/scripts/run_tests.py synthetic_people
+
+  synthetic-people-m12-smoke:
+    name: synthetic_people M12 smoke (default-on FASTA + cache)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: synthetic_people/requirements.txt
+
+      - name: Install htslib binaries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bcftools tabix
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r synthetic_people/requirements.txt
+
       # M12 (default-on FASTA) + ClinVar cache.
       #
       # The cli auto-downloads the Ensembl primary FASTA (~900 MB
       # gzipped → ~3.1 GB on disk) and the build's ClinVar VCF
       # (~70 MB) into ``--cache-dir`` on first run. Without a
       # cross-run cache, every CI job would re-pull both — slow
-      # and a real load on Ensembl/NCBI FTP. The unit-test suite
-      # itself opts out via ``--no-reference-fasta`` and uses
-      # per-test temp cache_dirs, so this cache restore is a
-      # no-op for the current tests. It's wired up here so:
+      # and a real load on Ensembl/NCBI FTP.
       #
-      # (a) any new smoke / e2e / benchmark job that DOES use real
-      #     REF or ClinVar will get a populated cache for free
-      #     (provided it points ``--cache-dir`` at the cached path
-      #     below — the cli default ``synthetic_people/cache`` is
-      #     repo-local and clobbered each job, so the cached path
-      #     must be passed explicitly), and
-      # (b) the pattern is documented in one place — downstream
-      #     users running this cli in their own GitHub Actions
-      #     workflows can copy the block verbatim.
+      # This smoke job is the cache's consumer: it runs the cli
+      # end-to-end with the M12 default-on auto-fetch path against
+      # the cached ``--cache-dir``, so the first run on a new key
+      # populates the cache (download + decompress + index) and
+      # every subsequent run on the same key restores it for free.
       #
       # On-disk layout (matches ``reference.fetch_reference_fasta``
       # + ``clinvar.fetch_clinvar``):
@@ -73,14 +92,43 @@ jobs:
       #
       # Cache key versioning: bump the ``-v1`` suffix when either
       # source URL or the on-disk layout changes.
+      #
+      # Downstream consumers running this cli in their own GitHub
+      # Actions workflows can copy the ``Cache reference FASTA``
+      # block + the ``--cache-dir ~/.cache/synthetic-people-data``
+      # arg below verbatim — together they're a working pattern.
       - name: Cache reference FASTA + ClinVar
         uses: actions/cache@v4
         with:
           path: ~/.cache/synthetic-people-data
           key: synth-people-data-${{ runner.os }}-grch38-v1
 
-      - name: Run unit tests
-        run: python .github/scripts/run_tests.py synthetic_people
+      # Minimal end-to-end smoke of the M12 default-on path.
+      # ``--n 2 --chromosomes 22 --chr-length-mb 0.5`` keeps the
+      # msprime simulation small (<30 s on cache hit); the heavy
+      # cost on a cache miss is the ~900 MB Ensembl FASTA download
+      # + decompress + index (~2-3 min on first run only).
+      #
+      # No ``--reference-fasta`` and no ``--no-reference-fasta``
+      # means the cli takes the default-on auto-fetch path — the
+      # path the rest of the test suite opts OUT of, so this is
+      # the only end-to-end CI coverage for that path.
+      - name: Smoke run (default-on REF FASTA + ClinVar)
+        run: |
+          mkdir -p smoke-out
+          python3 synthetic_people/generate_people.py \
+            --n 2 \
+            --chromosomes 22 \
+            --chr-length-mb 0.5 \
+            --seed 42 \
+            --cache-dir ~/.cache/synthetic-people-data \
+            --output-dir smoke-out
+          # Confirm the run actually produced VCFs (smoke = the
+          # cli completed AND emitted non-empty files). The cli
+          # names outputs ``person_{i+1:04d}.vcf.gz``.
+          ls -la smoke-out/
+          test -s smoke-out/person_0001.vcf.gz
+          test -s smoke-out/person_0002.vcf.gz
 
   nextflow-pipeline:
     name: nextflow_pipeline bin scripts
