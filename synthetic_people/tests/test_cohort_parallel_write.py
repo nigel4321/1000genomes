@@ -318,5 +318,94 @@ class ParallelWriteCohortAFTest(unittest.TestCase):
         self.assertAlmostEqual(float(af_str), 0.375, places=3)
 
 
+@unittest.skipUnless(_HAVE_BCFTOOLS, "bcftools not on PATH")
+class ParallelWriteMergeThreadsWiringTest(unittest.TestCase):
+    """Wiring: ``bcftools merge`` and ``bcftools index`` must both be
+    invoked with ``--threads min(4, workers)`` so the output BGZF
+    compression is parallelised. Output correctness at any thread
+    count is already covered by ``ParallelWriteParityTest``; this
+    test pins the perf wiring itself so a future refactor can't
+    silently drop the flag and regress the merge step's wall time
+    on real cohort runs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = Path(tempfile.mkdtemp(
+            prefix="cohort_parallel_threads_"))
+        cls.samples = [f"S{i:03d}" for i in range(8)]
+        cls.sites = [
+            _site(1000, "A", "G", ["0|0", "0|1", "1|1", "0|0",
+                                   "0|0", "1|0", "0|1", "1|1"],
+                  site_id="rs1"),
+        ]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _run_capturing_subprocess(self, out_path, workers):
+        """Run the parallel writer with ``subprocess.run`` patched
+        to capture bcftools argv before delegating to the real call.
+        Returns the captured argv list."""
+        from unittest.mock import patch
+        captured: list[list[str]] = []
+        import syntheticgen.bcf_writer as bcf_writer_mod
+        real_run = bcf_writer_mod.subprocess.run
+
+        def _capture(cmd, *args, **kwargs):
+            captured.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
+        with patch.object(bcf_writer_mod.subprocess, "run", _capture):
+            write_cohort_bcf_parallel(
+                out_path, "GRCh38", self.samples, self.sites,
+                workers=workers,
+            )
+        return captured
+
+    def _extract_threads_arg(self, argv: list[str]) -> str:
+        idx = argv.index("--threads")
+        return argv[idx + 1]
+
+    def test_merge_uses_threads_capped_at_4_for_workers_2(self):
+        # workers=2 → min(4, 2) = 2.
+        out = self.tmpdir / "threads_w2.bcf"
+        captured = self._run_capturing_subprocess(out, workers=2)
+        merge_calls = [
+            c for c in captured if c[:2] == ["bcftools", "merge"]
+        ]
+        self.assertEqual(len(merge_calls), 1,
+                         "expected exactly one bcftools merge call")
+        self.assertIn("--threads", merge_calls[0])
+        self.assertEqual(self._extract_threads_arg(merge_calls[0]),
+                         "2")
+
+    def test_merge_uses_threads_capped_at_4_for_workers_8(self):
+        # workers=8 → min(4, 8) = 4 (cap).
+        out = self.tmpdir / "threads_w8.bcf"
+        captured = self._run_capturing_subprocess(out, workers=8)
+        merge_calls = [
+            c for c in captured if c[:2] == ["bcftools", "merge"]
+        ]
+        self.assertEqual(len(merge_calls), 1)
+        self.assertEqual(self._extract_threads_arg(merge_calls[0]),
+                         "4")
+
+    def test_index_uses_threads_capped_at_4_for_workers_8(self):
+        # The post-merge ``bcftools index`` call should match the
+        # merge call's thread count — they share the same compression
+        # parallelism budget and run back-to-back on idle CPUs.
+        out = self.tmpdir / "threads_idx_w8.bcf"
+        captured = self._run_capturing_subprocess(out, workers=8)
+        index_calls = [
+            c for c in captured if c[:2] == ["bcftools", "index"]
+        ]
+        self.assertEqual(len(index_calls), 1,
+                         "expected exactly one bcftools index call")
+        self.assertIn("--threads", index_calls[0])
+        self.assertEqual(self._extract_threads_arg(index_calls[0]),
+                         "4")
+
+
 if __name__ == "__main__":
     unittest.main()

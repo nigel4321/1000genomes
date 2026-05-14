@@ -315,5 +315,68 @@ class ArrowBcfSerialFallbackTest(unittest.TestCase):
         self.assertEqual(_bcf_data_md5(out_par), _bcf_data_md5(out_ser))
 
 
+@unittest.skipUnless(_HAVE_BCFTOOLS, "bcftools not on PATH")
+@unittest.skipUnless(HAS_PYARROW, "pyarrow not installed")
+class ArrowBcfMergeThreadsWiringTest(unittest.TestCase):
+    """Wiring: the Arrow-path merge + index calls must mirror the
+    sites-list path's ``--threads min(4, workers)``. Output parity
+    across thread counts is covered by ``ArrowBcfWriteParityTest``;
+    this test pins the perf flag itself so a refactor can't silently
+    drop it from one path while leaving the other intact."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.sample_ids = [f"S{i:02d}" for i in range(8)]
+        self.sites = [
+            _site(100, ["0|0", "0|1", "1|1", "0|0",
+                        "1|0", "0|0", "0|1", "1|1"]),
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run_capturing_subprocess(self, workers: int) -> list[list[str]]:
+        from unittest.mock import patch
+        captured: list[list[str]] = []
+        import syntheticgen.bcf_writer as bcf_writer_mod
+        real_run = bcf_writer_mod.subprocess.run
+
+        def _capture(cmd, *args, **kwargs):
+            captured.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
+        arrow = self.dir / f"cohort_w{workers}.arrow"
+        write_arrow_file(
+            arrow, "22", len(self.sample_ids), iter(self.sites)
+        )
+        out = self.dir / f"arrow_threads_w{workers}.bcf"
+        with patch.object(bcf_writer_mod.subprocess, "run", _capture):
+            write_cohort_bcf_parallel_from_arrow(
+                arrow, out, "GRCh37", self.sample_ids, workers,
+            )
+        return captured
+
+    def test_arrow_merge_uses_threads_workers_8(self):
+        captured = self._run_capturing_subprocess(workers=8)
+        merge_calls = [
+            c for c in captured if c[:2] == ["bcftools", "merge"]
+        ]
+        self.assertEqual(len(merge_calls), 1)
+        self.assertIn("--threads", merge_calls[0])
+        idx = merge_calls[0].index("--threads")
+        self.assertEqual(merge_calls[0][idx + 1], "4")
+
+    def test_arrow_index_uses_threads_workers_8(self):
+        captured = self._run_capturing_subprocess(workers=8)
+        index_calls = [
+            c for c in captured if c[:2] == ["bcftools", "index"]
+        ]
+        self.assertEqual(len(index_calls), 1)
+        self.assertIn("--threads", index_calls[0])
+        idx = index_calls[0].index("--threads")
+        self.assertEqual(index_calls[0][idx + 1], "4")
+
+
 if __name__ == "__main__":
     unittest.main()
