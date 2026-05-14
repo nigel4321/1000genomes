@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen import cli as cli_module
 from syntheticgen.coalescent import simulate_cohort_iter
+from tests._shared_cache import SHARED_TEST_CACHE_DIR
 
 
 _HAVE_BCFTOOLS = shutil.which("bcftools") is not None
@@ -85,7 +86,9 @@ def _common_args(out_dir: Path, n: int = 3, chroms: str = "22") -> list:
         "--dropout-rate", "0",
         "--workers", "1",
         "--output-dir", str(out_dir),
-        "--cache-dir", str(out_dir / "cache"),
+        # Share the ClinVar download across tests in this process —
+        # see tests/_shared_cache.py.
+        "--cache-dir", str(SHARED_TEST_CACHE_DIR),
         "--mode", "cohort",
         # M12: opt out of the auto-download. The default behaviour
         # (auto-fetch into cache_dir/reference/) would pull a 3 GB
@@ -213,8 +216,16 @@ class CohortStreamedStdpopsimMutationModelTest(unittest.TestCase):
             "--dropout-rate", "0",
             "--workers", "1",
             "--output-dir", str(cls.tmpdir),
-            "--cache-dir", str(cls.tmpdir / "cache"),
+            # Share the ClinVar download across tests; see
+            # tests/_shared_cache.py.
+            "--cache-dir", str(SHARED_TEST_CACHE_DIR),
             "--mode", "cohort",
+            # M12: opt out of the FASTA auto-fetch — this test
+            # checks multi-allelic GT validity via bcftools view -s,
+            # not REF content. Without this flag the run would
+            # download a ~900 MB Ensembl FASTA into the per-test
+            # cache, adding ~3 minutes to CI wall-time for nothing.
+            "--no-reference-fasta",
         ])
         if rc != 0:
             raise RuntimeError(f"cli.main exited {rc}")

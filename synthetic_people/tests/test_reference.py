@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tests._shared_cache import SHARED_TEST_CACHE_DIR  # noqa: E402
 
 _HAVE_PYSAM = importlib.util.find_spec("pysam") is not None
 
@@ -477,7 +478,9 @@ class ReferenceEndToEndTest(unittest.TestCase):
             "--dropout-rate", "0",
             "--workers", "1",
             "--output-dir", str(out_dir),
-            "--cache-dir", str(out_dir / "cache"),
+            # Share the ClinVar download across tests; see
+            # tests/_shared_cache.py.
+            "--cache-dir", str(SHARED_TEST_CACHE_DIR),
             "--mode", "cohort",
             "--cohort-mode", "sites_list",
             "--reference-fasta", str(fasta),
@@ -670,7 +673,9 @@ class AdmixtureCliFastaTest(unittest.TestCase):
                 "--dropout-rate", "0",
                 "--workers", "1",
                 "--output-dir", str(out_dir),
-                "--cache-dir", str(out_dir / "cache"),
+                # Share the ClinVar download across tests; see
+                # tests/_shared_cache.py.
+                "--cache-dir", str(SHARED_TEST_CACHE_DIR),
                 "--reference-fasta", str(fasta_path),
             ]
             rc = cli_module.main(argv)
@@ -726,7 +731,9 @@ class AdmixtureCliFastaTest(unittest.TestCase):
                 "--svs-per-person", "0",
                 "--workers", "1",
                 "--output-dir", str(out_dir),
-                "--cache-dir", str(out_dir / "cache"),
+                # Share the ClinVar download across tests; see
+                # tests/_shared_cache.py.
+                "--cache-dir", str(SHARED_TEST_CACHE_DIR),
                 "--reference-fasta", "/nonexistent/path.fa",
             ]
             with self.assertRaises(SystemExit) as ctx:

@@ -40,6 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen import cli as cli_module
+from tests._shared_cache import SHARED_TEST_CACHE_DIR
 
 
 _HAVE_BCFTOOLS = shutil.which("bcftools") is not None
@@ -65,7 +66,11 @@ def _common_args(out_dir: Path, mode: str, n: int = 3) -> list:
         "--dropout-rate", "0",
         "--workers", "1",
         "--output-dir", str(out_dir),
-        "--cache-dir", str(out_dir / "cache"),
+        # Share the ClinVar download across tests in this process.
+        # cli.main unconditionally calls fetch_clinvar at startup;
+        # a per-test cache_dir would re-download the ~70 MB VCF on
+        # every test. See tests/_shared_cache.py.
+        "--cache-dir", str(SHARED_TEST_CACHE_DIR),
         "--mode", mode,
         # M12: opt out of the auto-fetch (default-on behaviour
         # would download a 3 GB FASTA into the per-test cache_dir).

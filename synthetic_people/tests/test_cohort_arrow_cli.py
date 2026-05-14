@@ -28,6 +28,7 @@ from syntheticgen.cli import (  # noqa: E402
     _preflight_arrow_disk_check,
     _resolve_cohort_mode,
 )
+from tests._shared_cache import SHARED_TEST_CACHE_DIR  # noqa: E402
 
 _HAVE_BCFTOOLS = shutil.which("bcftools") is not None
 _HAVE_TABIX = shutil.which("tabix") is not None
@@ -217,7 +218,9 @@ def _common_args(
         "--dropout-rate", "0",
         "--workers", "2",
         "--output-dir", str(out_dir),
-        "--cache-dir", str(out_dir / "cache"),
+        # Share the ClinVar download across tests; see
+        # tests/_shared_cache.py.
+        "--cache-dir", str(SHARED_TEST_CACHE_DIR),
         "--mode", "cohort",
         "--cohort-mode", cohort_mode,
         # M12: see test_cohort_streaming._common_args — opt out
