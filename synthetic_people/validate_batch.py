@@ -24,6 +24,12 @@ from pathlib import Path
 # Make sibling package importable when invoked as a plain script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from syntheticgen.mutation_spectrum import (  # noqa: E402
+    MutationSpectrum,
+    compute_spectrum,
+    to_jsonable as mutation_spectrum_to_jsonable,
+)
+from syntheticgen.reference import load_fasta  # noqa: E402
 from syntheticgen.validate import (  # noqa: E402
     aggregate_indel_lengths,
     aggregate_sv_summary,
@@ -187,11 +193,13 @@ def main(argv: list[str] | None = None) -> int:
     # every record mismatches; the gate exists so a post-M12 run
     # against the real FASTA proves the wiring works.
     ref_check = None
+    mutation_spectrum_json = None
     if args.reference_fasta is not None:
         if not args.reference_fasta.is_file():
             print(
                 f"[warn] --reference-fasta not found: "
-                f"{args.reference_fasta}; skipping REF check.",
+                f"{args.reference_fasta}; skipping REF check + "
+                f"mutation spectrum.",
                 file=sys.stderr,
             )
         else:
@@ -206,6 +214,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(f"  REF check {v.name}: {status}",
                       file=sys.stderr)
+            # Tier 2 #5: 96-channel mutation spectrum. Sourced from the
+            # cohort BCFs (one record per unique cohort site) rather
+            # than per-person VCFs, which would weight each site by
+            # its carrier count and over-represent common variants in
+            # the spectrum. Cohort BCFs exist in both --mode cohort
+            # and --mode per-person (Phase 5b2 layout) so this is
+            # available for every modern batch.
+            mutation_spectrum_json = _compute_mutation_spectrum(
+                args.batch_dir, args.reference_fasta, manifest,
+            )
 
     print(f"Cohort Ti/Tv = {titv:.3f}", file=sys.stderr)
     print(f"Cohort Het/Hom-alt = {cohort_het}/{cohort_hom_alt} = "
@@ -295,11 +313,13 @@ def main(argv: list[str] | None = None) -> int:
         },
         "ref_check": ref_check,
         # Tier 2 additions: per-region density, DP/GQ/AD sanity,
-        # F-statistic, admixture tract lengths.
+        # F-statistic, admixture tract lengths, 96-channel mutation
+        # spectrum.
         "region_density": region_density,
         "quality_metrics": quality_metrics,
         "f_statistic": f_statistic,
         "ancestry_tracts": ancestry_tracts,
+        "mutation_spectrum": mutation_spectrum_json,
         "ld_decay": ld,
         "pca": {
             "components": args.pca_components,
@@ -333,6 +353,18 @@ def main(argv: list[str] | None = None) -> int:
                                     indent=2, default=str))
     print(f"Summary JSON → {json_path}", file=sys.stderr)
 
+    # Tier 2 #5: also emit the mutation spectrum on its own so
+    # downstream signature-comparison tooling (deferred to a follow-
+    # up PR) can pick it up without parsing summary.json's broader
+    # schema. Skipped when no spectrum was computed.
+    if mutation_spectrum_json is not None:
+        spectrum_path = out_dir / "mutation_spectrum.json"
+        spectrum_path.write_text(
+            json.dumps(mutation_spectrum_json, indent=2),
+        )
+        print(f"Mutation spectrum JSON → {spectrum_path}",
+              file=sys.stderr)
+
     # --- artefacts: plots ---
     plots = _try_plots()
     plot_paths: dict = {}
@@ -357,6 +389,61 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Markdown report → {report_path}", file=sys.stderr)
     print("Validation complete.", file=sys.stderr)
     return 0
+
+
+def _compute_mutation_spectrum(
+    batch_dir: Path,
+    fasta_path: Path,
+    manifest: dict | None,
+) -> dict | None:
+    """Compute the 96-channel mutation spectrum from the batch's cohort BCFs.
+
+    Returns the JSON-serialisable spectrum dict (see
+    :func:`syntheticgen.mutation_spectrum.to_jsonable`) or ``None`` if
+    no cohort BCFs are available. Uses the cohort BCFs rather than
+    per-person VCFs because the former hold one record per unique site
+    — per-person VCFs would weight each site by its carrier count,
+    over-representing common variants in the spectrum. Cohort BCFs
+    exist in both ``--mode cohort`` and ``--mode per-person`` (Phase
+    5b2 layout) so the spectrum is computable for every modern batch.
+    """
+    cohort_bcf_rels = (manifest or {}).get("cohort_bcfs") or []
+    if not cohort_bcf_rels:
+        print(
+            "[info] no cohort_bcfs in manifest; skipping mutation "
+            "spectrum (Tier 2 #5 needs cohort BCFs as source).",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        "Computing 96-channel mutation spectrum from cohort BCFs...",
+        file=sys.stderr,
+    )
+    fa = load_fasta(fasta_path)
+    try:
+        cohort_spectrum = MutationSpectrum()
+        for rel in cohort_bcf_rels:
+            bcf = batch_dir / rel
+            if not bcf.is_file():
+                print(
+                    f"  [warn] cohort BCF not found: {bcf}; "
+                    f"skipping for spectrum",
+                    file=sys.stderr,
+                )
+                continue
+            s = compute_spectrum(bcf, fa)
+            cohort_spectrum.add(s)
+        n_binned = sum(cohort_spectrum.counts)
+        print(
+            f"  binned {n_binned} SNVs across "
+            f"{len(cohort_bcf_rels)} cohort BCFs "
+            f"(excluded {cohort_spectrum.n_excluded} for "
+            f"N/non-canonical flanks)",
+            file=sys.stderr,
+        )
+        return mutation_spectrum_to_jsonable(cohort_spectrum)
+    finally:
+        fa.close()
 
 
 def _overlay_requested_from_manifest(manifest: dict | None) -> dict:
