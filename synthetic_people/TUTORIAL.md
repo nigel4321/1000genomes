@@ -34,7 +34,7 @@ are written to be run from the repository root
 8. [Reproducibility and seeding](#8-reproducibility-and-seeding)
 9. [Performance and scaling](#9-performance-and-scaling)
 10. [Configuration files (optional)](#10-configuration-files-optional)
-    - 10½. [Reference FASTA, sex assignment, mutation spectrum](#10-reference-fasta-sex-assignment-mutation-spectrum)
+    - 10b. [Reference FASTA, sex assignment, mutation spectrum](#10b-reference-fasta-sex-assignment-mutation-spectrum)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Glossary](#12-glossary)
 
@@ -136,8 +136,13 @@ out_hello/validation/
 └── pca.png
 ```
 
-Pass `--reference-fasta` to `validate_batch.py` (or rely on the same
-cached FASTA the cli's M12 default-on path uses) and you also get:
+Pass `--reference-fasta <path>` to `validate_batch.py` (the
+validator doesn't auto-discover the cli's cached FASTA — you have
+to give it the path explicitly, e.g.
+`--reference-fasta ~/.cache/synthetic-people-data/reference/GRCh38.fa`).
+When you do, and when the batch was produced in a mode that emits
+cohort BCFs (`--mode cohort` or `--mode both`, recorded in the
+manifest's `cohort_bcfs` field), you also get:
 
 ```
 out_hello/validation/
@@ -146,9 +151,18 @@ out_hello/validation/
                                       similarity, bar-chart plot)
 ```
 
-…plus a `ref_check` entry in `summary.json` reporting whether
-`bcftools norm --check-ref` passes against the FASTA (it should
-post-M12; pre-M12 it failed on every record by construction).
+The file is a top-level JSON object with summary fields (`n_total`,
+`n_excluded`, `n_binned`) plus a `channels` array carrying 96
+labelled entries (`{label, count, fraction}`) in canonical
+SigProfiler order.
+
+You also get a `ref_check` entry in `summary.json` reporting
+whether `bcftools norm --check-ref` passes against the FASTA. Pre-
+M12 the SNV / indel REFs were drawn from `rng.choice("ACGT")` so
+they matched the real base only ~25 % of the time; post-M12 on the
+coalescent / admixture paths they all pass. **SV anchor REF rows
+will still flag as mismatched** until the SV generator is wired
+through M12 too — see the README's Known gaps.
 
 The `manifest.json` is the canonical index. Read it whenever you need
 to know what happened in a run:
@@ -164,9 +178,9 @@ print('FDR  :', m['errors']['realised_fdr'])"
 
 Per-person entries surface the highlighted ClinVar variant, ancestry
 fractions (admixture mode), realised error counts, and the paths to
-the truth BEDs. The manifest's top-level `sex` field is a list of
-`"m"` / `"f"` strings, parallel-indexed to `samples` — added by
-M13.1 (2026-05-15). Inspect with:
+the truth BEDs. The manifest's top-level `m['sex']` field is a list
+of `"m"` / `"f"` strings, parallel-indexed to `m['samples']` — added
+by M13.1 (2026-05-15). Inspect with:
 
 ```bash
 .venv/bin/python -c "import json; m=json.load(open('out_hello/manifest.json'));
@@ -1250,7 +1264,7 @@ only supported value is `1`.
 
 ---
 
-## 10½. Reference FASTA, sex assignment, mutation spectrum
+## 10b. Reference FASTA, sex assignment, mutation spectrum
 
 Recent milestones added a handful of cohort-level knobs that don't
 fit cleanly under any §5 recipe. This section is the cheat sheet.
@@ -1259,8 +1273,20 @@ fit cleanly under any §5 recipe. This section is the cheat sheet.
 
 Since 2026-05-14 the cli auto-fetches the build's Ensembl primary
 FASTA into `<--cache-dir>/reference/<build>.fa` on first run and
-reuses the cache afterwards. Every emitted `REF` is the real base
-at that position, so output VCFs pass `bcftools norm --check-ref`.
+reuses the cache afterwards. SNV and indel REFs from the coalescent
+and admixture paths are the real base at that position; the
+`bcftools norm --check-ref` gate passes on those rows. **Two
+exceptions still flag mismatches**: SV anchor REFs (SV generator
+not yet wired through M12) and any run that used
+`--legacy-background` (the legacy 1000G-pool path doesn't consult
+the FASTA at all).
+
+The first run cost is ~900 MB compressed → ~3 GB decompressed; the
+"60-second hello world" in §2 of this guide elides that download by
+assuming a warm cache. For first-time setup or in CI without the
+cache pre-populated, the FASTA fetch + decompress + index adds ~2-3
+minutes on top of the simulation time. Pass `--no-reference-fasta`
+to skip it for runs that don't need real REF.
 
 ```bash
 # Default — auto-fetches (~900 MB compressed, ~3 GB decompressed)
@@ -1300,36 +1326,50 @@ to `null` to use auto-fetch, the default). There's no YAML field for
 ```
 
 Validation: must be a finite float in `[0.0, 1.0]`; out-of-range
-values fail at parse time. The drawn sexes land in
-`manifest.json[sex]` parallel-indexed to `samples`. The simulator
+values fail at parse time. The drawn sexes land in the manifest's
+`m['sex']` list, parallel-indexed to `m['samples']`. The simulator
 itself doesn't yet use sex (M13.1 is foundation-only); M13.3 will
 wire it through ploidy / PAR / MT clonality.
 
 YAML equivalent: `cohort.male_fraction: 0.2` — CLI wins on conflict
-per the standard `cli > config > defaults` precedence. Changing
-`male_fraction` between runs against the same `--output-dir`
-triggers `ResumeMismatch` (it's part of the cohort identity); pass
-`--no-resume` to migrate.
+per the standard `cli > config > defaults` precedence. On the
+streamed coalescent path (today's default) `male_fraction` is part
+of the resume identity persisted in `cohort.meta.json`, so changing
+it between runs against the same `--output-dir` triggers
+`ResumeMismatch`; pass `--no-resume` to migrate. The legacy-
+background and admixture-materialized paths don't persist resume
+state, so they don't have this safeguard — changing
+`male_fraction` mid-batch on those paths will just redraw sexes
+silently.
 
 ### Mutation spectrum — `validate_batch.py --reference-fasta` (Tier 2 #5)
 
-When you pass `--reference-fasta` to `validate_batch.py`, the
-validator also emits `mutation_spectrum.json` — a 96-channel
-trinucleotide-context binning of every biallelic SNV in the cohort
-BCFs. Useful for M14 development (today the distribution is
-roughly flat; post-M14 with `JC69` + per-trinucleotide-context μ
-it should match COSMIC SBS1).
+When you pass `--reference-fasta` to `validate_batch.py` AND the
+batch was produced in a mode that emits cohort BCFs (so its
+`manifest.json` carries a non-empty `cohort_bcfs` list — true for
+`--mode cohort` or `--mode both`), the validator emits
+`mutation_spectrum.json` — a 96-channel trinucleotide-context
+binning of every biallelic SNV in the cohort BCFs. Useful for M14
+development (today the distribution is roughly flat; post-M14 with
+`JC69` + per-trinucleotide-context μ it should match COSMIC SBS1).
+
+If `--reference-fasta` is omitted, OR the batch doesn't have
+cohort BCFs, the validator skips the spectrum (logs an info
+message) and `mutation_spectrum.json` is not written.
 
 ```bash
-.venv/bin/python validate_batch.py out_hello/ \
+.venv/bin/python synthetic_people/validate_batch.py out_hello/ \
     --reference-fasta ~/.cache/synthetic-people-data/reference/GRCh38.fa
 ```
 
-Output: `out_hello/validation/mutation_spectrum.json` with 96
-entries in canonical SigProfiler order (`A[C>A]A`, `A[C>A]C`, …,
-`T[T>G]T`), each carrying `count` + `fraction`. Deferred to a
-follow-up PR: SBS1 cosine-similarity comparison + matplotlib bar
-chart + Markdown report section.
+Output: `out_hello/validation/mutation_spectrum.json` — a top-level
+JSON object with `n_total` (biallelic SNVs read), `n_excluded`
+(records dropped due to N / IUPAC / off-chrom-end flanks),
+`n_binned`, and a `channels` array of 96 entries in canonical
+SigProfiler order (`A[C>A]A`, `A[C>A]C`, …, `T[T>G]T`), each
+carrying `{label, count, fraction}`. Deferred to a follow-up PR:
+SBS1 cosine-similarity comparison + matplotlib bar chart +
+Markdown report section.
 
 ---
 

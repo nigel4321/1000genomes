@@ -69,6 +69,7 @@ python3 -m venv .venv
 | `matplotlib>=3.7`, `scikit-allel>=1.3` | M10 | LD decay r² + cohort PCA + plot artefacts |
 | `scikit-learn>=1.3` (transitive) | M10 | PCA decomposition for the cohort matrix |
 | `pydantic>=2.0`, `PyYAML>=6.0` | config file | Validate and load `generate_people_config.yaml` (see TUTORIAL.md §10) |
+| `pysam>=0.22` | M12+ | Reference FASTA mmap loader for REF lookup at each variant. Hard dep since M12 (2026-05-14) — the cli auto-loads the build's FASTA by default. |
 
 **Optional dep — `pyarrow` (cohort scale ≥ n=100 000):**
 
@@ -89,8 +90,14 @@ Probe the environment:
 .venv/bin/python synthetic_people/generate_people.py --check-deps
 ```
 
-First run only: ClinVar is downloaded (~50 MB) into
-`synthetic_people/cache/` and re-used thereafter.
+First run downloads two assets into `synthetic_people/cache/` (or
+the path you pass via `--cache-dir`) and re-uses them thereafter:
+
+- ClinVar VCF (~70 MB) — variant annotations
+- Build's Ensembl primary FASTA (~900 MB compressed → ~3 GB
+  decompressed) for the M12 (2026-05-14) reference-aware REF
+  picking. Pass `--no-reference-fasta` to skip the FASTA download
+  for smoke runs / seed-pinned tests that don't need real REF.
 
 ---
 
@@ -177,9 +184,10 @@ Every per-person VCF picks up a handful of SVs by default:
 Type mix: ~50% `DEL`, ~30% `DUP`, ~20% `INV`. `INFO/SVLEN` is negative
 for `DEL` and positive for `DUP` / `INV`; `INFO/END = POS + |SVLEN|`;
 `INFO/CIPOS = -50,50` (every SV is currently flagged "imprecise").
-Anchor `REF` is the real base from the build's reference FASTA when
-M12 is active (default since 2026-05-14); pass `--no-reference-fasta`
-to fall back to the legacy fabricated-REF path.
+Anchor `REF` is **still fabricated** by `_draw_anchor_base(rng)` in
+`syntheticgen/sv.py` — M12 wired the FASTA through the coalescent /
+admixture SNV+indel paths but the SV generator was not in scope.
+This is tracked as a remaining gap (see "Known gaps" below).
 
 `out/manifest.json` gains an `svs` block recording per-person count,
 length range, and cohort-total SVs emitted; per-person entries record
@@ -866,19 +874,27 @@ smoke runs / seed-pinned tests that don't need real REF; explicit
 `cohort.reference_fasta`) is the override for users with a FASTA
 already on disk.
 
-All four REF-picking sites in the simulator (materialised path,
-streaming pass 1 + 2, admixture inline producer) route through a
-shared `_pick_ref` helper that consults the FASTA when present and
-falls back to `rng.choice("ACGT")` otherwise. The rng draw happens
-unconditionally so the master rng's consumption order stays stable
-between paths — only the REF/ALT *content* changes, not the
-simulator's downstream rng trajectory.
+The four coalescent / admixture REF-picking sites in the simulator
+(materialised path, streaming pass 1 + 2, admixture inline producer)
+route through a shared `_pick_ref` helper that consults the FASTA
+when present and falls back to `rng.choice("ACGT")` otherwise. The
+rng draw happens unconditionally so the master rng's consumption
+order stays stable between paths — only the REF/ALT *content*
+changes, not the simulator's downstream rng trajectory.
+
+**Out of scope in M12:** the SV generator's anchor REF (`sv.py`
+still uses `_draw_anchor_base(rng)`) and the legacy 1000G-pool path
+(`--legacy-background` does not call `_resolve_reference_fasta`).
+The legacy path runs without an active FASTA; SV anchor REF
+fabrication remains a tracked gap.
 
 Validation gate: `validate_batch.py --reference-fasta <fa>` runs
-`bcftools norm --check-ref w` and reports mismatches. Pre-M12 the
-gate failed on every record (fabricated REF); post-M12 with the
-auto-fetched FASTA, a passing run is empirical evidence the wiring
-works.
+`bcftools norm --check-ref w` and reports mismatches. Pre-M12 most
+records mismatched (fabricated REF matched the real base by
+chance only ~25 % of the time); post-M12 the SNV + indel rows pass
+on the coalescent / admixture paths, but the gate will still flag
+the SV anchor REFs as mismatched until the SV generator is wired
+through too.
 
 ### M13.1 — Sex assignment foundation (shipped 2026-05-15)
 
@@ -895,13 +911,16 @@ master `--seed` XOR'd with a fixed salt for integer seeds; OS
 entropy when `--seed` is omitted) so the master rng is **not**
 advanced — a fixed-seed run reproduces pre-M13.1 simulator output
 bit-for-bit. The draw rate is controlled by `--male-fraction`
-(default 0.5; CLI ↔ YAML `cohort.male_fraction` in lock-step per the
-standard `cli > config > defaults` precedence). Sexes are persisted
-in `cohort.meta.json` (schema v2; pre-existing meta files surface as
-`ResumeMismatch` so the user runs `--no-resume` once to migrate)
-and exposed on the manifest as a top-level `sex: ["m", "f", ...]`
-list parallel-indexed to `samples` (always present regardless of
-`--mode`).
+(default 0.5; CLI ↔ YAML `cohort.male_fraction` in lock-step per
+the standard `cli > config > defaults` precedence). Sexes are
+exposed on the manifest as a top-level `sex: ["m", "f", ...]` list
+parallel-indexed to `samples`, always present regardless of
+`--mode`. On the streamed coalescent path (today's default), sexes
+are persisted in `cohort.meta.json` (schema v2; pre-existing meta
+files surface as `ResumeMismatch` so the user runs `--no-resume`
+once to migrate) and `male_fraction` is part of the resume
+identity. The legacy-background and admixture-materialized paths
+don't use `cohort.meta.json`; they draw fresh sexes each run.
 
 **No simulation behaviour change yet** — every chromosome is still
 treated as diploid; M13.3 will wire ploidy / PAR / MT clonality
@@ -944,6 +963,12 @@ Tracked in `IMPLEMENTATION_PLAN.md` and `DATA_QUALITY_ASSESSMENT.md`
   but every chromosome is still simulated as diploid. M13.3 wires
   the ploidy lookup into the producers so chrX non-PAR / chrY /
   MT emit haploid GTs. M13.2 (validation gates) lands first.
+- **SV anchor REF still fabricated** — `syntheticgen/sv.py` uses
+  `_draw_anchor_base(rng)` to pick a random standard base at each
+  SV's `POS`. M12 wired the FASTA through the coalescent /
+  admixture SNV + indel REF-picking paths but the SV generator was
+  not in scope. Until this lands, `bcftools norm --check-ref` will
+  flag the SV anchor rows on otherwise post-M12-clean batches.
 - **Heavy `--art` path** — ART read simulation + `bcftools call`
   is gated and exits with a clear message. M12 ships the FASTA
   cache so the dep is in place; the ART pipeline itself isn't
@@ -967,7 +992,7 @@ Tracked in `IMPLEMENTATION_PLAN.md` and `DATA_QUALITY_ASSESSMENT.md`
 | `--seed` | RNG seed; omit for fresh randomness each run | `None` |
 | `--build` | `GRCh37` or `GRCh38` | `GRCh38` |
 | `--output-dir` | Per-person VCF output | `./out` |
-| `--cache-dir` | ClinVar download cache | `./cache` |
+| `--cache-dir` | Cache directory: holds ClinVar (~70 MB) + the M12 reference FASTA (~3 GB on disk under `<cache-dir>/reference/<build>.fa`) | `./cache` |
 | `--check-deps` | Print dependency status and exit | `False` |
 | `--clinvar-sig` | Comma-separated CLNSIG values | `Pathogenic,Likely_pathogenic,Pathogenic/Likely_pathogenic` |
 | `--clinvar-inject-density` | [M7] Fraction of cohort sites overwritten with random ClinVar pathogenic records | `0.01` |
@@ -982,7 +1007,7 @@ Tracked in `IMPLEMENTATION_PLAN.md` and `DATA_QUALITY_ASSESSMENT.md`
 | `--error-rate` | [M9] Per-call probability of a GT flip (lightweight noise model) | `0.001` |
 | `--dropout-rate` | [M9] Per-call probability of a coverage dropout (`./.:0:0:0,0`) | `0.0005` |
 | `--art` | [M9, heavy] ART read simulation + `bcftools call`. Currently rejected; M12 ships the FASTA cache but the ART pipeline itself isn't wired up yet | `False` |
-| `--reference-fasta` | [M12] Path to a reference FASTA matching `--build`. When unset (default), the cli auto-fetches the Ensembl primary assembly into `<--cache-dir>/reference/<build>.fa` on first run | `None` (auto-fetch) |
+| `--reference-fasta` | [M12] Path to a reference FASTA matching `--build`. When unset (default), the cli auto-fetches the Ensembl primary assembly into `<--cache-dir>/reference/<build>.fa` on first run. Resolved on the streamed coalescent + admixture paths; `--legacy-background` does not consult it. | `None` (auto-fetch) |
 | `--no-reference-fasta` | [M12] Opt out of the auto-fetch + auto-load; emitted REF reverts to `rng.choice("ACGT")` legacy path. Useful for smoke runs / seed-pinned tests | `False` |
 | `--male-fraction` | [M13.1] Probability each person is drawn as male. `0.2` → ~20% male, `0.8` → ~80% male. Must be in `[0.0, 1.0]` | `0.5` |
 | `--chromosomes` | [coalescent] List, range, or mix (e.g. `22`, `19,20,21,22`, `1-22`, `1-3,5,19-22,X`) | `22` |

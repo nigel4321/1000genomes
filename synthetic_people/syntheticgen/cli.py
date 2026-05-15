@@ -1315,9 +1315,12 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--art", action="store_true",
                    help="[M9, heavy] Use ART read simulation + "
                         "bcftools call instead of the lightweight "
-                        "noise model. Requires a reference FASTA on "
-                        "disk and the `art_illumina` binary on PATH; "
-                        "wired in M11 alongside the GRCh38 reference.")
+                        "noise model. Currently rejected with a "
+                        "clear message: M12 ships the reference "
+                        "FASTA cache so the dep is in place, but "
+                        "the ART pipeline itself (art_illumina + "
+                        "bcftools call wiring) hasn't been hooked "
+                        "up yet.")
     p.add_argument("--workers", type=int, default=0,
                    help="[perf] Worker processes for parallel cohort "
                         "BCF writes (sample-slice, post-Phase-5e) and "
