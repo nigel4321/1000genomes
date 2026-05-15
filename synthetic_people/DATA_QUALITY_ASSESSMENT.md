@@ -504,11 +504,28 @@ Choose-your-own-adventure, ordered by catch-rate per cost.
 
 #### Tier 2 — moderately cheap, illuminates the model
 
-5. **Mutation spectrum (96-channel)**. For each SNV with a real
-   REF (post-M12), bin into the 96 trinucleotide contexts.
-   Compare against COSMIC SBS1. Today's spectrum is degenerate;
-   post-M14 it should match reality. **Blocked on M12** for real
-   REF. ~1 day.
+5. ~~**Mutation spectrum (96-channel)**~~ — **binning shipped
+   2026-05-15**. For each SNV with a real REF (post-M12), bin into
+   the 96 trinucleotide contexts. Today's spectrum is degenerate;
+   post-M14 it should match reality.
+   - New `syntheticgen/mutation_spectrum.py` does the 96-channel
+     binning with pyrimidine-context normalisation; reads cohort
+     BCFs (one record per unique site, no carrier-count weighting)
+     via `bcftools view -v snps -m2 -M2` and `bcftools query`.
+     Records with N / IUPAC / off-end flanks land in `n_excluded`
+     rather than poisoning a channel.
+   - Wired into `validate_batch.py` behind the existing
+     `--reference-fasta` arg; emits `mutation_spectrum.json` +
+     a `mutation_spectrum` field in `summary.json`.
+   - **Deferred to follow-up PR**: COSMIC SBS1 reference vector
+     hardcoding + cosine-similarity comparison. The reference
+     vector needs careful sourcing (COSMIC v3.3 GRCh38 SBS1, 96
+     floats summing to 1.0) and should land as its own PR rather
+     than be bundled with the binning machinery. The unbiased
+     spectrum from this PR is sufficient on its own to confirm
+     today's degenerate distribution and to gate M14.
+   - **Deferred to follow-up PRs**: matplotlib bar-chart plot,
+     Markdown report section, per-chromosome spectrum breakouts.
 6. ~~**Per-region variant density**~~ — **shipped 2026-05-13**.
    1 Mb bins per chrom, with a coefficient-of-variation
    diagnostic. Today flat (CV ≈ 0); post-M14 expect 0.5–1.0 on
