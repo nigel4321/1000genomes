@@ -538,19 +538,39 @@ exist yet.
 
 Mapping missing checks back to §7's M-milestones:
 
-- **M12 (reference-aware FASTA)** unblocks: REF-matches-GRCh38 check.
-- **M13 (sex chromosomes)** unblocks: Y-haploid, PAR consistency, MT clonality.
-- **M14 (mutation + recombination)** unblocks: mutation spectrum, per-region density, LD-hotspot fidelity.
-- **M15 (overlay AF consistency)** unblocks: HWE-per-site, realised-vs-target overlay density (the latter is actually checkable already without M15).
-- **M17 (validation vs 1000G)** unblocks: PCA projection, population-stratified AF.
+- ~~**M12 (reference-aware FASTA)** unblocks: REF-matches-GRCh38
+  check.~~ — **shipped**; the REF-check gate (Tier 1 #1) passes
+  against the auto-fetched FASTA.
+- **M13 (sex chromosomes)** unblocks: Y-haploid, PAR consistency,
+  MT clonality. M13.1 foundation has shipped; M13.2 (validators)
+  is the next gate-shipping step, M13.3 wires the simulator.
+- **M14 (mutation + recombination)** unblocks: mutation spectrum,
+  per-region density, LD-hotspot fidelity. **Mutation-spectrum
+  binning is now shipped** (Tier 2 #5) so the empirical gate is
+  ready before M14 lands.
+- **M15 (overlay AF consistency)** unblocks: HWE-per-site,
+  realised-vs-target overlay density (the latter is actually
+  checkable already without M15).
+- **M17 (validation vs 1000G)** unblocks: PCA projection,
+  population-stratified AF.
 - **M18 (trios)** unblocks: Mendelian consistency.
 
-The unblocked Category 1 checks (per-region density, per-chrom
-stats, Ti/Tv tightening, rsID coverage, DP/GQ/AD sanity, mutation
-spectrum modulo REF, phasing consistency, F-statistic, realised
-admixture tract lengths) are all implementable today against the
-current output. Adding them would 2–3× the validator's
-discrimination power before any new code feature ships.
+**Status of the Category-1 checks that didn't need a milestone
+unlock** — all shipped:
+
+- ~~per-region density~~ (Tier 2 #6, 2026-05-13)
+- ~~per-chrom stats~~ (Tier 1 #3, 2026-05-12)
+- ~~Ti/Tv tightening~~ (Tier 1 #4, 2026-05-12)
+- ~~realised overlay density~~ (Tier 1 #2, 2026-05-12)
+- ~~DP/GQ/AD sanity~~ (Tier 2 #7, 2026-05-13)
+- ~~mutation spectrum (modulo REF)~~ (Tier 2 #5 binning, 2026-05-15)
+- phasing consistency — still open
+- ~~F-statistic~~ (Tier 2 #8, 2026-05-13)
+- ~~realised admixture tract lengths~~ (Tier 2 #9, 2026-05-13)
+
+Together these 2-3×'d the validator's discrimination power as
+predicted — the suite that used to silently pass on the pre-M12
+fabricated REF now actively gates it.
 
 ### A.4 Recommended additions, prioritised
 
@@ -558,22 +578,26 @@ Choose-your-own-adventure, ordered by catch-rate per cost.
 
 #### Tier 1 — cheap, high-discrimination, no blockers
 
-1. **REF-matches-GRCh38 gate**. Wrap a
-   `bcftools norm --check-ref e -f reference.fa` in the validator
-   (skip cleanly if no FASTA). Even without M12 in place, this
-   proves the validator catches the bug if/when M12 lands
-   incomplete. ~1 hour.
-2. **Realised overlay density counters**. Walk the VCF `ID`
-   column for rsIDs (for example, `ID` values starting with `rs`),
-   plus `INFO/CLNSIG` and `INFO/COSMIC_ID`; tally non-empty
-   fractions; compare against manifest's requested densities.
-   ~1 hour.
-3. **Per-chromosome breakouts**. Re-emit all the aggregate stats
-   (Ti/Tv, het/hom, AF histogram, indel lengths) per chromosome,
-   not just cohort-wide. ~2 hours.
-4. **Ti/Tv tolerance tightening**. Drop the report band from
-   `[1.7, 2.6]` to `[2.0, 2.2]` for WGS. The wider band hides
-   drift. ~5 min + recalibration if it fails.
+1. ~~**REF-matches-GRCh38 gate**~~ — **shipped 2026-05-12**. Wraps
+   `bcftools norm --check-ref w` in the validator behind
+   `validate_batch.py --reference-fasta`. Skips cleanly when the
+   flag is omitted. Implemented in
+   `syntheticgen/validate.py::check_ref_against_fasta`. Today
+   passes against the auto-fetched M12 FASTA — empirical evidence
+   the M12 wiring works.
+2. ~~**Realised overlay density counters**~~ — **shipped
+   2026-05-12**. `cohort_overlay_density` walks per-sample
+   `SampleStats` for non-empty `INFO/RS` / `INFO/CLNSIG` /
+   `INFO/COSMIC_ID`; surfaces realised vs requested fractions in
+   `summary.json["overlay_density"]`.
+3. ~~**Per-chromosome breakouts**~~ — **shipped 2026-05-12**.
+   `cohort_chrom_stats` re-emits per-chrom Ti/Tv, het/hom, SV
+   count, indel count from per-sample `by_chrom` buckets in
+   `SampleStats`. Surfaces in `summary.json["chrom_stats"]`.
+4. ~~**Ti/Tv tolerance tightening**~~ — **shipped 2026-05-12**.
+   Report band dropped from `[1.7, 2.6]` to `[2.0, 2.2]` in
+   `validate_batch.TITV_BAND_LOW` / `TITV_BAND_HIGH`. WGS
+   calibrator target is 2.0–2.1; wider band was hiding drift.
 
 #### Tier 2 — moderately cheap, illuminates the model
 
@@ -618,7 +642,12 @@ Choose-your-own-adventure, ordered by catch-rate per cost.
 
 #### Tier 3 — wait for the corresponding feature
 
-10. Sex-chromosome ploidy checks — wait for M13.
+10. Sex-chromosome ploidy checks — **M13.2 is the gate-shipping
+    step** (next; lands before M13.3's haploid emission per the
+    Tier-1-first pattern). M13.1 already landed the
+    prerequisites (per-person sex in `manifest.json[sex]`, PAR
+    coordinates, `ploidy_for` helper). M13.2 will surface Y-het
+    in males, female-Y absence, MT homogeneity.
 11. PCA-vs-1000G projection — wait for M17.
 12. Mendelian consistency — wait for M18.
 
