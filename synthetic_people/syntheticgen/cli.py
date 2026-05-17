@@ -1147,7 +1147,13 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    help="Where to write person_<N>.vcf.gz")
     p.add_argument("--cache-dir", type=Path,
                    default=script_dir / "cache",
-                   help="Where ClinVar is downloaded and cached")
+                   help="Cache directory: holds the ClinVar VCF "
+                        "(~70 MB) plus, since M12 (2026-05-14), the "
+                        "build's reference FASTA (~3 GB decompressed "
+                        "under <cache-dir>/reference/<build>.fa). "
+                        "Both are downloaded on first run and reused "
+                        "thereafter. Pass --no-reference-fasta to "
+                        "skip the FASTA fetch.")
     p.add_argument("--build", choices=list(BUILDS), default="GRCh38",
                    help="Reference build; must match background VCFs")
     p.add_argument("--reference-fasta", type=Path, default=None,
@@ -2191,10 +2197,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.art:
         sys.exit(
-            "--art (ART read simulation + bcftools call) requires the "
-            "GRCh38 reference FASTA, which is wired in M11. Use the "
-            "default lightweight noise model (--error-rate / "
-            "--dropout-rate) for now."
+            "--art (ART read simulation + bcftools call) is gated "
+            "with a clear rejection: M12 (2026-05-14) ships the "
+            "reference FASTA cache so the dep is in place, but the "
+            "ART pipeline itself (art_illumina + bcftools call "
+            "wiring) hasn't been hooked up yet. Use the default "
+            "lightweight noise model (--error-rate / --dropout-rate) "
+            "for now."
         )
 
     try:
