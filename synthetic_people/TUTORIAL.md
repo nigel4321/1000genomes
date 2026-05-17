@@ -140,9 +140,11 @@ Pass `--reference-fasta <path>` to `validate_batch.py` (the
 validator doesn't auto-discover the cli's cached FASTA — you have
 to give it the path explicitly, e.g.
 `--reference-fasta ~/.cache/synthetic-people-data/reference/GRCh38.fa`).
-When you do, and when the batch was produced in a mode that emits
-cohort BCFs (`--mode cohort` or `--mode both`, recorded in the
-manifest's `cohort_bcfs` field), you also get:
+When you do, and when the batch's `manifest.json` carries a non-
+empty `cohort_bcfs` list — which it does in every mode that uses
+the streamed coalescent path (since Phase 5b2: `--mode per-person`,
+`--mode cohort`, and `--mode both` all write cohort BCFs as
+intermediates) — you also get:
 
 ```
 out_hello/validation/
@@ -1345,13 +1347,20 @@ silently.
 ### Mutation spectrum — `validate_batch.py --reference-fasta` (Tier 2 #5)
 
 When you pass `--reference-fasta` to `validate_batch.py` AND the
-batch was produced in a mode that emits cohort BCFs (so its
-`manifest.json` carries a non-empty `cohort_bcfs` list — true for
-`--mode cohort` or `--mode both`), the validator emits
-`mutation_spectrum.json` — a 96-channel trinucleotide-context
-binning of every biallelic SNV in the cohort BCFs. Useful for M14
-development (today the distribution is roughly flat; post-M14 with
-`JC69` + per-trinucleotide-context μ it should match COSMIC SBS1).
+batch's `manifest.json` carries a non-empty `cohort_bcfs` list,
+the validator emits `mutation_spectrum.json` — a 96-channel
+trinucleotide-context binning of every biallelic SNV in the cohort
+BCFs. Useful for M14 development (today the distribution is roughly
+flat; post-M14 with `JC69` + per-trinucleotide-context μ it should
+match COSMIC SBS1).
+
+In practice the `cohort_bcfs` precondition is satisfied by every
+mode that runs through today's streamed coalescent path (Phase
+5b2+): `--mode per-person` writes cohort BCFs as intermediates and
+derives per-person VCFs from them, `--mode cohort` writes them as
+the deliverable, and `--mode both` writes both. Only legacy batches
+written before Phase 5b2 — or runs that explicitly bypass the
+cohort path — lack `cohort_bcfs` and skip the spectrum.
 
 If `--reference-fasta` is omitted, OR the batch doesn't have
 cohort BCFs, the validator skips the spectrum (logs an info
