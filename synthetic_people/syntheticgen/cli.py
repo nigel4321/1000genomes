@@ -129,6 +129,13 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
     # collapses to single-allele for everyone.
     person_sexes = state.get("person_sexes")
     sex = person_sexes[i] if person_sexes else None
+    # M13.5: per-person mt_lineage_id enables MT clonal inheritance —
+    # all persons sharing a lineage emit identical MT GTs (overridden
+    # at write time deterministically from (lineage_id, pos, site_af)).
+    person_mt_lineage_ids = state.get("person_mt_lineage_ids")
+    mt_lineage_id = (
+        person_mt_lineage_ids[i] if person_mt_lineage_ids else None
+    )
 
     # The highlighted candidate must be a variant the person's
     # per-record-ploidy will actually emit. Two filters apply:
@@ -216,6 +223,7 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
         stats=person_stats,
         truth_writer=tw,
         sex=sex,
+        mt_lineage_id=mt_lineage_id,
     )
     tw.close()
 
@@ -1244,6 +1252,15 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "Per-person sex assignment is recorded at the "
                         "top level of `manifest.json` as `sex: [\"m\", "
                         "\"f\", ...]`, parallel-indexed to `samples`.")
+    p.add_argument("--mt-lineages", type=int, default=0,
+                   help="[M13.5] Number of distinct maternal lineages "
+                        "to draw people from. Persons sharing a "
+                        "lineage share their MT sequence. 0 (default) "
+                        "auto-picks max(1, n // 10). Mirrors the YAML "
+                        "field `cohort.mt_lineages`. Per-person "
+                        "`mt_lineage_id` is recorded at the top level "
+                        "of `manifest.json` as `mt_lineage_ids: [int, "
+                        "...]`, parallel-indexed to `samples`.")
     p.add_argument("--background-glob", action="append", default=None,
                    help="[legacy] Glob(s) for common-variant source VCFs. "
                         "Pass multiple times to combine sources. "
@@ -1930,6 +1947,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             "samples": sample_ids,
             # M13.1: per-person sex, parallel-indexed to ``samples``.
             "sex": resume.sexes,
+            "mt_lineage_ids": resume.mt_lineage_ids,
             "cohort_bcfs": cohort_bcf_rels,
         }
         if overlay_block is not None:
@@ -2008,6 +2026,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         # is the canonical source (deterministic per-seed, persisted
         # across resumes) on the streamed coalescent path.
         "person_sexes": resume.sexes,
+        # M13.5: per-person mt_lineage_id for MT clonal inheritance.
+        "person_mt_lineage_ids": resume.mt_lineage_ids,
     })
 
     fanout_workers = resolve_workers(args.workers)
@@ -2140,6 +2160,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         "samples": sample_ids,
         # M13.1: per-person sex, parallel-indexed to ``samples``.
         "sex": resume.sexes,
+        # M13.5: per-person mt_lineage_id, parallel-indexed to ``samples``.
+        "mt_lineage_ids": resume.mt_lineage_ids,
         "people": manifest_people,
     }
     # cohort BCFs always present in the streamed path (5b2 derives
@@ -2567,8 +2589,18 @@ def main(argv: list[str] | None = None) -> int:
     # model, etc.) and a fixed-seed run would no longer reproduce
     # pre-M13.1 output. ``_draw_sexes`` is deterministic given
     # ``(args.seed, args.n, args.male_fraction)``.
-    from .resume import _draw_sexes
+    from .resume import (
+        _draw_mt_lineages,
+        _draw_sexes,
+        _effective_mt_lineages,
+    )
     person_sexes = _draw_sexes(args.seed, args.n, args.male_fraction)
+    # M13.5: per-person mt_lineage_id from a SEPARATE rng (same
+    # don't-touch-master-rng rule as sexes). Persons sharing a
+    # lineage_id will emit identical MT GTs.
+    person_mt_lineage_ids = _draw_mt_lineages(
+        args.seed, args.n, _effective_mt_lineages(args),
+    )
 
     # Phase 5a: write the cohort BCF when --mode is `cohort` or `both`.
     # The BCF carries the truth-state cohort GTs (no per-call DP/GQ/AD
@@ -2647,6 +2679,7 @@ def main(argv: list[str] | None = None) -> int:
             "samples": sample_ids,
             # M13.1: per-person sex, parallel-indexed to ``samples``.
             "sex": person_sexes,
+            "mt_lineage_ids": person_mt_lineage_ids,
             "cohort_bcfs": [
                 str(cohort_bcf_path.relative_to(args.output_dir))
             ],
@@ -2731,6 +2764,10 @@ def main(argv: list[str] | None = None) -> int:
         # uses on the streamed path, so the two code paths emit
         # consistent sex assignments at the same --seed.
         "person_sexes": person_sexes,
+        # M13.5: per-person mt_lineage_id, drawn with the same
+        # dedicated-rng strategy so it's stable per --seed regardless
+        # of which code path runs.
+        "person_mt_lineage_ids": person_mt_lineage_ids,
     })
 
     use_pool = workers > 1 and args.n > 1
@@ -2819,6 +2856,8 @@ def main(argv: list[str] | None = None) -> int:
         # — but it's recorded now so consumers can already reason
         # about the cohort's sex composition.
         "sex": person_sexes,
+        # M13.5: per-person mt_lineage_id, parallel-indexed to ``samples``.
+        "mt_lineage_ids": person_mt_lineage_ids,
         "people": manifest_people,
     }
     if cohort_bcf_path is not None:

@@ -37,10 +37,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-# Schema version 2 (2026-05-15): added ``sexes`` for M13.1 per-person
-# sex assignment. Schema-version 1 meta files surface as
-# ResumeMismatch — the user runs once with --no-resume to migrate.
-_SCHEMA_VERSION = 2
+# Schema version history:
+#   v1 — original Phase 5b2 resume contract
+#   v2 (2026-05-15) — added ``sexes`` for M13.1 per-person sex
+#   v3 (2026-05-17) — added ``mt_lineage_ids`` for M13.5 maternal-
+#                     lineage clonal inheritance of MT
+# Older-version meta files surface as ResumeMismatch — the user
+# runs once with --no-resume to migrate.
+_SCHEMA_VERSION = 3
 
 
 def _params_for(args, chromosomes: list) -> dict:
@@ -70,7 +74,27 @@ def _params_for(args, chromosomes: list) -> dict:
         # ResumeMismatch when it changes, forcing the user to consciously
         # choose --no-resume.
         "male_fraction": args.male_fraction,
+        # M13.5: mt_lineages drives the mt_lineage_id assignment in
+        # _draw_mt_lineages. Changing it between runs reshapes the
+        # cohort's maternal-lineage groupings, so it's part of the
+        # resume identity.
+        "mt_lineages": _effective_mt_lineages(args),
     }
+
+
+def _effective_mt_lineages(args) -> int:
+    """Resolve ``args.mt_lineages`` (config value) to a concrete
+    lineage count, applying the auto-pick rule when 0 is given.
+
+    Auto-pick: ``max(1, n // 10)`` — roughly one maternal lineage
+    per 10 people, which lands at sensible cohort-realistic numbers
+    (n=2500 → ~250 lineages, similar to 1000 Genomes phase 3's
+    haplogroup classification).
+    """
+    requested = getattr(args, "mt_lineages", 0) or 0
+    if requested > 0:
+        return requested
+    return max(1, args.n // 10)
 
 
 def _draw_sexes(seed, n: int, male_fraction: float) -> list[str]:
@@ -109,6 +133,31 @@ def _draw_sexes(seed, n: int, male_fraction: float) -> list[str]:
     ]
 
 
+def _draw_mt_lineages(seed, n: int, n_lineages: int) -> list[int]:
+    """Draw ``n`` per-person mt_lineage_id assignments without
+    consuming the master rng.
+
+    M13.5: every person belongs to one of ``n_lineages`` maternal
+    lineages. Persons in the same lineage share their MT sequence
+    (clonally inherited from a maternal ancestor). The assignment
+    is uniform-random across lineages: each person draws an integer
+    from ``range(n_lineages)``.
+
+    Same dedicated-rng strategy as ``_draw_sexes`` so the master rng
+    state is unchanged — fixed-seed runs reproduce pre-M13.5
+    simulator output bit-for-bit; only ``manifest['mt_lineage_ids']``
+    is new. Salt is distinct from ``_draw_sexes``'s to avoid
+    correlation between sex and lineage assignments at any given
+    person index.
+    """
+    salt = 0x_4D_54_4C_49  # arbitrary fixed salt — "MTLI" for "MT lineages"
+    if seed is None:
+        rng = random.Random()
+    else:
+        rng = random.Random(seed ^ salt)
+    return [rng.randrange(n_lineages) for _ in range(n)]
+
+
 @dataclass
 class Resume:
     """Loaded or freshly-derived resume state for a streamed run."""
@@ -122,6 +171,11 @@ class Resume:
     # Persisted so a resumed run sees the same sexes the original run
     # drew, same contract as person_seeds.
     sexes: list = field(default_factory=list)
+    # M13.5: per-person mt_lineage_id, parallel-indexed to ``samples``.
+    # Persons sharing a lineage_id share their MT sequence (M13.5
+    # maternal-lineage clonal inheritance). Persisted across resumes
+    # so the maternal lineage assignments don't shift between runs.
+    mt_lineage_ids: list = field(default_factory=list)
     completed_chromosomes: list = field(default_factory=list)
 
     def is_chromosome_done(self, chrom: str) -> bool:
@@ -140,6 +194,7 @@ class Resume:
             "samples": self.samples,
             "person_seeds": self.person_seeds,
             "sexes": self.sexes,
+            "mt_lineage_ids": self.mt_lineage_ids,
             "overlay_seeds": self.overlay_seeds,
             "completed_chromosomes": self.completed_chromosomes,
         }
@@ -222,6 +277,7 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
             samples=payload["samples"],
             person_seeds=payload["person_seeds"],
             sexes=payload["sexes"],
+            mt_lineage_ids=payload["mt_lineage_ids"],
             overlay_seeds=payload["overlay_seeds"],
             completed_chromosomes=payload.get(
                 "completed_chromosomes", []),
@@ -236,6 +292,11 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
     # shift every downstream consumer, breaking the "no simulation
     # change at fixed seed" contract.
     sexes = _draw_sexes(args.seed, args.n, args.male_fraction)
+    # M13.5: mt_lineage_ids likewise drawn from a SEPARATE rng so the
+    # master rng state is unchanged. Persons sharing a lineage_id
+    # share their MT sequence.
+    n_lineages = _effective_mt_lineages(args)
+    mt_lineage_ids = _draw_mt_lineages(args.seed, args.n, n_lineages)
     overlay_seeds = {
         chrom: rng.randint(1, 2**31 - 1)
         for chrom in chromosomes
@@ -246,6 +307,7 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
         samples=samples,
         person_seeds=person_seeds,
         sexes=sexes,
+        mt_lineage_ids=mt_lineage_ids,
         overlay_seeds=overlay_seeds,
         completed_chromosomes=[],
     )

@@ -25,7 +25,7 @@ gaps below are about the next layer of realism, not the foundation.
 
 | Spec requirement (§) | Status | Comment |
 |---|---|---|
-| VCF 4.2, contig headers for 1–22, X, Y, MT (§2.1) | ⚠ partial | Contig lengths exist in `syntheticgen/builds.py:6-24`; default is `--chromosomes 22`. X/Y/MT can be **declared** but not **simulated correctly** (see §3 below). |
+| VCF 4.2, contig headers for 1–22, X, Y, MT (§2.1) | ✓ (since M13.3+ 2026-05-17) | Contig lengths in `syntheticgen/builds.py`; default `--chromosomes 22`. X/Y/MT now correctly emitted in per-person VCFs: M13.3 wires haploid GTs on chrX non-PAR / chrY non-PAR (males) and MT (everyone); M13.3 drops chrY entirely for females; M13.4 mirrors chrX PAR onto chrY in males; M13.5 enforces MT clonal inheritance within maternal lineages. The intermediate cohort BCF still carries diploid-everywhere data (deferred). |
 | Phased GT, DP, GQ, AD (§2.2) | ✓ | `syntheticgen/quality.py` draws DP ~ Poisson(λ≈30) + per-sample jitter; AD carries the 0.475 het-alt ref-bias matching Illumina + BWA-MEM. |
 | SNPs, indels, SVs, multi-allelic (§2.2) | ⚠ partial | SNPs ✓; SVs ✓ (DEL/DUP/INV); **indels only via overlays, none from coalescent**; **no true multi-allelics** (`BinaryMutationModel`). |
 | LD via coalescent or HMM (§3.1) | ⚠ partial | msprime ✓, but with a **flat per-genome recombination rate** (no deCODE / HapMap recombination map). Chunked simulation explicitly drops cross-chunk LD. |
@@ -49,48 +49,71 @@ genetics research would call high-fidelity**, primarily because of:
 
 1. ~~fabricated `REF` bases (no FASTA loaded)~~ — **closed by M12
    (2026-05-14)**;
-2. sex-chromosome ploidy unmodeled (X/Y/MT treated as autosomes);
+2. ~~sex-chromosome ploidy unmodeled (X/Y/MT treated as autosomes)~~
+   — **closed by M13.1 – M13.5 (2026-05-15 – 2026-05-17)**;
 3. overlay genotype/AF inconsistency (ClinVar variants land at
    arbitrary cohort AF);
 4. uniform genome-wide recombination and mutation rates (no
    hotspots, no CpG enrichment).
 
-M12 closes #1; the remaining three are tractable now that Phase
-5d.1 has removed the memory ceiling that motivated them. **M13
-(sex chromosomes)** is the next-largest perception gap with real
-WGS, followed by M14 (context-aware μ) which is now unblocked by
-M12's real REF.
+M12 closed #1; M13 closed #2. The remaining two are tractable now
+that Phase 5d.1 has removed the memory ceiling that motivated them.
+**M14 (context-aware μ + recombination)** is the next priority,
+unblocked by M12's real REF and gated by the mutation-spectrum
+diagnostic from Tier 2 #5.
 
 ---
 
 ## 3. The X / Y / MT problem — most consequential gap
 
-The codebase has every contig length in `syntheticgen/builds.py`,
-and the CLI accepts `--chromosomes X,Y,MT`, but **every simulation
-site assumes `n_haplotypes = 2 × n_people` unconditionally**
-(`syntheticgen/coalescent.py:398`, `syntheticgen/admixture.py:158`).
-Consequences:
+**Status (post-M13.5, 2026-05-17): the gap below was the
+spec-required deliverable most cleanly absent through 2026-05-14;
+M13.1 – M13.5 closed it for per-person VCF output.** This section
+is kept for the historical record so a reader auditing the project
+can see what shipped and why. See §7 (M13.1 – M13.5) for the
+implementation details and §A.3 for the validator-gate timeline.
 
-- **Males are simulated with two X haplotypes** (impossible) and a
-  **diploid Y** (impossible).
-- **Y is biallelic** rather than haploid — the non-recombining
-  haploid Y is the cleanest patrilineal marker in real data and is
-  the single most distinctive sex-chromosome property.
-- **PAR1 (~2.78 Mb) and PAR2 (~330 kb)** — regions where X and Y do
-  recombine in males and must carry identical variants between
-  X-PAR and Y-PAR — are not modeled. Whole regions of the
-  pseudo-autosomal genome are silently autosomal in the output.
-- **MT** (clonal, maternally inherited, with heteroplasmy) is
-  treated as standard diploid — wrong inheritance, wrong allele
-  dosage, wrong copy number.
-- **No `--sex` flag exists**, so the cohort is implicitly "all
-  pseudo-2N individuals". A scientist running case/control on an
-  X-linked trait would get nonsense.
+The codebase had every contig length in `syntheticgen/builds.py`,
+and the CLI accepted `--chromosomes X,Y,MT`, but **every simulation
+site assumed `n_haplotypes = 2 × n_people` unconditionally**.
+Consequences (now addressed):
 
-The validation suite is silent on every one of these: no Y-haploid
-check, no PAR-consistency check, no MT-clonality check, no X
-male/female ploidy check. This is the spec-required deliverable
-most cleanly absent.
+- ~~**Males simulated with two X haplotypes** and a **diploid Y**~~
+  → M13.3 emits chrX non-PAR + chrY non-PAR as haploid GT in males.
+- ~~**Y biallelic instead of haploid**~~ → M13.3 single-allele GT.
+- ~~**PAR1 / PAR2 not modeled**~~ → M13.4 mirrors chrX PAR onto chrY
+  at the build-correct translated coordinate in males; chrY PAR
+  records from the simulator are dropped.
+- ~~**MT treated as diploid, per-sample-independent**~~ → M13.3
+  emits MT as single-allele haploid GT; M13.5 enforces clonal
+  inheritance — persons in the same maternal lineage emit identical
+  MT.
+- ~~**No `--sex` flag**~~ → M13.1 adds `--male-fraction` (CLI ↔ YAML
+  `cohort.male_fraction`), default 0.5; M13.5 adds `--mt-lineages`
+  (CLI ↔ YAML `cohort.mt_lineages`), default auto-pick.
+
+**What's still NOT closed (deferred):**
+
+- **The intermediate cohort BCF** stays diploid-everywhere with
+  independently-simulated chrX / chrY / MT — per-person VCFs are
+  correct (the user-visible output) because the M13.3 / M13.4 /
+  M13.5 fixes happen at `write_person_vcf` time, applied on top of
+  the diploid-everywhere intermediate. A follow-up could rewrite
+  the cohort BCF as variable-ploidy.
+- **msprime is still asked to simulate chrY independently** and
+  PAR regions are still simulated twice (X + Y) only to have the
+  Y copy thrown away at write time. Slight CPU waste, no
+  correctness impact.
+- **M9 sequencing-error model is silent on haploid calls.**
+  `errors.maybe_flip_gt` leaves single-token GTs alone, so chrY
+  non-PAR / chrX non-PAR (males) / MT records don't receive
+  `--error-rate` flips. Realised FDR under-reports by exactly the
+  haploid-record share of total calls.
+
+The M13.2 validation gates (Y-het-in-males / female-Y-absence /
+MT-no-heterozygous) are GREEN post-M13.3; the M13.5 within-lineage
+MT consistency is implicit (deterministic by construction, not
+sampled — but a future validator could surface it explicitly).
 
 ---
 
@@ -543,12 +566,60 @@ Tests:
   surfaced by Copilot review on PR #110 and acknowledged as a
   deferred follow-up.
 
-#### M13.5 — MT clonal inheritance ⏳
+#### M13.5 — MT clonal inheritance **shipped 2026-05-17**
 
-- Maternal-lineage concept (every person has a `mt_lineage_id`
-  drawn at cohort setup time); MT sequence is shared within a
-  lineage. Today's coalescent simulates MT independently per
-  sample, which is wrong.
+Every person now has a `mt_lineage_id` drawn at cohort setup
+time. Persons sharing a lineage emit IDENTICAL MT records — that's
+the maternal-clonality contract real human MT follows. Pre-M13.5
+the simulator drew MT independently per sample (no maternal
+inheritance model in msprime's autosomal recombination-driven
+coalescent), so two members of the "same family" had different MT.
+
+**Implementation:**
+
+- `resume.py`: new `_draw_mt_lineages(seed, n, n_lineages)` helper
+  (same dedicated-rng strategy as `_draw_sexes`, so master rng
+  stays untouched). New `_effective_mt_lineages(args)` resolves
+  the auto-pick rule (`max(1, n // 10)` — roughly one lineage per
+  10 people, aligned with 1000G phase 3's ~250 haplogroups
+  across ~2500 samples).
+- `Resume` dataclass gains `mt_lineage_ids: list[int]`, persisted
+  in `cohort.meta.json` (schema bumped to v3 — pre-existing meta
+  files surface as `ResumeMismatch` and the user runs `--no-resume`
+  once to migrate). `mt_lineages` is part of the resume identity
+  so changing it between runs also triggers `ResumeMismatch`.
+- `config.py` gains `cohort.mt_lineages` (default 0 = auto-pick);
+  `cli.py` gains the matching `--mt-lineages` flag (CLI ↔ config
+  parity per the standard precedence).
+- All four manifest assemblies surface `mt_lineage_ids` parallel-
+  indexed to `samples`.
+- `write_person_vcf` takes a new `mt_lineage_id` parameter. For
+  each MT record, the simulator's per-person GT is overridden
+  with a `(mt_lineage_id, pos, site_af)`-deterministic call via
+  `_mt_lineage_carrier`. The decision uses `hashlib.md5` (not
+  Python's built-in `hash`, which is salted per process) and
+  biases by the simulator's per-site AF so the cohort's realised
+  MT AF approximates what the simulator drew. Override happens
+  BEFORE M13.3's ploidy collapse — single-token "0"/"1" output
+  passes through the collapse as a no-op.
+
+**Empirical contract:** any two persons in the same lineage have
+byte-identical MT records (chrom + pos + ref + alt + GT). The
+`mt_no_heterozygous` gate (M13.2) was already GREEN post-M13.3
+(haploid emission); M13.5 adds the stronger between-person
+consistency. A follow-up validator could surface the new
+"within-lineage MT consistency" property explicitly.
+
+Tests:
+
+- 5 new in `test_resume.py::ResumeFreshStartTest` (draw +
+  persist + deterministic-at-fixed-seed + auto-pick + edge cases),
+  1 new in `ResumeMismatchedParamsTest`
+  (`mt_lineages_mismatch_raises`), plus 1 fixture update.
+- 5 new in `test_writer_haploid.py::WritePersonVcfMtClonalTest`
+  end-to-end (same lineage → same GT, different lineages can
+  diverge, AF=0 / AF=1 endpoints, no-override when lineage_id is
+  None).
 
 ### M14 — Realistic mutation & recombination
 

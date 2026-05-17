@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import random
 import subprocess
@@ -33,6 +34,31 @@ def _contig_sort_key(chrom: str, pos: int,
     return (contig_order.get(chrom, len(contig_order)), pos)
 
 
+def _mt_lineage_carrier(mt_lineage_id: int, pos: int,
+                        site_af: float) -> bool:
+    """M13.5: deterministically decide whether ``mt_lineage_id``
+    carries the alt allele at this MT site.
+
+    Two persons sharing the same ``mt_lineage_id`` get the same
+    answer at the same ``pos`` — that's the clonal-inheritance
+    guarantee. The decision is biased by ``site_af`` (the
+    simulator's per-site alt-allele frequency) so the cohort's
+    realised MT AF approximates the simulator's intent: a site
+    with AF ~ 0.1 will have ~10 % of lineages carrying it.
+
+    ``hashlib.md5`` is used (not Python's built-in ``hash``)
+    because the latter is salted per-process by default and would
+    produce non-reproducible results across runs.
+    """
+    seed = int(
+        hashlib.md5(
+            f"mt:{mt_lineage_id}:{pos}".encode("utf-8")
+        ).hexdigest()[:8],
+        16,
+    )
+    return (seed / 0xFFFFFFFF) < site_af
+
+
 def write_person_vcf(out_path: Path, person: dict, build: str,
                      rng: random.Random,
                      dp_mean: float = DEFAULT_DP_MEAN,
@@ -40,7 +66,8 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                      dropout_rate: float = 0.0,
                      stats: dict | None = None,
                      truth_writer: TruthBedWriter | None = None,
-                     sex: str | None = None) -> Path:
+                     sex: str | None = None,
+                     mt_lineage_id: int | None = None) -> Path:
     """Write a single-sample bgzipped+indexed VCF.
 
     Each record carries simulated DP/GQ/AD alongside GT. The per-sample
@@ -86,6 +113,16 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
         and emits diploid GTs for every record — back-compat for any
         caller that hasn't been updated to plumb per-person sex
         through yet.
+
+    M13.5 MT clonal inheritance (2026-05-17):
+      * `mt_lineage_id` — int identifying the person's maternal
+        lineage. When set, every MT record's GT is overridden with
+        a deterministic (lineage_id, pos, site_af)-keyed call, so
+        every person sharing a lineage_id emits identical MT
+        records. The call is biased by the simulator's per-site
+        alt-allele frequency, so the cohort's realised MT AF
+        approximates what the simulator drew. Back-compat: `None`
+        preserves the simulator's per-person MT GT.
     """
     contigs = BUILDS[build]["contigs"]
     contig_order = {c: i for i, c in enumerate(contigs)}
@@ -182,6 +219,28 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                                   line_buffering=False)
             fh.write(build_header(build, person["sample_id"]))
             for variant, gt, is_hi in records:
+                # M13.5: MT clonal inheritance. Override the
+                # simulator's per-person MT GT with a deterministic
+                # lineage-keyed call so every person sharing a
+                # mt_lineage_id has identical MT records. The
+                # decision is biased by the simulator's per-site AF
+                # so the cohort's realised MT AF approximates the
+                # simulator's intent. Happens BEFORE the M13.3
+                # ploidy collapse — the override emits "0" or "1"
+                # which is already haploid, and M13.3's
+                # split-on-"|" of a single-token GT is a no-op.
+                chrom_norm = (
+                    variant["chrom"][3:]
+                    if variant["chrom"].startswith("chr")
+                    else variant["chrom"]
+                )
+                if mt_lineage_id is not None and chrom_norm in ("MT", "M"):
+                    site_afs = variant.get("afs") or [0.0]
+                    site_af = site_afs[0] if site_afs[0] is not None else 0.0
+                    is_carrier = _mt_lineage_carrier(
+                        mt_lineage_id, variant["pos"], site_af,
+                    )
+                    gt = "1" if is_carrier else "0"
                 # M13.3: per-record ploidy filtering. When ``sex`` is
                 # supplied, drop chrY records for females and collapse
                 # haploid records to a single-allele GT.

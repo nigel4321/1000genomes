@@ -460,6 +460,108 @@ class WritePersonVcfParCopyTest(unittest.TestCase):
         self.assertEqual(y[0]["gt"], "1|1")
 
 
+@unittest.skipUnless(_HAVE_BCFTOOLS and _HAVE_BGZIP and _HAVE_TABIX,
+                     "bcftools + bgzip + tabix required")
+class WritePersonVcfMtClonalTest(unittest.TestCase):
+    """M13.5: MT clonal inheritance. Persons sharing a
+    mt_lineage_id emit identical MT records — the simulator's per-
+    person MT GT is overridden at write time with a (lineage_id,
+    pos, site_af)-deterministic call.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name: str, mt_gt: str,
+               mt_lineage_id: int | None,
+               site_af: float = 1.0) -> dict:
+        """Write a single-person VCF with one MT record and return
+        the parsed result. ``site_af=1.0`` ensures the deterministic
+        lineage call always lands on alt — useful for tests that
+        care about lineage-vs-lineage divergence rather than
+        AF-driven ratios."""
+        mt_record = _record("MT", 100, mt_gt)
+        mt_record["afs"] = [site_af]
+        person = {
+            "sample_id": name,
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [mt_record],
+        }
+        out = _write_and_read(
+            self.dir, person, sex="m",
+            # _write_and_read doesn't accept mt_lineage_id; inline
+            # a one-shot call below for the same effect.
+        )
+        # Re-emit because _write_and_read doesn't expose
+        # mt_lineage_id. Re-implement just enough here:
+        import random
+        out_path = self.dir / f"{name}.vcf.gz"
+        write_person_vcf(
+            out_path, person, "GRCh38",
+            random.Random(42), sex="m",
+            mt_lineage_id=mt_lineage_id, dp_mean=30.0,
+        )
+        proc = subprocess.run(
+            ["bcftools", "view", "-H", str(out_path)],
+            capture_output=True, text=True, check=True,
+        )
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            if parts[0] == "MT":
+                return {"gt": parts[9].split(":")[0]}
+        return {}
+
+    def test_same_lineage_two_persons_same_mt_gt(self):
+        # M13.5 contract: two persons sharing a mt_lineage_id emit
+        # IDENTICAL MT GTs even when the simulator drew different
+        # per-person MTs for them.
+        a = self._write("a", mt_gt="0|0", mt_lineage_id=42)
+        b = self._write("b", mt_gt="1|1", mt_lineage_id=42)
+        self.assertEqual(a["gt"], b["gt"])
+
+    def test_different_lineages_can_differ(self):
+        # The companion property: at high AF (0.5) the determinism
+        # is keyed by lineage_id, so different lineages can land
+        # on different sides. Try several lineage_id pairs until
+        # we find one that diverges — proves the override isn't
+        # collapsing every lineage to the same value.
+        # (At site_af=0.5, each lineage is ~50/50. Across 10
+        # lineage pairs the prob of zero divergence is ~1/1024.)
+        same = []
+        for lid in range(20):
+            r = self._write(f"p{lid}", mt_gt="0|0",
+                            mt_lineage_id=lid, site_af=0.5)
+            same.append(r["gt"])
+        gts = set(same)
+        self.assertEqual(
+            gts, {"0", "1"},
+            f"all 20 lineage_ids produced the same GT: {same}",
+        )
+
+    def test_site_af_zero_yields_hom_ref(self):
+        # AF=0 → every lineage is hom-ref-haploid ("0").
+        r = self._write("z", mt_gt="1|1",
+                        mt_lineage_id=0, site_af=0.0)
+        self.assertEqual(r["gt"], "0")
+
+    def test_site_af_one_yields_alt(self):
+        # AF=1 → every lineage is hom-alt-haploid ("1").
+        r = self._write("o", mt_gt="0|0",
+                        mt_lineage_id=0, site_af=1.0)
+        self.assertEqual(r["gt"], "1")
+
+    def test_no_override_when_lineage_id_none(self):
+        # Back-compat: mt_lineage_id=None preserves M13.3 behaviour
+        # (collapse simulator's diploid MT GT to first allele).
+        r = self._write("u", mt_gt="0|1", mt_lineage_id=None)
+        # M13.3 first-allele collapse: "0|1" → "0".
+        self.assertEqual(r["gt"], "0")
+
+
 class HighlightedRecordReachesVcfTest(unittest.TestCase):
     """PR #107 + PR #108 review (Copilot): the highlighted variant
     must not land on a chromosome the person's ploidy will drop.

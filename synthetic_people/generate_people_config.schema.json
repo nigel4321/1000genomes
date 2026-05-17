@@ -102,6 +102,14 @@
           "title": "Male Fraction",
           "type": "number"
         },
+        "mt_lineages": {
+          "argparse_dest": "mt_lineages",
+          "default": 0,
+          "description": "[M13.5] Number of distinct maternal lineages to draw people from. Persons sharing a lineage share their MT sequence (clonally inherited from a maternal ancestor). ``0`` (default) auto-picks ``max(1, n // 10)`` \u2014 roughly one maternal lineage per 10 people, in line with 1000 Genomes phase 3's ~250 mtDNA haplogroups across ~2500 samples. Equivalent to the ``--mt-lineages`` CLI flag. Per-person ``mt_lineage_id`` is recorded at the top level of ``manifest.json`` as ``mt_lineage_ids: [int, ...]``, parallel-indexed to ``samples``.",
+          "minimum": 0,
+          "title": "Mt Lineages",
+          "type": "integer"
+        },
         "n": {
           "argparse_dest": "n",
           "default": 10,
@@ -511,6 +519,7 @@
         "chr_length_mb": 5.0,
         "chromosomes": "22",
         "male_fraction": 0.5,
+        "mt_lineages": 0,
         "n": 10,
         "reference_fasta": null,
         "seed": null

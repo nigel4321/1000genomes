@@ -922,10 +922,85 @@ once to migrate) and `male_fraction` is part of the resume
 identity. The legacy-background and admixture-materialized paths
 don't use `cohort.meta.json`; they draw fresh sexes each run.
 
-**No simulation behaviour change yet** — every chromosome is still
-treated as diploid; M13.3 will wire ploidy / PAR / MT clonality
-into the producers. M13.1 lays the data + helpers + per-person
-sex disclosure.
+### M13.2 — Sex-chromosome validation gates (shipped 2026-05-17)
+
+Three pass/fail gates in `validate_batch.py` that surface in
+`summary.json["sex_chrom_gates"]` and a Markdown report section:
+
+- **`y_het_in_males`** — counts non-PAR chrY heterozygotes across
+  male VCFs (expected 0 post-M13.3).
+- **`female_y_absence`** — counts chrY records in female VCFs
+  (expected 0 post-M13.3).
+- **`mt_no_heterozygous`** — counts heterozygous MT calls across
+  all samples (expected 0 post-M13.3's haploid MT emission).
+
+The gates were Tier-1-first — they shipped expected-to-FAIL on
+M13.1-era diploid-everywhere output, and turn GREEN as the
+M13.3 / M13.5 wiring lands. The FAIL → GREEN flip is the empirical
+proof point. Skipped cleanly on pre-M13.1 batches (no
+`manifest['sex']` → status="skipped" for all three).
+
+### M13.3 — Haploid emission (shipped 2026-05-17)
+
+`write_person_vcf` reads the per-person sex (plumbed via
+`_PERSON_WORKER_STATE`) and applies per-record ploidy:
+
+- **chrX non-PAR in males** → single-allele GT (`"0"` / `"1"`),
+  `AN=1`.
+- **chrY non-PAR in males** → single-allele GT, `AN=1`.
+- **chrY in females** → record dropped entirely.
+- **MT in both sexes** → single-allele GT, `AN=1`.
+- **PAR positions in males** → diploid (PAR is biologically
+  diploid in males).
+- **Autosomes + chrX in females** → diploid (no change).
+
+Diploid → haploid collapse keeps the first allele; `AC` / `AF`
+follow `AN`. Backwards-compat: `sex=None` preserves pre-M13.3
+behaviour.
+
+Quality helpers (`_parse_gt_alleles`, `ad_from_gt`, `gq_from_ad`)
+treat single-token haploid GTs as `(k, k)` so AD/GQ stay
+consistent with the emitted GT (haploid alt → AD looks hom-alt,
+high GQ).
+
+### M13.4 — PAR1/PAR2 copy mechanism (shipped 2026-05-17)
+
+PAR sequence is biologically identical between chrX and chrY (they
+recombine in male meiosis), so chrY PAR variants must match chrX
+PAR. New `builds.par_x_to_y_pos(x_pos, build)` translates a chrX
+PAR position to its chrY counterpart (identity on GRCh38 PAR1;
+build-specific offset everywhere else). At write time:
+
+- **chrY PAR records from the simulator are dropped** — they'd
+  diverge from chrX PAR by independent simulation.
+- **For males**, chrX PAR records are mirrored onto chrY at the
+  translated coordinate. The mirror shares GT/REF/ALT/INFO with
+  the chrX original; only `chrom` and `pos` change. The mirror is
+  never flagged `HIGHLIGHT` (only the chrX original).
+- Females are unchanged — chrY entirely absent per M13.3.
+
+SV records are skipped from the mirror (their `END` / `SVLEN`
+coordinates don't survive a chrom/pos swap).
+
+### M13.5 — MT clonal inheritance (shipped 2026-05-17)
+
+Every person gets a `mt_lineage_id` drawn at cohort setup time —
+persons sharing a lineage emit IDENTICAL MT records (real human
+MT is clonally inherited from a maternal ancestor). New
+`--mt-lineages` CLI flag (CLI ↔ YAML `cohort.mt_lineages`), default
+`0` = auto-pick `max(1, n // 10)`.
+
+At write time, each MT record's GT is overridden with a
+deterministic `(mt_lineage_id, pos, site_af)`-keyed call —
+biased by the simulator's per-site AF so the cohort's realised
+MT AF approximates the simulator's intent. Override happens
+before M13.3's ploidy collapse; the single-token output passes
+through the collapse as a no-op.
+
+`mt_lineage_ids` are persisted in `cohort.meta.json` (schema v3
+— pre-existing meta files surface as `ResumeMismatch`) and
+exposed at the top level of `manifest.json` parallel-indexed to
+`samples`.
 
 ---
 
@@ -958,11 +1033,18 @@ hard failure).
 Tracked in `IMPLEMENTATION_PLAN.md` and `DATA_QUALITY_ASSESSMENT.md`
 (the latter holds the M-numbered roadmap):
 
-- **Sex-chromosome ploidy not yet applied** — M13.1 (2026-05-15)
-  ships per-person sex assignment + PAR / ploidy lookup helpers,
-  but every chromosome is still simulated as diploid. M13.3 wires
-  the ploidy lookup into the producers so chrX non-PAR / chrY /
-  MT emit haploid GTs. M13.2 (validation gates) lands first.
+- **Cohort BCF intermediate stays diploid-everywhere** — M13.3 /
+  M13.4 / M13.5 apply at `write_person_vcf` time, so the user-
+  visible per-person VCFs are correct. The intermediate cohort
+  BCF still carries diploid X/Y/MT and independently-simulated
+  PAR variants. A follow-up can rewrite the cohort BCF as
+  variable-ploidy if downstream consumers need it.
+- **M9 sequencing-error model silent on haploid calls** —
+  `errors.maybe_flip_gt` leaves single-token GTs alone, so
+  haploid records (chrY non-PAR / chrX non-PAR in males / MT)
+  don't receive `--error-rate` flips. Realised FDR
+  under-reports by exactly the haploid-record share of total
+  calls.
 - **SV anchor REF still fabricated** — `syntheticgen/sv.py` uses
   `_draw_anchor_base(rng)` to pick a random standard base at each
   SV's `POS`. M12 wired the FASTA through the coalescent /
@@ -1010,6 +1092,7 @@ Tracked in `IMPLEMENTATION_PLAN.md` and `DATA_QUALITY_ASSESSMENT.md`
 | `--reference-fasta` | [M12] Path to a reference FASTA matching `--build`. When unset (default), the cli auto-fetches the Ensembl primary assembly into `<--cache-dir>/reference/<build>.fa` on first run. Resolved on the streamed coalescent + admixture paths; `--legacy-background` does not consult it. | `None` (auto-fetch) |
 | `--no-reference-fasta` | [M12] Opt out of the auto-fetch + auto-load; emitted REF reverts to `rng.choice("ACGT")` legacy path. Useful for smoke runs / seed-pinned tests | `False` |
 | `--male-fraction` | [M13.1] Probability each person is drawn as male. `0.2` → ~20% male, `0.8` → ~80% male. Must be in `[0.0, 1.0]` | `0.5` |
+| `--mt-lineages` | [M13.5] Number of distinct maternal lineages. Persons sharing a lineage emit identical MT records. `0` = auto-pick `max(1, n // 10)` | `0` (auto) |
 | `--chromosomes` | [coalescent] List, range, or mix (e.g. `22`, `19,20,21,22`, `1-22`, `1-3,5,19-22,X`) | `22` |
 | `--chr-length-mb` | [coalescent] Simulated prefix per chrom | `5.0` |
 | `--demo-model` | [coalescent] stdpopsim model id; `none` for uniform | `OutOfAfrica_3G09` |
