@@ -59,6 +59,9 @@ def _args_ns(**overrides):
         # draw per-person sexes alongside person_seeds. Match the
         # production default so the fixture stays representative.
         male_fraction=0.5,
+        # M13.5: load_or_create_meta uses ``args.mt_lineages`` to
+        # auto-pick the lineage count when 0 (default).
+        mt_lineages=0,
     )
     base.update(overrides)
     return types.SimpleNamespace(**base)
@@ -124,6 +127,49 @@ class ResumeFreshStartTest(unittest.TestCase):
             self.tmp, random.Random(42),
         )
         self.assertEqual(r.sexes, ["m", "m", "m"])
+
+    def test_mt_lineage_ids_drawn_and_persisted(self):
+        # M13.5: mt_lineage_ids must be drawn at create time,
+        # persisted in cohort.meta.json, and have the same
+        # cardinality as samples.
+        r = load_or_create_meta(
+            _args_ns(n=20, mt_lineages=4), ["22"],
+            self.tmp, random.Random(42),
+        )
+        self.assertEqual(len(r.mt_lineage_ids), 20)
+        self.assertTrue(all(0 <= lid < 4 for lid in r.mt_lineage_ids))
+        # And they round-trip via the persisted meta.
+        payload = json.loads(
+            (self.tmp / "cohort.meta.json").read_text())
+        self.assertEqual(payload["mt_lineage_ids"], r.mt_lineage_ids)
+
+    def test_mt_lineages_auto_picks_when_zero(self):
+        # mt_lineages=0 → max(1, n // 10). For n=30 that's 3 lineages.
+        r = load_or_create_meta(
+            _args_ns(n=30, mt_lineages=0), ["22"],
+            self.tmp, random.Random(42),
+        )
+        # All assigned lineage ids must fall in [0, 3).
+        self.assertTrue(all(0 <= lid < 3 for lid in r.mt_lineage_ids))
+
+    def test_mt_lineages_auto_picks_at_least_one(self):
+        # Edge case: n < 10 should still produce 1 lineage (not 0).
+        r = load_or_create_meta(
+            _args_ns(n=5, mt_lineages=0), ["22"],
+            self.tmp, random.Random(42),
+        )
+        self.assertEqual(set(r.mt_lineage_ids), {0})
+
+    def test_mt_lineage_ids_deterministic_at_fixed_seed(self):
+        a = load_or_create_meta(
+            _args_ns(n=10, mt_lineages=3), ["22"],
+            self.tmp / "a", random.Random(42),
+        )
+        b = load_or_create_meta(
+            _args_ns(n=10, mt_lineages=3), ["22"],
+            self.tmp / "b", random.Random(42),
+        )
+        self.assertEqual(a.mt_lineage_ids, b.mt_lineage_ids)
 
     def test_draw_sexes_unseeded_is_fresh_each_call(self):
         # PR #96 review (Copilot): when seed is None the documented
@@ -243,6 +289,16 @@ class ResumeMismatchedParamsTest(unittest.TestCase):
         with self.assertRaises(ResumeMismatch):
             load_or_create_meta(
                 _args_ns(seed=42, male_fraction=0.8), ["22"],
+                self.tmp, random.Random(0))
+
+    def test_mt_lineages_mismatch_raises(self):
+        # M13.5: mt_lineages is part of the resume identity. Changing
+        # it between runs reshapes the maternal-lineage groupings;
+        # the persisted ``mt_lineage_ids`` would silently mis-apply
+        # to a different lineage count without this guard.
+        with self.assertRaises(ResumeMismatch):
+            load_or_create_meta(
+                _args_ns(seed=42, mt_lineages=7), ["22"],
                 self.tmp, random.Random(0))
 
     def test_force_fresh_wipes_existing_state(self):

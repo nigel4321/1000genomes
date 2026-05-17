@@ -1329,9 +1329,16 @@ to `null` to use auto-fetch, the default). There's no YAML field for
 
 Validation: must be a finite float in `[0.0, 1.0]`; out-of-range
 values fail at parse time. The drawn sexes land in the manifest's
-`m['sex']` list, parallel-indexed to `m['samples']`. The simulator
-itself doesn't yet use sex (M13.1 is foundation-only); M13.3 will
-wire it through ploidy / PAR / MT clonality.
+`m['sex']` list, parallel-indexed to `m['samples']`. Sex now drives
+real per-record behaviour in the emitted VCFs (M13.3 — 2026-05-17):
+
+- chrX non-PAR + chrY non-PAR in males → haploid GT
+- chrY entirely absent for females
+- MT haploid for everyone
+- chrX PAR + chrY PAR mirrored in males (M13.4) — identical
+  variants at corresponding coordinates
+- MT clonally inherited within maternal lineages (M13.5) — see
+  below
 
 YAML equivalent: `cohort.male_fraction: 0.2` — CLI wins on conflict
 per the standard `cli > config > defaults` precedence. On the
@@ -1343,6 +1350,47 @@ background and admixture-materialized paths don't persist resume
 state, so they don't have this safeguard — changing
 `male_fraction` mid-batch on those paths will just redraw sexes
 silently.
+
+### Maternal lineages — `--mt-lineages` (M13.5)
+
+Real human MT is clonally inherited from a maternal ancestor, so
+two people in the same maternal lineage share their MT sequence
+exactly. M13.5 implements this:
+
+```bash
+# Default: auto-pick max(1, n // 10) lineages — roughly one lineage
+# per 10 people, aligned with 1000G phase 3's ~250 haplogroups
+# across ~2500 samples.
+.venv/bin/python synthetic_people/generate_people.py --n 100
+
+# Explicit lineage count. 4 lineages with --n 20 → ~5 persons per
+# lineage on average, with each lineage sharing MT exactly.
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 20 --mt-lineages 4 --seed 42
+
+# All persons share MT (one big maternal family).
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 50 --mt-lineages 1
+```
+
+YAML equivalent: `cohort.mt_lineages: 4`. Per-person assignment
+lands in the manifest as `mt_lineage_ids: [0, 2, 1, 0, ...]`
+parallel-indexed to `samples`. Two persons with the same
+`mt_lineage_id` will have byte-identical MT records in their
+VCFs. Inspect with:
+
+```bash
+.venv/bin/python -c "import json; m=json.load(open('out/manifest.json'));
+from collections import Counter;
+print('lineage sizes:', Counter(m['mt_lineage_ids']).most_common())"
+```
+
+The override happens at write time; the per-site AF is preserved
+from the simulator's draw so the cohort's realised MT AF still
+approximates real human MT diversity. Changing `--mt-lineages`
+between runs against the same `--output-dir` (streamed coalescent
+path only) triggers `ResumeMismatch`; pass `--no-resume` to
+migrate.
 
 ### Mutation spectrum — `validate_batch.py --reference-fasta` (Tier 2 #5)
 

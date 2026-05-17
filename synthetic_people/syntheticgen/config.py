@@ -137,6 +137,23 @@ def _models():
             ),
             json_schema_extra={"argparse_dest": "male_fraction"},
         )
+        mt_lineages: int = Field(
+            default=0, ge=0,
+            description=(
+                "[M13.5] Number of distinct maternal lineages to draw "
+                "people from. Persons sharing a lineage share their "
+                "MT sequence (clonally inherited from a maternal "
+                "ancestor). ``0`` (default) auto-picks "
+                "``max(1, n // 10)`` — roughly one maternal lineage "
+                "per 10 people, in line with 1000 Genomes phase 3's "
+                "~250 mtDNA haplogroups across ~2500 samples. Equivalent "
+                "to the ``--mt-lineages`` CLI flag. Per-person "
+                "``mt_lineage_id`` is recorded at the top level of "
+                "``manifest.json`` as ``mt_lineage_ids: [int, ...]``, "
+                "parallel-indexed to ``samples``."
+            ),
+            json_schema_extra={"argparse_dest": "mt_lineages"},
+        )
 
     class SimulationConfig(_Strict):
         demo_model: str = Field(
